@@ -67,7 +67,7 @@ class Trainer:
                 self._pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
             initial = p.params.to_dict() if (use_current and p.params) else None
             loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(self._pool, train_job, export, cfg.layout, cfg.mapping, initial)
+            res = await loop.run_in_executor(self._pool, train_job, export, cfg.layout, p.mapping(), initial)
             from .model.layout import Params
             p.params = Params.from_dict(res["params"])
             p.report = {**res["report"], "finished": time.time() * 1000}

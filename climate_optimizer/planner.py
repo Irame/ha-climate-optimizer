@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -106,6 +107,18 @@ class Planner:
         layout = self.cfg.layout_obj()
         return layout, matching_params(self.params, layout)
 
+    def mapping(self) -> dict:
+        """The configured mapping, with each AC unit's fan modes filled in when
+        left empty: as its proxy reports them, else as the device lists them."""
+        m = json.loads(json.dumps(self.cfg.mapping))
+        reported = self.store.get("fan_modes") or {}
+        for u in (m.get("units") or {}).values():
+            if not u.get("fan_modes"):
+                fm = reported.get(u.get("proxy", "")) or (self.collector.meta.get(u.get("source", "")) or {}).get("fan_modes")
+                if fm:
+                    u["fan_modes"] = list(fm)
+        return m
+
     def unit_for_proxy(self, eid: str) -> str | None:
         for uid, m in (self.cfg.mapping.get("units") or {}).items():
             if m.get("proxy") == eid:
@@ -155,7 +168,7 @@ class Planner:
         ex = self.store.export(ents, int(now_ms - 4 * 864e5), int(now_ms), self.collector.meta,
                                {**self.location(), "tz": str(self.tz())})
         try:
-            grid = build_grid(parse_rows(ex), layout, cfg.mapping, min_hours=6)
+            grid = build_grid(parse_rows(ex), layout, self.mapping(), min_hours=6)
         except ValueError as e:
             return None, None, str(e)
         sysm = build(layout, params)
@@ -339,6 +352,11 @@ class Planner:
         now_ms = now_ms or time.time() * 1000
         eid = body.get("entity_id", "")
         self.requests[eid] = ProxyRequest(now_ms, body)
+        fm = body.get("source_fan_modes")
+        if fm:
+            known = self.store.get("fan_modes") or {}
+            if known.get(eid) != fm:
+                self.store.put("fan_modes", {**known, eid: list(fm)})
         uid = self.unit_for_proxy(eid)
         valid = datetime.fromtimestamp((now_ms + 3 * MIN) / 1000, timezone.utc).isoformat()
         if uid is None:

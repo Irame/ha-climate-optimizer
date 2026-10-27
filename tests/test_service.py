@@ -82,3 +82,14 @@ def test_schedule_preview_and_history(client):
 def test_ui_is_served(client):
     assert "Climate optimizer" in client.get("/").text
     assert client.get("/static/app.js").status_code == 200
+
+
+def test_fan_modes_come_from_the_proxy(client):
+    svc = client.svc
+    old = svc.cfgs.config.mapping
+    m = {**old, "units": {u: {k: v for k, v in d.items() if k != "fan_modes"} for u, d in old["units"].items()}}
+    client.put("/api/config", json={"mapping": m})
+    body = {**svc.ha.world.request("office"), "source_fan_modes": ["silent", "low", "high", "turbo"]}
+    client.post("/api/v1/command", json=body)
+    assert svc.planner.mapping()["units"]["office"]["fan_modes"] == ["silent", "low", "high", "turbo"]
+    client.put("/api/config", json={"mapping": old})

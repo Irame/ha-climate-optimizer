@@ -577,7 +577,7 @@ pages.settings = async () => {
     html += `<tr><td>${esc(u.name)}<div class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</div></td>
       <td><input data-path="mapping.units.${u.id}.proxy" list="dl-climate" value="${esc(M.units[u.id].proxy || '')}" style="width:100%"></td>
       <td><input data-path="mapping.units.${u.id}.source" list="${u.kind === 'ac' ? 'dl-climate' : 'dl-switch'}" value="${esc(M.units[u.id].source || '')}" style="width:100%">
-      ${u.kind === 'ac' ? `<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" value="${esc((M.units[u.id].fan_modes || []).join(', '))}" placeholder="fan modes, quietest first" style="width:100%;margin-top:4px">` : ''}</td>
+      ${u.kind === 'ac' ? `<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" value="${esc((M.units[u.id].fan_modes || []).join(', '))}" placeholder="fan modes, quietest first (empty: as the proxy reports them)" style="width:100%;margin-top:4px">` : ''}</td>
       <td>${u.kind === 'heater' ? `<input data-path="mapping.units.${u.id}.power" list="dl-power" value="${esc(M.units[u.id].power || '')}" style="width:100%">` : ''}</td></tr>`;
   }
   html += `</table></div><p class="hint">Fan modes: the device’s fan modes the proxy uses, quietest first (its <code>source_fan_modes</code>); level 0 is the first.</p></div>`;

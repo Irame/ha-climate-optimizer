@@ -209,7 +209,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         ex = s.store.export(tracked_entities(cfg.mapping), start, now, s.collector.meta, {**p.location(), "tz": str(p.tz())})
         out: dict = {"start": start, "end": now}
         try:
-            g = build_grid(parse_rows(ex), layout, cfg.mapping, start=start, min_hours=1)
+            g = build_grid(parse_rows(ex), layout, p.mapping(), start=start, min_hours=1)
         except ValueError as e:
             out["error"] = str(e)
         else:
