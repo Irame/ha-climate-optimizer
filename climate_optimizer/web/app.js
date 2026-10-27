@@ -1,0 +1,664 @@
+import { ChartGroup, curveChart, fmtTime, fmtDay } from './chart.js';
+
+// ---- basics -------------------------------------------------------------------
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const SLOTS = ['--s1', '--s2', '--s3', '--s4', '--s5', '--s6', '--s7', '--s8'];
+const slot = i => css(SLOTS[i % SLOTS.length]);
+const num = (v, d = 1) => (v === null || v === undefined || !isFinite(v)) ? '–' : Number(v).toFixed(d);
+const H = 36e5, MIN = 6e4;
+
+function token() { try { return localStorage.getItem('co-token') || ''; } catch { return ''; } }
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const t = token();
+  if (t) headers.Authorization = 'Bearer ' + t;
+  const r = await fetch('api/' + path, { ...opts, headers });
+  if (r.status === 401) {
+    const t2 = prompt('This optimizer needs its API token:');
+    if (t2) { try { localStorage.setItem('co-token', t2); } catch { } return api(path, opts); }
+    throw new Error('token required');
+  }
+  if (!r.ok) {
+    let msg = r.statusText;
+    try { const j = await r.json(); msg = j.detail || msg; } catch { }
+    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+  }
+  return r.json();
+}
+
+const S = { config: null, status: null, plan: null, history: null, entities: null, tz: undefined, zoneSel: 'all' };
+
+function zoneColor(zid) {
+  const zones = S.config?.layout?.zones || [];
+  const i = zones.findIndex(z => z.id === zid);
+  return slot(i < 0 ? 0 : i);
+}
+function zoneName(zid) { return (S.config?.layout?.zones || []).find(z => z.id === zid)?.name || zid; }
+function unitOf(uid) { return (S.config?.layout?.units || []).find(u => u.id === uid); }
+function fnName(id) { return (S.config?.functions || []).find(f => f.id === id)?.name || id; }
+function ago(ms) {
+  if (!ms) return 'never';
+  const s = (Date.now() - ms) / 1000;
+  if (s < 90) return Math.round(s) + ' s ago';
+  if (s < 5400) return Math.round(s / 60) + ' min ago';
+  if (s < 172800) return Math.round(s / 3600) + ' h ago';
+  return Math.round(s / 86400) + ' days ago';
+}
+
+// ---- routing ------------------------------------------------------------------
+const pages = {};
+let current = null;
+function route() {
+  const name = (location.hash || '#dashboard').slice(1);
+  const page = pages[name] ? name : 'dashboard';
+  document.querySelectorAll('nav a').forEach(a => a.classList.toggle('active', a.dataset.page === page));
+  document.querySelectorAll('section.page').forEach(s => s.classList.toggle('active', s.id === 'page-' + page));
+  current = page;
+  pages[page]().catch(showError(page));
+}
+const showError = page => e => {
+  const root = $('#page-' + page);
+  root.insertAdjacentHTML('afterbegin', `<div class="msg err">${esc(e.message || e)}</div>`);
+  console.error(e);
+};
+window.addEventListener('hashchange', route);
+let resizeTimer;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => current && pages[current](true).catch(() => { }), 250); });
+
+async function loadBase() {
+  [S.config, S.status] = await Promise.all([api('config'), api('status')]);
+  pills();
+}
+
+function pills() {
+  const st = S.status;
+  if (!st) return;
+  const p = [];
+  p.push(`<span class="pill"><span class="dot ${st.ha.connected ? 'good' : 'critical'}"></span>${st.ha.connected ? 'Home Assistant' : 'Not connected'}</span>`);
+  p.push(`<span class="pill"><span class="dot ${st.shadow ? 'warning' : 'good'}"></span>${st.shadow ? 'Shadow mode' : 'Controlling'}</span>`);
+  const age = st.plan.created ? (Date.now() - st.plan.created) / MIN : null;
+  p.push(`<span class="pill"><span class="dot ${st.plan.error ? 'critical' : age !== null && age < 11 ? 'good' : 'warning'}"></span>Plan ${st.plan.created ? ago(st.plan.created) : 'none'}</span>`);
+  p.push(`<span class="pill"><span class="dot ${st.model.trained ? 'good' : 'warning'}"></span>${st.model.training ? 'Training…' : st.model.trained ? 'Model trained' : 'Model untrained'}</span>`);
+  $('#pills').innerHTML = p.join('');
+}
+
+// ---- overview -----------------------------------------------------------------
+pages.dashboard = async (redraw) => {
+  const root = $('#page-dashboard');
+  if (!redraw || !S.plan) {
+    await loadBase();
+    [S.plan, S.history] = await Promise.all([api('plan'), api('history?hours=12')]);
+  }
+  const st = S.status, P = S.plan?.plan, info = S.plan?.info || {};
+  let html = '';
+  if (!st.ha.connected) html += `<div class="msg err">Home Assistant: ${esc(st.ha.error || 'not connected')}. Check <a href="#settings">Settings</a>.</div>`;
+  if (S.plan?.error) html += `<div class="msg err">Planning: ${esc(S.plan.error)}</div>`;
+  for (const n of info.notes || []) html += `<div class="msg">${esc(n)}</div>`;
+  if (st.shadow) html += `<div class="msg">Shadow mode: the optimizer plans and shows what it would do, but the proxies keep their own thermostats. Switch it off in <a href="#settings">Settings</a> once the plans look right.</div>`;
+
+  // one card per unit
+  html += '<div class="grid-cards">';
+  const layout = S.config.layout;
+  for (const u of layout.units) {
+    const z = st.zones[u.zone] || {};
+    const us = st.units[u.id] || {};
+    const ui = info.units?.[u.id] || {};
+    const k = 0;
+    const share = P?.share?.[u.id]?.[k] ?? 0;
+    const heat = P?.heat?.[u.id]?.[k] ?? 0;
+    const fnId = info.schedule?.function?.[u.zone]?.[0];
+    const comfort = P?.comfort?.[u.zone]?.[0];
+    let state = '<span class="badge">off</span>';
+    if (share >= 0.5) state = `<span class="badge ${heat < 0 ? 'cool' : 'on'}">${heat < 0 ? 'cooling' : 'heating'} ${num(Math.abs(heat), 1)} kW${us.decision?.level !== undefined ? ' · level ' + us.decision.level : ''}</span>`;
+    let next = '';
+    if (P) {
+      const on = P.share[u.id];
+      const now0 = on[0] >= 0.5;
+      const j = on.findIndex((v, i) => i > 0 && (v >= 0.5) !== now0 && (now0 || v > 0.05));
+      if (j > 0) next = `${now0 ? 'off' : 'on'} at ${fmtTime(P.t[j], S.tz)}`;
+    }
+    const notes = [];
+    if (ui.note) notes.push(`<span class="badge warn">${esc(ui.note)}</span>`);
+    if ((z.windows_open || []).length) notes.push('<span class="badge warn">window open</span>');
+    const opt = us.proxy_attrs?.optimizer;
+    html += `<div class="card unit-card">
+      <div class="top"><span class="name"><i style="background:${zoneColor(u.zone)}"></i>${esc(u.name)}</span>${state}</div>
+      <div class="temp">${num(z.temperature, 1)} °C<small>comfort ${num(comfort, 1)} °C</small></div>
+      <div class="line">${fnId ? esc(fnName(fnId)) + (info.schedule.source?.[u.zone]?.[0] && info.schedule.source[u.zone][0] !== 'default' ? ' · ' + esc(info.schedule.source[u.zone][0]) : '') : 'no comfort cost'}${next ? ' · ' + next : ''}</div>
+      <div class="line">${esc(us.proxy || 'no proxy')}${us.proxy_state ? ' · ' + esc(us.proxy_state) : ''}${opt ? ' · ' + esc(opt) : ''} ${notes.join(' ')}</div>
+    </div>`;
+  }
+  html += '</div>';
+
+  if (P) {
+    const c = P.cost;
+    const hours = (P.t[P.t.length - 1] - P.t[0]) / H;
+    const dt = P.t.slice(1).map((t, i) => (t - P.t[i]) / H);
+    const kwh = P.electric.reduce((a, v, i) => a + v * dt[i], 0);
+    html += `<div class="stats" style="margin-bottom:14px">
+      <div class="stat"><div class="k">Plan</div><div class="v">${P.mode === 'cool' ? 'Cooling' : 'Heating'}</div><div class="s">${num(hours, 0)} h ahead · ${ago(S.plan.created)}</div></div>
+      <div class="stat"><div class="k">Electricity</div><div class="v">${num(c.energy, 2)} €</div><div class="s">${num(kwh, 1)} kWh over the plan</div></div>
+      <div class="stat"><div class="k">Comfort cost</div><div class="v">${num(c.comfort, 2)} €</div><div class="s">deviations, as priced</div></div>
+      <div class="stat"><div class="k">Starts</div><div class="v">${num(c.starts, 2)} €</div><div class="s">compressor and heater</div></div>
+      <div class="stat"><div class="k">Heat missing at the end</div><div class="v">${num(c.terminal, 2)} €</div><div class="s">solved in ${num(P.seconds, 1)} s · ${esc(P.status)}</div></div>
+    </div>`;
+  }
+  html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Next hours</h3><span class="spacer"></span><div class="chips" id="zone-chips"></div></div><div id="dash-chart"></div></div>`;
+  root.innerHTML = html;
+  if (!P) { $('#dash-chart').innerHTML = '<p class="hint">No plan yet.</p>'; return; }
+  zoneChips($('#zone-chips'), () => pages.dashboard(true));
+  drawTimeline($('#dash-chart'), P, info, S.history);
+};
+
+function zoneChips(box, redraw) {
+  const zones = S.config.layout.zones;
+  const items = [{ id: 'all', name: 'All rooms' }, ...zones];
+  box.innerHTML = items.map(z => `<button class="chip ${S.zoneSel === z.id ? 'active' : ''}" data-z="${z.id}">${z.id !== 'all' ? `<i style="background:${zoneColor(z.id)}"></i>` : ''}${esc(z.name)}</button>`).join('');
+  box.querySelectorAll('button').forEach(b => b.onclick = () => { S.zoneSel = b.dataset.z; redraw(); });
+}
+
+function comfortBand(P, info, z) {
+  const fns = Object.fromEntries((S.config.functions || []).map(f => [f.id, f]));
+  const ids = info.schedule?.function?.[z] || [];
+  const tc = P.comfort[z];
+  if (!tc) return null;
+  const lo = [], hi = [];
+  for (let k = 0; k < tc.length; k++) {
+    const f = fns[ids[k]] || {};
+    lo.push(tc[k] - (f.below?.deadband ?? 0));
+    hi.push(tc[k] + (f.above?.deadband ?? 0));
+  }
+  lo.push(lo[lo.length - 1]); hi.push(hi[hi.length - 1]);
+  return { t: P.t, lo, hi };
+}
+
+function drawTimeline(box, P, info, hist) {
+  box.innerHTML = '';
+  const now = P.t[0];
+  const x0 = hist?.t?.length ? Math.max(hist.t[0], now - 12 * H) : now - H;
+  const g = new ChartGroup(box, { x0, x1: P.t[P.t.length - 1], now, tz: S.tz });
+  const zones = S.config.layout.zones.filter(z => S.zoneSel === 'all' || z.id === S.zoneSel);
+  // temperatures
+  const tp = g.add({ title: 'Room temperature (°C): measured, then planned', unit: '°C', height: 220 });
+  if (S.zoneSel !== 'all') {
+    const b = comfortBand(P, info, S.zoneSel);
+    if (b) tp.band({ ...b, color: zoneColor(S.zoneSel), opacity: 0.14 });
+    if (P.comfort[S.zoneSel]) tp.line({ name: 'Comfort', color: css('--muted'), t: P.t, y: [...P.comfort[S.zoneSel], P.comfort[S.zoneSel].at(-1)], step: true, width: 1, noLegend: true });
+  }
+  for (const z of zones) {
+    const c = zoneColor(z.id);
+    if (hist?.temp?.[z.id]) tp.line({ name: z.name, color: c, t: hist.t, y: hist.temp[z.id] });
+    if (P.temp[z.id]) tp.line({ name: z.name + ' (plan)', legendKey: z.name, color: c, t: P.t, y: P.temp[z.id], dash: true });
+  }
+  // units
+  const rows = S.config.layout.units.map(u => {
+    const spans = [];
+    if (hist?.t) {
+      const step = 5 * MIN;
+      const hu = hist.units?.[u.id], hh = hist.heater?.[u.id];
+      hist.t.forEach((t, i) => {
+        const v = hu ? (hu.heat[i] || 0) + (hu.cool[i] || 0) : (hh ? (hh[i] > 0.05 ? 1 : 0) : 0);
+        if (v > 0.01 && t < now) spans.push({ t0: t, t1: Math.min(now, t + step), v, label: hu ? `ran ${Math.round(v * 100)} %${hu.level[i] !== null ? ', level ' + num(hu.level[i], 1) : ''}` : `${num(hh[i], 2)} kW` });
+      });
+    }
+    P.share[u.id].forEach((v, k) => spans.push({ t0: P.t[k], t1: P.t[k + 1], v, label: v > 0.01 ? `${num(Math.abs(P.heat[u.id][k]), 2)} kW${v < 0.99 ? ', ' + Math.round(v * 100) + ' % of the step' : ''}` : 'off' }));
+    return { name: u.name, short: u.name.split(' ')[0], color: zoneColor(u.zone), spans };
+  });
+  g.add({ title: 'Units: recorded, then planned (lighter = part of the step)' }).gantt(rows);
+  // price
+  const pp = g.add({ title: 'Electricity price (ct/kWh)', unit: 'ct', height: 120, fmt: v => v.toFixed(0) });
+  const prices = (info.prices || []).filter(p => p[1] > x0).sort((a, b) => a[0] - b[0]);
+  const past = (hist?.prices || []).filter(p => p[0] < (prices[0]?.[0] ?? Infinity));
+  const all = [...past, ...prices];
+  if (all.length) pp.line({ name: 'Price', color: slot(6), t: all.map(p => p[0]), y: all.map(p => p[2] * 100), step: true, tEnd: all.at(-1)[1] });
+  pp.fmt = v => v.toFixed(v < 10 ? 1 : 0);
+  // outdoor
+  const op = g.add({ title: 'Outdoor temperature (°C): measured, then forecast', unit: '°C', height: 110 });
+  if (hist?.tout) op.line({ name: 'Outdoor', color: slot(0), t: hist.t, y: hist.tout });
+  if (info.tout) op.line({ name: 'Outdoor (forecast)', legendKey: 'Outdoor', color: slot(0), t: P.t.slice(0, -1).map((t, i) => (t + P.t[i + 1]) / 2), y: info.tout, dash: true, noLegend: true });
+  g.panels.forEach(p => p.draw());
+}
+
+// ---- history ------------------------------------------------------------------
+pages.history = async (redraw) => {
+  const root = $('#page-history');
+  S.histHours = S.histHours || 48;
+  if (!redraw || !S.histLong) {
+    await loadBase();
+    S.histLong = await api('history?hours=' + S.histHours);
+  }
+  const h = S.histLong;
+  root.innerHTML = `<div class="toolbar"><h2 style="margin:0">History</h2><span class="spacer"></span>
+    <div class="chips" id="hist-range">${[24, 48, 168, 336].map(x => `<button class="chip ${S.histHours === x ? 'active' : ''}" data-h="${x}">${x < 168 ? x + ' h' : x / 24 + ' days'}</button>`).join('')}</div>
+    <div class="chips" id="hist-zones"></div></div>
+    ${h.error ? `<div class="msg err">${esc(h.error)}</div>` : ''}
+    <div class="card"><div id="hist-chart"></div></div>
+    <div class="card"><h3>Energy and cost</h3><div id="hist-sum"></div></div>`;
+  root.querySelectorAll('#hist-range button').forEach(b => b.onclick = () => { S.histHours = +b.dataset.h; S.histLong = null; pages.history(); });
+  zoneChips($('#hist-zones'), () => pages.history(true));
+  if (!h.t) return;
+  const g = new ChartGroup($('#hist-chart'), { x0: h.start, x1: h.end, now: h.end, tz: S.tz });
+  const zones = S.config.layout.zones.filter(z => S.zoneSel === 'all' || z.id === S.zoneSel);
+  const tp = g.add({ title: 'Room temperature (°C): measured, and what the plans predicted an hour earlier', unit: '°C', height: 220 });
+  for (const z of zones) {
+    tp.line({ name: z.name, color: zoneColor(z.id), t: h.t, y: h.temp[z.id] });
+    const pr = h.predicted_1h?.[z.id];
+    if (pr?.length && S.zoneSel !== 'all') tp.line({ name: z.name + ' (predicted 1 h ahead)', legendKey: 'predicted 1 h ahead', color: css('--muted'), t: pr.map(p => p[0]), y: pr.map(p => p[1]), dash: true });
+  }
+  const rows = S.config.layout.units.map(u => {
+    const hu = h.units?.[u.id], hh = h.heater?.[u.id];
+    const spans = h.t.map((t, i) => {
+      const v = hu ? (hu.heat[i] || 0) + (hu.cool[i] || 0) : (hh && hh[i] > 0.05 ? 1 : 0);
+      return { t0: t, t1: t + 5 * MIN, v, label: hu ? `${Math.round(v * 100)} %${hu.level[i] !== null && v > 0 ? ', level ' + num(hu.level[i], 1) : ''}` : `${num(hh?.[i], 2)} kW` };
+    });
+    return { name: u.name, short: u.name.split(' ')[0], color: zoneColor(u.zone), spans };
+  });
+  g.add({ title: 'Units running' }).gantt(rows);
+  if (h.phase?.some(v => v !== null)) g.add({ title: 'Outdoor unit phase (kW)', unit: 'kW', height: 110, fmt: v => v.toFixed(1) }).line({ name: 'Phase', color: slot(6), t: h.t, y: h.phase });
+  const pr = h.prices || [];
+  if (pr.length) g.add({ title: 'Electricity price (ct/kWh)', unit: 'ct', height: 110, fmt: v => v.toFixed(0) }).line({ name: 'Price', color: slot(6), t: pr.map(p => p[0]), y: pr.map(p => p[2] * 100), step: true, tEnd: pr.at(-1)[1] });
+  g.add({ title: 'Outdoor temperature (°C)', unit: '°C', height: 100 }).line({ name: 'Outdoor', color: slot(0), t: h.t, y: h.tout });
+  g.panels.forEach(p => p.draw());
+
+  // energy: phase-based where recorded, priced with the recorded prices
+  let kwh = 0, eur = 0;
+  const priceAt = t => { const p = pr.find(p => p[0] <= t && t < p[1]); return p ? p[2] : null; };
+  if (h.phase) h.t.forEach((t, i) => { const v = h.phase[i]; if (v !== null) { kwh += v / 12; const p = priceAt(t); if (p !== null) eur += v / 12 * p; } });
+  const heaterKwh = Object.values(h.heater || {}).reduce((a, arr) => a + arr.reduce((b, v) => b + (v || 0) / 12, 0), 0);
+  $('#hist-sum').innerHTML = `<div class="stats">
+    <div class="stat"><div class="k">Outdoor unit phase</div><div class="v">${num(kwh, 1)} kWh</div><div class="s">${num(eur, 2)} € at the recorded prices · includes other loads on that phase</div></div>
+    <div class="stat"><div class="k">Heaters</div><div class="v">${num(heaterKwh, 1)} kWh</div><div class="s">from their plugs</div></div>
+  </div>`;
+};
+
+// ---- comfort and schedules ----------------------------------------------------
+const DAYS = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
+const sideCost = (s, d) => {
+  const x = Math.max(0, d - (s.deadband || 0));
+  let c = (s.linear || 0) * x + (s.quadratic || 0) * x * x;
+  if (s.limit !== null && s.limit !== undefined && s.limit !== '' && d > s.limit) c += 50 * (d - s.limit);
+  return c;
+};
+
+pages.comfort = async (redraw) => {
+  const root = $('#page-comfort');
+  if (!redraw || !S.draft) {
+    await loadBase();
+    S.draft = JSON.parse(JSON.stringify({ functions: S.config.functions, defaults: S.config.defaults, comfort: S.config.comfort, rules: S.config.rules, calendar: S.config.calendar }));
+  }
+  const D = S.draft, L = S.config.layout;
+  const fnOpts = sel => D.functions.map(f => `<option value="${esc(f.id)}" ${f.id === sel ? 'selected' : ''}>${esc(f.name)}</option>`).join('');
+  let html = `<div class="toolbar"><h2 style="margin:0">Comfort &amp; schedules</h2><span class="spacer"></span>
+    <span id="cf-msg" class="hint"></span><button id="cf-reset">Discard changes</button><button class="primary" id="cf-save">Save</button></div>
+    <p class="hint">What being off the comfort temperature is worth, in euros per hour. The optimizer weighs this against electricity: a cheap deviation is taken when it saves more than it costs. Inside the deadband nothing is paid; the limit is not crossed unless it can't be helped.</p>`;
+  html += '<div id="fn-list"></div><div class="row" style="margin-bottom:14px"><button id="fn-add">Add comfort function</button></div>';
+  // zones
+  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Comfort function when no rule applies</th><th>Comfort temperature</th></tr>`;
+  for (const z of L.zones) {
+    const hasProxy = L.units.some(u => u.zone === z.id && S.config.mapping?.units?.[u.id]?.proxy);
+    html += `<tr><td><span class="name"><i style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${zoneColor(z.id)};margin-right:6px"></i>${esc(z.name)}</span></td>
+      <td><select data-default="${z.id}"><option value="">Standard default</option>${fnOpts(D.defaults[z.id])}</select></td>
+      <td>${hasProxy ? '<span class="hint">the proxy’s target temperature</span> ' : ''}<input type="number" step="0.5" style="width:90px" data-comfort="${z.id}" value="${D.comfort[z.id] ?? ''}" placeholder="${hasProxy ? 'fallback' : 'none'}"> °C</td></tr>`;
+  }
+  html += '</table></div><p class="hint">Rooms without a comfort temperature carry no comfort cost (the hallway, usually).</p></div>';
+  // rules
+  html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Rules</h3><span class="spacer"></span><button id="rule-add">Add rule</button></div>
+    <p class="hint">A rule switches a room to another comfort function, moves its comfort temperature, or keeps units off, at recurring times. Where rules overlap, the higher priority wins. "Every other week, Monday to Thursday evenings": weekly, every 2 weeks, those four days, 18:00–23:00, starting on a Monday of an "on" week.</p>
+    <div id="rule-list"></div></div>`;
+  html += `<div class="card"><h3>Calendar</h3><div class="fields"><label class="field">Calendar entity<input id="cal" list="dl-calendar" value="${esc(D.calendar)}" placeholder="calendar.climate"></label></div>
+    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K. Rooms and functions match by name or id.</p></div>`;
+  html += `<div class="card"><div class="toolbar"><h3 style="margin:0">The next two weeks</h3><span class="spacer"></span><span class="hint">saved rules · hatched: units kept off</span></div><div id="preview"></div></div>`;
+  html += `<datalist id="dl-calendar">${(S.entities || []).filter(e => e.id.startsWith('calendar.')).map(e => `<option value="${esc(e.id)}">`).join('')}</datalist>`;
+  root.innerHTML = html;
+  if (!S.entities) api('entities').then(e => { S.entities = e; }).catch(() => { });
+
+  // functions
+  const list = $('#fn-list');
+  D.functions.forEach((f, i) => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const side = (key, label) => {
+      const s = f[key] || {};
+      const inp = (prop, step, hint) => `<label>${hint}<input type="number" step="${step}" min="0" data-fn="${i}" data-side="${key}" data-prop="${prop}" value="${s[prop] ?? ''}" placeholder="${prop === 'limit' ? 'none' : '0'}"></label>`;
+      return `<fieldset><legend>${label}</legend>${inp('deadband', 0.1, 'Deadband (K)')}${inp('linear', 0.01, 'Linear (€/K·h)')}${inp('quadratic', 0.01, 'Quadratic (€/K²·h)')}${inp('limit', 0.1, 'Limit (K)')}</fieldset>`;
+    };
+    card.innerHTML = `<div class="fn-card"><div>
+        <div class="row" style="margin-bottom:8px"><input data-fn="${i}" data-prop="name" value="${esc(f.name)}" style="font-weight:600;flex:1">
+        <span class="hint">id ${esc(f.id)}</span><button class="danger" data-del-fn="${i}" ${D.functions.length < 2 ? 'disabled' : ''}>Delete</button></div>
+        <div class="sides">${side('below', 'Too cold')}${side('above', 'Too warm')}</div></div>
+      <div><div class="curve"></div><p class="hint" style="margin:4px 0 0">Cost per hour against the deviation from the comfort temperature (K): left too cold, right too warm. Past a limit every further kelvin costs 50 € an hour.</p></div></div>`;
+    list.appendChild(card);
+    const draw = () => {
+      const lim = s => (s?.limit === null || s?.limit === undefined || s?.limit === '') ? null : +s.limit;
+      const lb = lim(f.below), la = lim(f.above);
+      // the soft part only: past a limit the cost is prohibitive, shown as a marker
+      const xs = Array.from({ length: 121 }, (_, k) => -6 + k * 0.1).filter(x => x >= -(lb ?? 99) - 1e-9 && x <= (la ?? 99) + 1e-9);
+      const ys = xs.map(x => x < 0 ? sideCost({ ...f.below, limit: null }, -x) : sideCost({ ...f.above, limit: null }, x));
+      const marks = [];
+      if (lb !== null) marks.push({ x: -lb, label: 'limit' });
+      if (la !== null) marks.push({ x: la, label: 'limit' });
+      curveChart(card.querySelector('.curve'), { series: [{ x: xs, y: ys, color: slot(i) }], marks, domain: [-6, 6], xFmt: v => (v > 0 ? '+' : '') + v, yFmt: v => v.toFixed(2) + ' €', height: 170 });
+    };
+    draw();
+    card.querySelectorAll('input[data-fn]').forEach(inp => inp.oninput = () => {
+      const prop = inp.dataset.prop;
+      if (prop === 'name') { f.name = inp.value; return; }
+      const v = inp.value === '' ? (prop === 'limit' ? null : 0) : +inp.value;
+      f[inp.dataset.side] = { ...(f[inp.dataset.side] || {}), [prop]: v };
+      draw();
+    });
+  });
+  root.querySelectorAll('[data-del-fn]').forEach(b => b.onclick = () => { D.functions.splice(+b.dataset.delFn, 1); pages.comfort(true); });
+  $('#fn-add').onclick = () => {
+    let n = D.functions.length + 1, id = 'custom' + n;
+    while (D.functions.some(f => f.id === id)) id = 'custom' + (++n);
+    D.functions.push({ id, name: 'Custom ' + n, below: { deadband: 0.5, linear: 0.1, quadratic: 0.05, limit: null }, above: { deadband: 1, linear: 0.05, quadratic: 0, limit: null } });
+    pages.comfort(true);
+  };
+  root.querySelectorAll('[data-default]').forEach(s => s.onchange = () => { if (s.value) D.defaults[s.dataset.default] = s.value; else delete D.defaults[s.dataset.default]; });
+  root.querySelectorAll('[data-comfort]').forEach(s => s.oninput = () => { if (s.value === '') delete D.comfort[s.dataset.comfort]; else D.comfort[s.dataset.comfort] = +s.value; });
+  $('#cal').oninput = e => { D.calendar = e.target.value.trim(); };
+
+  // rules
+  const rl = $('#rule-list');
+  D.rules.forEach((r, i) => rl.appendChild(ruleEditor(r, i, D, fnOpts)));
+  if (!D.rules.length) rl.innerHTML = '<p class="hint">No rules: every room uses its default all the time.</p>';
+  $('#rule-add').onclick = () => {
+    D.rules.push({ id: 'rule' + Date.now().toString(36), name: 'New rule', action: 'comfort', zones: [], units: [], function: D.functions[0].id, offset: 0, rrule: 'FREQ=DAILY', dtstart: new Date().toISOString().slice(0, 10), start: '22:00', end: '06:00', priority: 10, enabled: true });
+    pages.comfort(true);
+  };
+  $('#cf-reset').onclick = () => { S.draft = null; pages.comfort(); };
+  $('#cf-save').onclick = async () => {
+    const msg = $('#cf-msg');
+    try {
+      S.config = await api('config', { method: 'PUT', body: JSON.stringify(D) });
+      msg.textContent = 'Saved. The next plan uses it.';
+      S.draft = JSON.parse(JSON.stringify({ functions: S.config.functions, defaults: S.config.defaults, comfort: S.config.comfort, rules: S.config.rules, calendar: S.config.calendar }));
+      drawPreview();
+    } catch (e) { msg.textContent = 'Not saved: ' + e.message; }
+  };
+  drawPreview();
+};
+
+function parseRrule(s) {
+  const o = {};
+  for (const part of (s || '').replace(/^RRULE:/i, '').split(';')) { const [k, v] = part.split('='); if (k) o[k.toUpperCase()] = v || ''; }
+  return o;
+}
+function buildRrule(o) { return Object.entries(o).filter(([, v]) => v !== '' && v !== undefined).map(([k, v]) => `${k}=${v}`).join(';'); }
+
+function ruleEditor(r, i, D, fnOpts) {
+  const L = S.config.layout;
+  const box = document.createElement('div');
+  box.className = 'rule';
+  const rr = parseRrule(r.rrule);
+  const freq = rr.FREQ || 'DAILY';
+  const byday = (rr.BYDAY || '').split(',').filter(Boolean);
+  const targets = r.action === 'lockout'
+    ? L.units.map(u => `<label class="check"><input type="checkbox" data-unit="${u.id}" ${r.units.includes(u.id) ? 'checked' : ''}>${esc(u.name)}</label>`).join(' ')
+    : L.zones.map(z => `<label class="check"><input type="checkbox" data-zone="${z.id}" ${r.zones.includes(z.id) ? 'checked' : ''}>${esc(z.name)}</label>`).join(' ');
+  box.innerHTML = `<div class="row" style="margin-bottom:8px"><label class="check"><input type="checkbox" data-k="enabled" ${r.enabled ? 'checked' : ''}></label>
+      <input data-k="name" value="${esc(r.name)}" style="font-weight:600;flex:1;min-width:160px">
+      <select data-k="action"><option value="comfort" ${r.action === 'comfort' ? 'selected' : ''}>Comfort function</option><option value="offset" ${r.action === 'offset' ? 'selected' : ''}>Comfort temperature ±</option><option value="lockout" ${r.action === 'lockout' ? 'selected' : ''}>Keep units off</option></select>
+      ${r.action === 'comfort' ? `<select data-k="function">${fnOpts(r.function)}</select>` : ''}
+      ${r.action === 'offset' ? `<input type="number" step="0.5" data-k="offset" value="${r.offset}" style="width:80px"> K` : ''}
+      <button class="danger" data-del>Delete</button></div>
+    <div class="row" style="margin-bottom:8px"><span class="hint">${r.action === 'lockout' ? 'Units (none ticked: all)' : 'Rooms (none ticked: all)'}:</span> ${targets}</div>
+    <div class="fields">
+      <label class="field">Repeats<select data-r="FREQ"><option value="DAILY" ${freq === 'DAILY' ? 'selected' : ''}>daily</option><option value="WEEKLY" ${freq === 'WEEKLY' ? 'selected' : ''}>weekly</option><option value="MONTHLY" ${freq === 'MONTHLY' ? 'selected' : ''}>monthly</option></select></label>
+      <label class="field">Every<input type="number" min="1" data-r="INTERVAL" value="${rr.INTERVAL || 1}"></label>
+      <label class="field">From<input type="time" data-k="start" value="${r.start === '24:00' ? '23:59' : r.start}"></label>
+      <label class="field">To<input type="time" data-k="end" value="${r.end === '24:00' ? '00:00' : r.end}"></label>
+      <label class="field">Counting from<input type="date" data-k="dtstart" value="${r.dtstart}"></label>
+      <label class="field">Priority<input type="number" data-k="priority" value="${r.priority}"></label>
+    </div>
+    <div class="row" style="margin-top:8px"><span class="hint">On:</span><div class="days">${DAYS.map(d => `<label><input type="checkbox" data-day="${d}" ${byday.includes(d) ? 'checked' : ''}>${d[0] + d[1].toLowerCase()}</label>`).join('')}</div>
+      <span class="hint">(none: every day)</span><span class="spacer"></span><label class="field" style="flex-direction:row;align-items:center;gap:6px">RRULE<input data-k="rrule" value="${esc(r.rrule)}" style="width:280px"></label></div>`;
+  const sync = () => {
+    const o = parseRrule(r.rrule);
+    o.FREQ = box.querySelector('[data-r=FREQ]').value;
+    const iv = +box.querySelector('[data-r=INTERVAL]').value || 1;
+    o.INTERVAL = iv > 1 ? iv : '';
+    const days = [...box.querySelectorAll('[data-day]')].filter(c => c.checked).map(c => c.dataset.day);
+    o.BYDAY = days.join(',');
+    r.rrule = buildRrule({ FREQ: o.FREQ, INTERVAL: o.INTERVAL, BYDAY: o.BYDAY, ...Object.fromEntries(Object.entries(o).filter(([k]) => !['FREQ', 'INTERVAL', 'BYDAY'].includes(k))) });
+    box.querySelector('[data-k=rrule]').value = r.rrule;
+  };
+  box.querySelectorAll('[data-r], [data-day]').forEach(e => e.onchange = sync);
+  box.querySelectorAll('[data-k]').forEach(e => e.onchange = () => {
+    const k = e.dataset.k;
+    if (k === 'enabled') r.enabled = e.checked;
+    else if (k === 'priority') r.priority = +e.value;
+    else if (k === 'offset') r.offset = +e.value;
+    else if (k === 'start' || k === 'end') r[k] = e.value || '00:00';
+    else r[k] = e.value;
+    if (k === 'action') { if (r.action === 'comfort' && !r.function) r.function = D.functions[0].id; pages.comfort(true); }
+    if (k === 'rrule') pages.comfort(true);
+  });
+  box.querySelectorAll('[data-zone]').forEach(c => c.onchange = () => { r.zones = [...box.querySelectorAll('[data-zone]')].filter(x => x.checked).map(x => x.dataset.zone); });
+  box.querySelectorAll('[data-unit]').forEach(c => c.onchange = () => { r.units = [...box.querySelectorAll('[data-unit]')].filter(x => x.checked).map(x => x.dataset.unit); });
+  box.querySelector('[data-del]').onclick = () => { D.rules.splice(i, 1); pages.comfort(true); };
+  return box;
+}
+
+async function drawPreview() {
+  const box = $('#preview');
+  if (!box) return;
+  const pv = await api('schedule/preview?days=14&step_min=30');
+  const L = S.config.layout;
+  const fnIdx = Object.fromEntries(S.config.functions.map((f, i) => [f.id, i]));
+  const per = 24 * 60 / pv.step_min;
+  let html = `<div class="legend" style="margin:0 0 8px">${S.config.functions.map((f, i) => `<span><i style="background:${slot(i)};height:10px;width:10px"></i>${esc(f.name)}</span>`).join('')}</div>`;
+  html += `<div class="two">`;
+  for (const z of L.zones) {
+    const fn = pv.function[z.id];
+    const lockUnits = L.units.filter(u => u.zone === z.id).map(u => pv.locked[u.id]);
+    const hasComfort = L.units.some(u => u.zone === z.id && S.config.mapping?.units?.[u.id]?.proxy) || S.config.comfort?.[z.id] !== undefined;
+    if (!hasComfort) { html += `<div><h3 style="margin:6px 0">${esc(z.name)}</h3><p class="hint">No comfort temperature: no comfort cost here.</p></div>`; continue; }
+    html += `<div><h3 style="margin:6px 0">${esc(z.name)}</h3><div class="heat">`;
+    for (let d = 0; d < fn.length / per; d++) {
+      const day = fmtDay(pv.start + d * 864e5 + 6 * H, S.tz);
+      html += `<div class="heat-row"><span>${day}</span><div class="heat-cells" style="grid-template-columns:repeat(${per},1fr)">`;
+      for (let k = d * per; k < (d + 1) * per; k++) {
+        const locked = lockUnits.some(l => l?.[k]);
+        const off = pv.offset[z.id][k];
+        const t = pv.start + k * pv.step_min * MIN;
+        html += `<span class="${locked ? 'locked' : ''}" style="background:${slot(fnIdx[fn[k]] ?? 0)}" title="${fmtTime(t, S.tz)} ${esc(fnName(fn[k]))}${off ? ' ' + (off > 0 ? '+' : '') + off + ' K' : ''}${locked ? ' · units off' : ''} (${esc(pv.source[z.id][k])})"></span>`;
+      }
+      html += `</div></div>`;
+    }
+    html += `<div class="heat-row"><span></span><div class="row hint" style="justify-content:space-between"><span>0:00</span><span>6:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div></div></div></div>`;
+  }
+  html += '</div>';
+  box.innerHTML = html;
+}
+
+// ---- model ----------------------------------------------------------------------
+pages.model = async () => {
+  const root = $('#page-model');
+  await loadBase();
+  const m = await api('model');
+  const rep = m.report;
+  const L = S.config.layout;
+  let html = `<div class="toolbar"><h2 style="margin:0">Model</h2><span class="spacer"></span>
+    <button id="train" ${m.training ? 'disabled' : ''}>${m.training ? 'Training…' : 'Retrain now'}</button>
+    <button id="train-fresh" ${m.training ? 'disabled' : ''}>Train from scratch</button></div>`;
+  if (m.error) html += `<div class="msg err">Last training failed: ${esc(m.error)}</div>`;
+  if (!rep) {
+    html += `<div class="msg">Not trained yet${m.training ? ' — training is running' : ''}. The optimizer uses a generic apartment until then. Training reads the recorded history (up to ${S.config.history_days} days) and runs every night at ${S.config.retrain_hour}:00.</div>`;
+  } else {
+    const days = rep.days || {};
+    html += `<div class="stats" style="margin-bottom:14px">
+      <div class="stat"><div class="k">Trained</div><div class="v">${ago(rep.finished || rep.trained_at * 1000)}</div><div class="s">${(days.train || []).length} days to learn, ${(days.val || []).length} to check · ${num(rep.seconds, 0)} s</div></div>
+      <div class="stat"><div class="k">Heat pump efficiency</div><div class="v">COP ${num(rep.cop7, 1)}</div><div class="s">at 7 °C outside, 21 °C inside</div></div>
+      <div class="stat"><div class="k">Electricity on check days</div><div class="v">${num(rep.energy?.sim, 1)} kWh</div><div class="s">${rep.energy?.observed ? 'measured ' + num(rep.energy.obs, 1) + ' kWh' : 'no phase measurement'}</div></div>
+    </div>`;
+    for (const w of rep.warnings || []) html += `<div class="msg">${esc(w)}</div>`;
+    html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th></tr>`;
+    L.zones.forEach((z, i) => {
+      const zs = rep.zones?.[z.id] || {};
+      html += `<tr><td>${esc(z.name)}</td><td class="num">${num(rep.rmse_val?.[i], 2)} K</td><td class="num">${num(rep.bias_val?.[i], 2)} K</td><td class="num">${num(zs.C, 1)} kWh/K</td><td class="num">${num((zs.Hloss || 0) * 1000, 0)} W/K</td><td class="num">${num(zs.tau_h, 0)} h</td></tr>`;
+    });
+    html += `</table></div><p class="hint">Error: how far whole days predicted from midnight, from nothing but weather and what the units did, stayed from the thermometers.</p></div>`;
+    html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Heat per fan level</th></tr>`;
+    for (const u of L.units) {
+      const p = m.params.units[u.id] || {};
+      html += `<tr><td>${esc(u.name)}</td><td>${p.heat ? p.heat.map((v, i) => `level ${i}: ${num(v, 2)} kW`).join(' · ') : num(p.kw, 2) + ' kW'}</td></tr>`;
+    }
+    html += `</table></div><p class="hint">Heating output at 7 °C outside; it falls ${num((m.params.plant.cap_slope || 0) * 100, 1)} % per kelvin colder. The shared outdoor unit delivers at most ${num(m.params.plant.Qmax, 1)} kW.</p></div>`;
+    if (rep.validation?.length) {
+      html += `<div class="card"><div class="toolbar"><h3 style="margin:0">A check day: predicted from midnight against measured</h3><span class="spacer"></span><div class="chips" id="val-zones"></div></div><div id="val-chart"></div></div>`;
+    }
+  }
+  root.innerHTML = html;
+  $('#train').onclick = () => api('model/train', { method: 'POST' }).then(() => setTimeout(() => pages.model(), 1500));
+  $('#train-fresh').onclick = () => api('model/train?fresh=true', { method: 'POST' }).then(() => setTimeout(() => pages.model(), 1500));
+  if (rep?.validation?.length) {
+    S.valZone = S.valZone || L.zones[0].id;
+    const chips = $('#val-zones');
+    chips.innerHTML = L.zones.map(z => `<button class="chip ${S.valZone === z.id ? 'active' : ''}" data-z="${z.id}"><i style="background:${zoneColor(z.id)}"></i>${esc(z.name)}</button>`).join('');
+    chips.querySelectorAll('button').forEach(b => b.onclick = () => { S.valZone = b.dataset.z; pages.model(); });
+    const day = rep.validation[rep.validation.length - 1];
+    const zi = L.zones.findIndex(z => z.id === S.valZone);
+    const t = day.pred.map((_, k) => day.t0 + k * 5 * MIN);
+    const g = new ChartGroup($('#val-chart'), { x0: t[0], x1: t[t.length - 1], now: t[t.length - 1] + 1, tz: S.tz });
+    g.add({ title: `${zoneName(S.valZone)} (°C)`, unit: '°C', height: 200 })
+      .line({ name: 'Measured', color: css('--muted'), t, y: day.meas.map(r => r[zi]) })
+      .line({ name: 'Predicted', color: zoneColor(S.valZone), t, y: day.pred.map(r => r[zi]) });
+    g.panels.forEach(p => p.draw());
+  }
+};
+
+// ---- settings ---------------------------------------------------------------------
+const SETTING_FIELDS = [
+  ['horizon_min_h', 'Plan at least (h)', 1], ['horizon_max_h', 'Plan at most (h)', 1],
+  ['min_run_min', 'Minimum run (min)', 1], ['min_off_min', 'Minimum pause (min)', 1],
+  ['start_cost', 'Cost of a compressor start (€)', 0.01], ['heater_start_cost', 'Cost of a heater start (€)', 0.001],
+  ['terminal_quantile', 'Value heat left at the end at this price quantile', 0.05],
+  ['window_assume_open_min', 'An open window closes after (min)', 1],
+  ['heat_below_outdoor', 'Heat only if colder outside than (°C)', 0.5], ['cool_above_outdoor', 'Cool only if warmer outside than (°C)', 0.5],
+  ['time_limit_s', 'Solver time limit (s)', 1], ['binary_h', 'On/off decided as such for (h)', 0.05],
+];
+
+pages.settings = async () => {
+  const root = $('#page-settings');
+  await loadBase();
+  if (!S.entities) S.entities = await api('entities').catch(() => []);
+  const C = JSON.parse(JSON.stringify(S.config));
+  const L = C.layout;
+  const M = C.mapping = C.mapping || {};
+  M.zones = M.zones || {}; M.units = M.units || {};
+  const dl = (id, pred) => `<datalist id="${id}">${S.entities.filter(pred).map(e => `<option value="${esc(e.id)}">${esc(e.name || '')}</option>`).join('')}</datalist>`;
+  const temp = e => e.id.startsWith('sensor.') && (e.device_class === 'temperature' || /°/.test(e.unit || ''));
+  const power = e => e.id.startsWith('sensor.') && (e.device_class === 'power' || /^k?W$/.test(e.unit || ''));
+  const field = (label, path, list, placeholder = '') => `<label class="field">${label}<input data-path="${path}" list="${list}" value="${esc(get(C, path) ?? '')}" placeholder="${placeholder}"></label>`;
+  let html = `<div class="toolbar"><h2 style="margin:0">Settings</h2><span class="spacer"></span><span id="st-msg" class="hint"></span><button class="primary" id="st-save">Save</button></div>`;
+  html += `<div class="card"><h3>Mode</h3>
+    <label class="check"><input type="checkbox" data-path="shadow" ${C.shadow ? 'checked' : ''}> Shadow mode: plan and show, but let the proxies’ own thermostats decide</label>
+    <p class="hint">Set each proxy to <b>auto</b> and point its <code>optimizer_url</code> here: <code>${esc(location.origin + location.pathname.replace(/\/$/, ''))}</code>. In shadow mode the optimizer answers <code>follow: false</code>.</p>
+    <div class="fields"><label class="field">API token for proxies and this page<input type="password" data-path="api_token" value="${esc(C.api_token)}" placeholder="none"></label></div></div>`;
+  html += `<div class="card"><h3>Home Assistant</h3><div class="fields wide">
+    <label class="field">URL<input data-path="ha.url" value="${esc(C.ha.url)}" placeholder="http://homeassistant.local:8123"></label>
+    <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}"></label></div>
+    <label class="check" style="margin-top:8px"><input type="checkbox" data-path="ha.verify_ssl" ${C.ha.verify_ssl ? 'checked' : ''}> Verify TLS certificate</label>
+    <p class="hint">${S.status.ha.connected ? 'Connected to Home Assistant ' + esc(S.status.ha.version) + '.' : 'Not connected: ' + esc(S.status.ha.error || '')}</p></div>`;
+  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors (comma separated)</th></tr>`;
+  for (const z of L.zones) {
+    M.zones[z.id] = M.zones[z.id] || {};
+    html += `<tr><td>${esc(z.name)}</td><td><input data-path="mapping.zones.${z.id}.thermometer" list="dl-temp" value="${esc(M.zones[z.id].thermometer || '')}" style="width:100%"></td>
+      <td>${z.windows ? `<input data-path="mapping.zones.${z.id}.windows" data-list="1" list="dl-binary" value="${esc((M.zones[z.id].windows || []).join(', '))}" style="width:100%">` : '<span class="hint">none in the layout</span>'}</td></tr>`;
+  }
+  html += `</table></div></div>`;
+  html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Proxy (what the optimizer answers)</th><th>Device under the proxy</th><th>${L.units.some(u => u.kind === 'heater') ? 'Heater power sensor' : ''}</th></tr>`;
+  for (const u of L.units) {
+    M.units[u.id] = M.units[u.id] || {};
+    html += `<tr><td>${esc(u.name)}<div class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</div></td>
+      <td><input data-path="mapping.units.${u.id}.proxy" list="dl-climate" value="${esc(M.units[u.id].proxy || '')}" style="width:100%"></td>
+      <td><input data-path="mapping.units.${u.id}.source" list="${u.kind === 'ac' ? 'dl-climate' : 'dl-switch'}" value="${esc(M.units[u.id].source || '')}" style="width:100%">
+      ${u.kind === 'ac' ? `<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" value="${esc((M.units[u.id].fan_modes || []).join(', '))}" placeholder="fan modes, quietest first" style="width:100%;margin-top:4px">` : ''}</td>
+      <td>${u.kind === 'heater' ? `<input data-path="mapping.units.${u.id}.power" list="dl-power" value="${esc(M.units[u.id].power || '')}" style="width:100%">` : ''}</td></tr>`;
+  }
+  html += `</table></div><p class="hint">Fan modes: the device’s fan modes the proxy uses, quietest first (its <code>source_fan_modes</code>); level 0 is the first.</p></div>`;
+  html += `<div class="card"><h3>Outside, power and prices</h3><div class="fields wide">
+    ${field('Outdoor thermometer', 'mapping.outdoor', 'dl-temp')}
+    ${field('Weather (forecast)', 'mapping.weather', 'dl-weather')}
+    ${field('Phase with the outdoor unit', 'mapping.phase', 'dl-power')}
+    <label class="field">Other phases (comma separated)<input data-path="mapping.phases_other" data-list="1" list="dl-power" value="${esc((M.phases_other || []).join(', '))}"></label>
+    ${field('Car charger power (optional)', 'mapping.car', 'dl-power')}
+    <label class="field">Prices from<select data-path="prices.source"><option value="tibber_prices" ${C.prices.source === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${C.prices.source === 'attributes' ? 'selected' : ''}>a sensor's attributes</option></select></label>
+    ${field('tibber_prices entry id (if several)', 'prices.entry_id', '')}
+    ${field('Price sensor', 'prices.sensor', 'dl-price')}
+    </div><p class="hint">The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
+  html += `<div class="card"><h3>Optimizer</h3><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
+    <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
+    <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents. On/off is decided as such for the first quarter hour; after that the plan counts what share of each step a unit runs.</p></div>`;
+  html += `<div class="card"><h3>Training</h3><div class="fields">
+    <label class="field">Retrain every night at (hour)<input type="number" min="0" max="23" data-path="retrain_hour" value="${C.retrain_hour}"></label>
+    <label class="field">History kept and trained on (days)<input type="number" min="3" max="365" data-path="history_days" value="${C.history_days}"></label></div>
+    <div class="row" style="margin-top:10px"><label class="field">Load an export from the browser snippet<input type="file" id="import-file" accept=".json,application/json"></label><span id="import-msg" class="hint"></span></div></div>`;
+  html += `<div class="card"><h3>Layout (advanced)</h3><p class="hint">Rooms, how they connect, and which units heat them. Changing it means retraining.</p>
+    <textarea id="layout-json" rows="12">${esc(JSON.stringify(C.layout, null, 2))}</textarea>
+    <div class="fields" style="margin-top:8px"><label class="field">Latitude (default: Home Assistant’s)<input type="number" step="0.1" id="lat" value="${C.location?.lat ?? ''}"></label><label class="field">Longitude<input type="number" step="0.1" id="lon" value="${C.location?.lon ?? ''}"></label></div></div>`;
+  html += dl('dl-temp', temp) + dl('dl-power', power) + dl('dl-climate', e => e.id.startsWith('climate.'))
+    + dl('dl-binary', e => e.id.startsWith('binary_sensor.')) + dl('dl-switch', e => /^(switch|input_boolean)\./.test(e.id))
+    + dl('dl-weather', e => e.id.startsWith('weather.')) + dl('dl-price', e => e.id.startsWith('sensor.') && /kwh/i.test(e.unit || ''));
+  root.innerHTML = html;
+
+  $('#import-file').onchange = async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    $('#import-msg').textContent = 'Loading…';
+    try {
+      const r = await api('import', { method: 'POST', body: await f.text() });
+      $('#import-msg').textContent = `${r.rows} rows loaded. Retrain on the Model page.`;
+    } catch (err) { $('#import-msg').textContent = 'Failed: ' + err.message; }
+  };
+  $('#st-save').onclick = async () => {
+    const msg = $('#st-msg');
+    root.querySelectorAll('[data-path]').forEach(inp => {
+      let v = inp.type === 'checkbox' ? inp.checked : inp.type === 'number' ? (inp.value === '' ? null : +inp.value) : inp.value.trim();
+      if (inp.dataset.list) v = String(v).split(',').map(s => s.trim()).filter(Boolean);
+      set(C, inp.dataset.path, v);
+    });
+    try {
+      C.layout = JSON.parse($('#layout-json').value);
+    } catch (e) { msg.textContent = 'Layout is not valid JSON'; return; }
+    const lat = $('#lat').value, lon = $('#lon').value;
+    C.location = lat !== '' && lon !== '' ? { lat: +lat, lon: +lon } : null;
+    try {
+      S.config = await api('config', { method: 'PUT', body: JSON.stringify(C) });
+      msg.textContent = 'Saved.';
+      setTimeout(() => pages.settings(), 800);
+    } catch (e) { msg.textContent = 'Not saved: ' + e.message; }
+  };
+};
+
+function get(o, path) { return path.split('.').reduce((a, k) => a?.[k], o); }
+function set(o, path, v) {
+  const ks = path.split('.');
+  let a = o;
+  for (const k of ks.slice(0, -1)) a = a[k] = a[k] || {};
+  a[ks.at(-1)] = v;
+}
+
+// ---- start ----------------------------------------------------------------------
+(async () => {
+  try {
+    await loadBase();
+    S.tz = undefined;
+    try {
+      const hc = S.status?.tz;
+      if (hc) S.tz = hc;
+    } catch { }
+  } catch (e) { console.error(e); }
+  route();
+  setInterval(async () => {
+    try {
+      S.status = await api('status');
+      pills();
+      if (current === 'dashboard' && S.plan && S.status.plan.created && S.status.plan.created !== S.plan.created) pages.dashboard();
+    } catch { }
+  }, 30000);
+})();
