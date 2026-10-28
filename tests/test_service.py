@@ -161,3 +161,16 @@ def test_a_room_whose_units_are_off_costs_no_comfort(client):
         world.units["bath"]["proxy_mode"] = "auto"
         for s in world.states():
             svc.collector.states[s["entity_id"]] = s
+
+
+def test_environment_wins_over_saved_settings(tmp_path, monkeypatch):
+    from climate_optimizer.config import ConfigStore
+
+    cs = ConfigStore(tmp_path / "config.json")
+    cs.update({"ha": {"url": "http://saved:8123", "token": "saved"}})
+    monkeypatch.setenv("HA_URL", "http://host.docker.internal:8123")
+    cs = ConfigStore(tmp_path / "config.json")
+    assert cs.config.ha.url == "http://host.docker.internal:8123" and cs.config.ha.token == "saved"
+    cs.update({"ha": {"url": "http://ui:8123"}})  # the UI cannot override it
+    assert cs.config.ha.url == "http://host.docker.internal:8123"
+    assert cs.config.public()["env"] == {"ha_url": True, "ha_token": False}

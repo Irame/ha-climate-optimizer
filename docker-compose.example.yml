@@ -1,6 +1,5 @@
-# Copy to docker-compose.yml and adjust. The Home Assistant URL and token can
-# also be set later in the web UI (Settings); the values here only seed the
-# first start.
+# Copy to docker-compose.yml and adjust. HA_URL and HA_TOKEN can also be left
+# out and set in the web UI (Settings); set here, they win over the UI.
 services:
   climate-optimizer:
     build: .
@@ -9,10 +8,14 @@ services:
     restart: unless-stopped
     ports:
       - "8099:8099"
+    # Home Assistant on the same machine with network_mode: host is reachable
+    # as host.docker.internal; on Linux Docker only defines that name when asked:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/data
     environment:
-      HA_URL: http://homeassistant.local:8123
+      HA_URL: http://homeassistant.local:8123  # same machine: http://host.docker.internal:8123
       HA_TOKEN: ${HA_TOKEN}  # a long-lived access token, e.g. from an .env file
       TZ: Europe/Berlin
       # The service runs as this user and takes ownership of ./data on start.

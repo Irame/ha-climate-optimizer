@@ -108,6 +108,7 @@ class Config(BaseModel):
         d = self.model_dump()
         d["ha"]["token"] = "********" if self.ha.token else ""
         d["api_token"] = "********" if self.api_token else ""
+        d["env"] = {"ha_url": bool(os.environ.get("HA_URL")), "ha_token": bool(os.environ.get("HA_TOKEN"))}
         return d
 
 
@@ -118,9 +119,13 @@ class ConfigStore:
         self.config = self._load()
 
     def _load(self) -> Config:
-        if self.path.exists():
-            return Config.model_validate(json.loads(self.path.read_text()))
-        c = Config()
+        c = Config.model_validate(json.loads(self.path.read_text())) if self.path.exists() else Config()
+        return self._env(c)
+
+    @staticmethod
+    def _env(c: Config) -> Config:
+        """HA_URL and HA_TOKEN, when the container sets them, win over what was saved,
+        or a changed compose file would seem to do nothing."""
         if os.environ.get("HA_URL"):
             c.ha.url = os.environ["HA_URL"]
         if os.environ.get("HA_TOKEN"):
@@ -141,7 +146,7 @@ class ConfigStore:
                     cur[k].update(v)
                 else:
                     cur[k] = v
-            new = Config.model_validate(cur)
+            new = self._env(Config.model_validate(cur))
             self.save(new)
             self.config = new
             return new

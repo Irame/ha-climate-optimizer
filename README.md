@@ -48,6 +48,8 @@ Then open `http://<host>:8099`:
 
 4. The optimizer starts in **shadow mode**: it plans and shows what it would do, and the proxies keep their own thermostats. When the plans look right, switch shadow mode off in Settings.
 
+**Home Assistant on the same machine**, as a container with `network_mode: host`: set `HA_URL: http://host.docker.internal:8123` and keep the `extra_hosts` entry from the example (on Linux, Docker defines that name only when asked). The proxies then reach the optimizer at `optimizer_url: http://127.0.0.1:8099`. Or run the optimizer with `network_mode: host` too (drop `ports:` and `extra_hosts:`), and use `http://127.0.0.1:8123` and `http://127.0.0.1:8099`.
+
 Without Home Assistant, `DEMO=1` runs the optimizer against a simulated apartment with a week of history:
 
 ```sh

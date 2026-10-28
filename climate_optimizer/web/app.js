@@ -679,8 +679,8 @@ pages.settings = async () => {
     <p class="hint">Set each proxy to <b>auto</b> and point its <code>optimizer_url</code> here: <code>${esc(location.origin + location.pathname.replace(/\/$/, ''))}</code>. In shadow mode the optimizer answers <code>follow: false</code>.</p>
     <div class="fields"><label class="field">API token for proxies and this page<input type="password" data-path="api_token" value="${esc(C.api_token)}" placeholder="none"></label></div></div>`;
   html += `<div class="card"><h3>Home Assistant</h3><div class="fields wide">
-    <label class="field">URL<input data-path="ha.url" value="${esc(C.ha.url)}" placeholder="http://homeassistant.local:8123"></label>
-    <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}"></label></div>
+    <label class="field">URL<input data-path="ha.url" value="${esc(C.ha.url)}" placeholder="http://homeassistant.local:8123" ${C.env?.ha_url ? 'disabled' : ''}>${C.env?.ha_url ? '<span class="hint">set by the container’s HA_URL</span>' : ''}</label>
+    <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}" ${C.env?.ha_token ? 'disabled' : ''}>${C.env?.ha_token ? '<span class="hint">set by the container’s HA_TOKEN</span>' : ''}</label></div>
     <label class="check" style="margin-top:8px"><input type="checkbox" data-path="ha.verify_ssl" ${C.ha.verify_ssl ? 'checked' : ''}> Verify TLS certificate</label>
     <p class="hint">${S.status.ha.connected ? 'Connected to Home Assistant ' + esc(S.status.ha.version) + '.' : 'Not connected: ' + esc(S.status.ha.error || '') + '. The entity lists below fill once it is.'}</p></div>`;
   html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors</th><th>Windows face</th></tr>`;
