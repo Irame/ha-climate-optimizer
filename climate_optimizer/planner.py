@@ -276,6 +276,7 @@ class Planner:
             functions[z] = [fns.get(f) or next(iter(fns.values())) for f in res.function[z]]
 
         units = []
+        uncontrolled = set()  # units the optimizer cannot run at all: off, unknown, or run by their own thermostat
         for u in layout.units:
             m = umap.get(u.id) or {}
             ps = self.collector.states.get(m.get("proxy", ""))
@@ -284,6 +285,7 @@ class Planner:
             mode_now = ps.get("state") if ps else None
             note = None
             if ps is None:
+                allowed[:] = False
                 note = "proxy not found"
             elif mode_now in OFF_STATES:
                 allowed[:] = False
@@ -291,6 +293,8 @@ class Planner:
             elif not cfg.shadow and mode_now != "auto":
                 allowed[:] = False
                 note = f"proxy in {mode_now}, not auto"
+            if note:
+                uncontrolled.add(u.id)
             if u.zone in open_zone:
                 allowed &= starts_min >= st.window_assume_open_min
             attrs = (ps or {}).get("attributes") or {}
@@ -312,6 +316,16 @@ class Planner:
             proxies[u.id] = {"proxy": m.get("proxy"), "state": mode_now, "note": note, "levels": [lo, hi],
                              "running": running, "comfort": comfort.get(u.zone, [None])[0] if u.zone in comfort else None}
 
+        # A room whose units are all off is not the plan's to keep warm: pricing its
+        # comfort would only have the plan heat the neighbours to warm it through
+        # the hallway. (A scheduled lockout is different: heating ahead of it is fair.)
+        for z in list(comfort):
+            here = [u.id for u in layout.units if u.zone == z]
+            if here and all(uid in uncontrolled for uid in here):
+                del comfort[z], functions[z]
+                info.setdefault("no_comfort", {})[z] = proxies[here[0]]["note"]
+                for uid in here:
+                    proxies[uid]["comfort"] = None
         pr = mpc.Problem(sysm, t, dist, win, price, x0, comfort, functions, units, st)
         info.update({"units": proxies, "schedule": {"function": res.function, "source": res.source, "offset": res.offset,
                                                     "locked": res.locked}, "x0": x0.tolist(), "trained": self.params is not None})

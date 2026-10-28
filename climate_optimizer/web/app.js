@@ -177,8 +177,10 @@ pages.dashboard = async (redraw) => {
     const opt = us.proxy_attrs?.optimizer;
     html += `<div class="card unit-card">
       <div class="top"><span class="name"><i style="background:${zoneColor(u.zone)}"></i>${esc(u.name)}</span>${state}</div>
-      <div class="temp">${num(z.temperature, 1)} °C<small>comfort ${num(comfort, 1)} °C</small></div>
-      <div class="line">${fnId ? esc(fnName(fnId)) + (info.schedule.source?.[u.zone]?.[0] && info.schedule.source[u.zone][0] !== 'default' ? ' · ' + esc(info.schedule.source[u.zone][0]) : '') : 'no comfort cost'}${next ? ' · ' + next : ''}</div>
+      <div class="temp">${num(z.temperature, 1)} °C<small>${comfort !== undefined ? `comfort ${num(comfort, 1)} °C` : 'no comfort cost'}</small></div>
+      <div class="line">${comfort !== undefined && fnId ? esc(fnName(fnId)) + (info.schedule.source?.[u.zone]?.[0] && info.schedule.source[u.zone][0] !== 'default' ? ' · ' + esc(info.schedule.source[u.zone][0]) : '')
+        + (P?.comfort_cost?.[u.zone] >= 0.005 ? ` · ${num(P.comfort_cost[u.zone], 2)} € off comfort` : '')
+        : info.no_comfort?.[u.zone] ? 'not the plan’s to heat while the unit is off' : 'no comfort temperature'}${next ? ' · ' + next : ''}</div>
       <div class="line">${esc(us.proxy || 'no proxy')}${us.proxy_state ? ' · ' + esc(us.proxy_state) : ''}${opt ? ' · ' + esc(opt) : ''} ${notes.join(' ')}</div>
     </div>`;
   }
@@ -192,7 +194,10 @@ pages.dashboard = async (redraw) => {
     html += `<div class="stats" style="margin-bottom:14px">
       <div class="stat"><div class="k">Plan</div><div class="v">${P.mode === 'cool' ? 'Cooling' : 'Heating'}</div><div class="s">${num(hours, 0)} h ahead · ${ago(S.plan.created)}</div></div>
       <div class="stat"><div class="k">Electricity</div><div class="v">${num(c.energy, 2)} €</div><div class="s">${num(kwh, 1)} kWh over the plan</div></div>
-      <div class="stat"><div class="k">Comfort cost</div><div class="v">${num(c.comfort, 2)} €</div><div class="s">deviations, as priced</div></div>
+      <div class="stat"><div class="k">Comfort cost</div><div class="v">${num(c.comfort, 2)} €</div><div class="s">${(() => {
+        const top = Object.entries(P.comfort_cost || {}).filter(([, v]) => v >= 0.01).sort((a, b) => b[1] - a[1]).slice(0, 2);
+        return top.length ? 'mostly ' + top.map(([z, v]) => `${esc(zoneName(z))} ${num(v, 2)} €`).join(', ') : 'deviations, as priced';
+      })()}</div></div>
       <div class="stat"><div class="k">Starts</div><div class="v">${num(c.starts, 2)} €</div><div class="s">compressor and heater</div></div>
       <div class="stat"><div class="k">Heat missing at the end</div><div class="v">${num(c.terminal, 2)} €</div><div class="s">solved in ${num(P.seconds, 1)} s · ${esc(P.status)}</div></div>
     </div>`;

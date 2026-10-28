@@ -121,6 +121,7 @@ class Plan:
     seconds: float
     gap: float | None = None
     alternatives: dict[str, float] = field(default_factory=dict)  # mode -> objective of the others tried
+    comfort_cost: dict[str, float] = field(default_factory=dict)  # zone -> € of deviation over the plan
 
     def step_at(self, t_ms: float) -> int | None:
         if self.t[0] - 5 * MIN <= t_ms < self.t[0]:
@@ -141,6 +142,7 @@ class Plan:
             "cost": {k: round(v, 4) for k, v in self.cost.items()},
             "status": self.status, "seconds": round(self.seconds, 2), "gap": self.gap,
             "alternatives": {k: round(v, 4) for k, v in self.alternatives.items()},
+            "comfort_cost": {k: round(v, 4) for k, v in self.comfort_cost.items()},
         }
 
 
@@ -427,6 +429,7 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
 
     # comfort
     seg_vars = []
+    seg_zone: dict[str, list[int]] = {}
     for z, Tc in pr.comfort.items():
         i = zid.index(z)
         for k in range(N):
@@ -439,6 +442,7 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
                     cols.append(v)
                     vals.append(1.0)
                     seg_vars.append(v)
+                    seg_zone.setdefault(z, []).append(v)
                 # below: Ta + sum >= Tc ; above: -Ta + sum >= -Tc
                 R.add(cols, vals, lo=float(sgn * Tc[k]))
 
@@ -499,6 +503,7 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
         cost={"energy": energy, "comfort": comfort_cost, "starts": starts_cost, "terminal": term_cost,
               "total": energy + comfort_cost + starts_cost + term_cost},
         status=status, seconds=seconds, gap=getattr(res, "mip_gap", None),
+        comfort_cost={z: float(np.dot(x[v], np.array(V.c)[v])) for z, v in seg_zone.items()},
     )
     return plan, float(res.fun)
 

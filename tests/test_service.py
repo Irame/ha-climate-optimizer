@@ -143,3 +143,21 @@ def test_training_progress(client, tmp_path):
         assert p["stage"] == "fit" and p["evaluations"] == 50 and p["budget"] == 200
     finally:
         t.running = False
+
+
+def test_a_room_whose_units_are_off_costs_no_comfort(client):
+    """Pricing it would only have the plan heat the neighbours to warm it."""
+    svc = client.svc
+    world = svc.ha.world
+    world.units["bath"]["proxy_mode"] = "off"
+    try:
+        for s in world.states():  # let the collector see it
+            svc.collector.states[s["entity_id"]] = s
+        r = client.post("/api/plan").json()
+        assert "bath" not in r["plan"]["comfort"]
+        assert r["info"]["no_comfort"] == {"bath": "proxy is off"}
+        assert set(r["plan"]["comfort_cost"]) <= {"office", "bedroom", "living"}
+    finally:
+        world.units["bath"]["proxy_mode"] = "auto"
+        for s in world.states():
+            svc.collector.states[s["entity_id"]] = s
