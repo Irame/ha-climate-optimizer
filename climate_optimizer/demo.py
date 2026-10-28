@@ -3,7 +3,8 @@
 DEMO=1 python -m climate_optimizer starts the service against it: a week of
 made-up history is loaded into the store, then the apartment lives on in
 real time. Its proxies ask the optimizer every minute, like the real ones,
-and run their own thermostat when told not to follow.
+and run their own thermostat when told not to follow. The demo keeps its
+data in DATA_DIR/demo-data, apart from the real data.
 """
 
 from __future__ import annotations
@@ -296,7 +297,12 @@ def demo_service(data: Path):
     return svc
 
 
+def demo_dir() -> Path:
+    """Apart from the real data: the demo's made-up history must never be trained on."""
+    return Path(os.environ.get("DATA_DIR", ".")) / "demo-data"
+
+
 def demo_app():
     from .app import create_app
 
-    return create_app(service=demo_service(Path(os.environ.get("DATA_DIR", "./demo-data"))))
+    return create_app(service=demo_service(demo_dir()))

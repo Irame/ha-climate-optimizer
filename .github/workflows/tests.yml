@@ -19,3 +19,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t climate-optimizer .
+      - name: Start it on a data directory owned by root, as Docker creates one
+        run: |
+          mkdir data && sudo chown root:root data
+          docker run -d --name co -p 8099:8099 -e DEMO=1 -v "$PWD/data:/data" climate-optimizer
+          for i in $(seq 60); do
+            if curl -fs localhost:8099/api/status | grep -q '"connected":true'; then ok=1; break; fi
+            sleep 2
+          done
+          docker logs co
+          test "$ok" = 1
+          test "$(stat -c %u data)" = 1000
+          test -f data/demo-data/config.json
+          test ! -e data/config.json

@@ -54,6 +54,8 @@ Without Home Assistant, `DEMO=1` runs the optimizer against a simulated apartmen
 docker run --rm -p 8099:8099 -e DEMO=1 $(docker build -q .)
 ```
 
+The container starts as root, hands its data directory to `PUID:PGID` (default `1000:1000`) and then runs as that user, so a `./data` directory that Docker created as root works as it is. With `user:` set in the compose file the container cannot change ownership; the directory must then already be writable for that user.
+
 ### Prices
 
 - `tibber_prices`: the `tibber_prices.get_price` action of the Tibber Prices integration.
@@ -82,7 +84,7 @@ The proxy's fan mode offset limits the levels: an offset of −1 caps the top le
 ```sh
 pip install -e ".[test]"
 pytest
-DEMO=1 DATA_DIR=./demo-data python -m climate_optimizer
+DEMO=1 DATA_DIR=. python -m climate_optimizer   # data in ./demo-data
 ```
 
 | Module | Contents |

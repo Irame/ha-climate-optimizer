@@ -15,4 +15,7 @@ services:
       HA_URL: http://homeassistant.local:8123
       HA_TOKEN: ${HA_TOKEN}  # a long-lived access token, e.g. from an .env file
       TZ: Europe/Berlin
-      # DEMO: "1"           # a simulated apartment instead of Home Assistant
+      # The service runs as this user and takes ownership of ./data on start.
+      # PUID: "1000"
+      # PGID: "1000"
+      # DEMO: "1"           # a simulated apartment instead of Home Assistant (data in ./data/demo-data)
