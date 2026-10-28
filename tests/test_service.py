@@ -93,3 +93,53 @@ def test_fan_modes_come_from_the_proxy(client):
     client.post("/api/v1/command", json=body)
     assert svc.planner.mapping()["units"]["office"]["fan_modes"] == ["silent", "low", "high", "turbo"]
     client.put("/api/config", json={"mapping": old})
+
+
+def test_diagnostics_roundtrip(client, tmp_path):
+    import gzip
+    import json
+
+    from climate_optimizer.model.dataset import build_grid, parse_rows
+
+    client.put("/api/config", json={"ha": {"token": "secret"}, "api_token": ""})
+    r = client.get("/api/diagnostics?days=3")
+    assert r.status_code == 200 and r.headers["content-type"] == "application/gzip"
+    d = json.loads(gzip.decompress(r.content))
+    assert d["kind"] == "climate-optimizer diagnostics"
+    assert "secret" not in json.dumps(d)
+    assert d["config"]["ha"]["token"] == "" and d["params"]
+    # it is an export: it builds the training grid as it is, and loads back in
+    svc = client.svc
+    g = build_grid(parse_rows(d), svc.cfgs.config.layout_obj(), d["config"]["mapping"], min_hours=24)
+    assert g.K > 500 and g.valid.mean() > 0.9
+    n = client.post("/api/import", content=r.content).json()["rows"]
+    assert n > 1000
+
+
+def test_diagnostics_cli(client, tmp_path, monkeypatch):
+    import gzip
+    import json
+    import sys
+
+    from climate_optimizer import diagnostics
+
+    out = tmp_path / "d.json.gz"
+    monkeypatch.setattr(sys, "argv", ["x", "--data", str(client.svc.store_path.parent), "--days", "2", "--out", str(out)])
+    monkeypatch.setattr(diagnostics.os, "geteuid", lambda: 1000)
+    diagnostics.main()
+    d = json.loads(gzip.decompress(out.read_bytes()))
+    assert d["stats_5min"] and d["history"]
+
+
+def test_training_progress(client, tmp_path):
+    from climate_optimizer.trainer import write_progress
+
+    t = client.svc.trainer
+    write_progress(t.progress_path, {"stage": "fit", "evaluations": 50, "budget": 200})
+    assert t.progress() is None  # nothing running
+    t.running, t.started = True, 0.0
+    try:
+        p = client.get("/api/model").json()["progress"]
+        assert p["stage"] == "fit" and p["evaluations"] == 50 and p["budget"] == 200
+    finally:
+        t.running = False

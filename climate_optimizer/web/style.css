@@ -181,3 +181,11 @@ button:disabled { opacity: 0.5; cursor: default; }
   .fn-card, .two { grid-template-columns: 1fr; }
   .fn-card .sides { grid-template-columns: 1fr; }
 }
+
+.progress { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; }
+.progress span { display: block; height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.6s ease; }
+.multi { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.multi .chip { cursor: default; padding-right: 4px; }
+.multi .x { border: none; background: none; padding: 0 4px; font-size: 14px; line-height: 1; color: var(--ink-2); cursor: pointer; }
+.multi .x:hover { color: var(--critical); }
+.multi select { flex: 1; min-width: 140px; }

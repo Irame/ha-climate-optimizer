@@ -4,8 +4,10 @@ are answered while it runs."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import multiprocessing as mp
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 
@@ -33,29 +35,55 @@ def _plain(x):
     return x
 
 
-def train_job(export: dict, layout: dict, mapping: dict, initial: dict | None) -> dict:
+def write_progress(path: str | None, d: dict) -> None:
+    if not path:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({**d, "t": time.time()}, f)
+    os.replace(tmp, path)
+
+
+def train_job(export: dict, layout: dict, mapping: dict, initial: dict | None, progress_path: str | None = None) -> dict:
     from .model.dataset import build_grid, parse_rows
     from .model.fit import train
     from .model.layout import Layout, Params
 
+    write_progress(progress_path, {"stage": "grid"})
     lay = Layout.from_dict(layout)
     grid = build_grid(parse_rows(export), lay, mapping)
-    res = train(lay, grid, Params.from_dict(initial) if initial else None)
+    res = train(lay, grid, Params.from_dict(initial) if initial else None,
+                progress=lambda d: write_progress(progress_path, d))
     return {"params": res["params"].to_dict(), "report": _plain(res["report"])}
 
 
 class Trainer:
-    def __init__(self, planner):
+    def __init__(self, planner, progress_path: str | None = None):
         self.planner = planner
         self.running = False
         self.started: float | None = None
         self.error: str | None = None
+        self.progress_path = progress_path
         self._pool: ProcessPoolExecutor | None = None
+
+    def progress(self) -> dict | None:
+        """Where a running training is: stage, and for the fit how far into its budget."""
+        if not self.running:
+            return None
+        d = {"stage": "export"}
+        if self.progress_path:
+            try:
+                with open(self.progress_path) as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                pass
+        return {**d, "elapsed_s": time.time() - (self.started or time.time())}
 
     async def run(self, use_current: bool = True) -> None:
         if self.running:
             return
         self.running, self.started, self.error = True, time.time(), None
+        write_progress(self.progress_path, {"stage": "export"})
         p = self.planner
         cfg = p.cfg
         try:
@@ -67,7 +95,7 @@ class Trainer:
                 self._pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
             initial = p.params.to_dict() if (use_current and p.params) else None
             loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(self._pool, train_job, export, cfg.layout, p.mapping(), initial)
+            res = await loop.run_in_executor(self._pool, train_job, export, cfg.layout, p.mapping(), initial, self.progress_path)
             from .model.layout import Params
             p.params = Params.from_dict(res["params"])
             p.report = {**res["report"], "finished": time.time() * 1000}

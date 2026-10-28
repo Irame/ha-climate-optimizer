@@ -11,7 +11,7 @@ const H = 36e5, MIN = 6e4;
 
 function token() { try { return localStorage.getItem('co-token') || ''; } catch { return ''; } }
 async function api(path, opts = {}) {
-  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const headers = { 'Content-Type': opts.raw ? 'application/octet-stream' : 'application/json', ...(opts.headers || {}) };
   const t = token();
   if (t) headers.Authorization = 'Bearer ' + t;
   const r = await fetch('api/' + path, { ...opts, headers });
@@ -25,7 +25,47 @@ async function api(path, opts = {}) {
     try { const j = await r.json(); msg = j.detail || msg; } catch { }
     throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
   }
-  return r.json();
+  return opts.blob ? r.blob() : r.json();
+}
+
+// ---- entity pickers ---------------------------------------------------------------
+// which entities fit a field: its domains, and the ones that most likely are meant listed first
+const KINDS = {
+  temp: { domains: ['sensor'], likely: e => e.device_class === 'temperature' || /°/.test(e.unit || '') },
+  power: { domains: ['sensor'], likely: e => e.device_class === 'power' || /^k?W$/.test(e.unit || '') },
+  opening: { domains: ['binary_sensor'], likely: e => ['door', 'window', 'opening', 'garage_door'].includes(e.device_class) },
+  climate: { domains: ['climate'] },
+  switch: { domains: ['switch', 'input_boolean'] },
+  weather: { domains: ['weather'] },
+  price: { domains: ['sensor'], likely: e => /kwh/i.test(e.unit || '') || e.device_class === 'monetary' },
+  calendar: { domains: ['calendar'] },
+};
+function entityOptions(kind, value, none = '— none —') {
+  const k = KINDS[kind];
+  const all = (S.entities || []).filter(e => k.domains.includes(e.id.split('.')[0]))
+    .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+  const opt = e => `<option value="${esc(e.id)}" ${e.id === value ? 'selected' : ''}>${esc(e.name ? `${e.name} (${e.id})` : e.id)}</option>`;
+  let html = none === null ? '' : `<option value="">${none}</option>`;
+  if (value && !all.some(e => e.id === value)) html += `<option value="${esc(value)}" selected>${esc(value)} (not in Home Assistant)</option>`;
+  const likely = k.likely ? all.filter(k.likely) : all;
+  const other = k.likely ? all.filter(e => !k.likely(e)) : [];
+  if (other.length && likely.length) html += `<optgroup label="Likely">${likely.map(opt).join('')}</optgroup><optgroup label="Other">${other.map(opt).join('')}</optgroup>`;
+  else html += all.map(opt).join('');
+  return html;
+}
+const entitySelect = (path, kind, value) => `<select data-path="${path}" data-kind="${kind}" style="width:100%">${entityOptions(kind, value)}</select>`;
+const entityMulti = (path, kind, values) => `<div class="multi" data-path="${path}" data-kind="${kind}" data-multi="${esc(JSON.stringify(values || []))}"></div>`;
+function initMulti(box) {
+  let vals = JSON.parse(box.dataset.multi || '[]');
+  const name = id => (S.entities || []).find(e => e.id === id)?.name || id;
+  const render = () => {
+    box.dataset.multi = JSON.stringify(vals);
+    box.innerHTML = vals.map((v, i) => `<span class="chip active" title="${esc(v)}">${esc(name(v))}<button type="button" class="x" data-i="${i}" aria-label="Remove ${esc(name(v))}">×</button></span>`).join('')
+      + `<select class="add" aria-label="Add">${entityOptions(box.dataset.kind, '', vals.length ? 'add another…' : 'add…')}</select>`;
+    box.querySelectorAll('.x').forEach(b => b.onclick = () => { vals.splice(+b.dataset.i, 1); render(); });
+    box.querySelector('.add').onchange = e => { const v = e.target.value; if (v && !vals.includes(v)) vals.push(v); render(); };
+  };
+  render();
 }
 
 const S = { config: null, status: null, plan: null, history: null, entities: null, tz: undefined, zoneSel: 'all' };
@@ -286,6 +326,7 @@ pages.comfort = async (redraw) => {
   const root = $('#page-comfort');
   if (!redraw || !S.draft) {
     await loadBase();
+    if (!S.entities) S.entities = await api('entities').catch(() => []);
     S.draft = JSON.parse(JSON.stringify({ functions: S.config.functions, defaults: S.config.defaults, comfort: S.config.comfort, rules: S.config.rules, calendar: S.config.calendar }));
   }
   const D = S.draft, L = S.config.layout;
@@ -307,12 +348,10 @@ pages.comfort = async (redraw) => {
   html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Rules</h3><span class="spacer"></span><button id="rule-add">Add rule</button></div>
     <p class="hint">A rule switches a room to another comfort function, moves its comfort temperature, or keeps units off, at recurring times. Where rules overlap, the higher priority wins. "Every other week, Monday to Thursday evenings": weekly, every 2 weeks, those four days, 18:00–23:00, starting on a Monday of an "on" week.</p>
     <div id="rule-list"></div></div>`;
-  html += `<div class="card"><h3>Calendar</h3><div class="fields"><label class="field">Calendar entity<input id="cal" list="dl-calendar" value="${esc(D.calendar)}" placeholder="calendar.climate"></label></div>
+  html += `<div class="card"><h3>Calendar</h3><div class="fields"><label class="field">Calendar entity<select id="cal">${entityOptions('calendar', D.calendar, '— no calendar —')}</select></label></div>
     <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K. Rooms and functions match by name or id.</p></div>`;
   html += `<div class="card"><div class="toolbar"><h3 style="margin:0">The next two weeks</h3><span class="spacer"></span><span class="hint">saved rules · hatched: units kept off</span></div><div id="preview"></div></div>`;
-  html += `<datalist id="dl-calendar">${(S.entities || []).filter(e => e.id.startsWith('calendar.')).map(e => `<option value="${esc(e.id)}">`).join('')}</datalist>`;
   root.innerHTML = html;
-  if (!S.entities) api('entities').then(e => { S.entities = e; }).catch(() => { });
 
   // functions
   const list = $('#fn-list');
@@ -359,7 +398,7 @@ pages.comfort = async (redraw) => {
   };
   root.querySelectorAll('[data-default]').forEach(s => s.onchange = () => { if (s.value) D.defaults[s.dataset.default] = s.value; else delete D.defaults[s.dataset.default]; });
   root.querySelectorAll('[data-comfort]').forEach(s => s.oninput = () => { if (s.value === '') delete D.comfort[s.dataset.comfort]; else D.comfort[s.dataset.comfort] = +s.value; });
-  $('#cal').oninput = e => { D.calendar = e.target.value.trim(); };
+  $('#cal').onchange = e => { D.calendar = e.target.value; };
 
   // rules
   const rl = $('#rule-list');
@@ -476,15 +515,37 @@ async function drawPreview() {
 }
 
 // ---- model ----------------------------------------------------------------------
+const STAGES = {
+  export: 'Reading the recorded history',
+  grid: 'Laying it onto a 5-minute grid',
+  fit: 'Fitting the model to it',
+  check: 'Predicting the held-back days',
+};
+function trainingProgress(pg) {
+  // a share for the bar: the fit's evaluation budget is an upper bound, it often stops early
+  const share = !pg ? 0 : pg.stage === 'export' ? 0.02 : pg.stage === 'grid' ? 0.05
+    : pg.stage === 'fit' ? 0.05 + 0.9 * Math.min(1, (pg.evaluations || 0) / (pg.budget || 1)) : 0.97;
+  const el = pg?.elapsed_s ?? 0;
+  const detail = pg?.stage === 'fit' && pg.budget ? ` · ${pg.evaluations} of at most ${pg.budget} model runs` : '';
+  return `<div class="progress"><span style="width:${Math.round(share * 100)}%"></span></div>
+    <p class="hint" style="margin:6px 0 0">${esc(STAGES[pg?.stage] || 'Starting')}${detail} · ${Math.floor(el / 60)}:${String(Math.floor(el % 60)).padStart(2, '0')} min</p>`;
+}
+
+let modelPoll = null;
 pages.model = async () => {
   const root = $('#page-model');
+  clearTimeout(modelPoll);
   await loadBase();
   const m = await api('model');
   const rep = m.report;
   const L = S.config.layout;
   let html = `<div class="toolbar"><h2 style="margin:0">Model</h2><span class="spacer"></span>
-    <button id="train" ${m.training ? 'disabled' : ''}>${m.training ? 'Training…' : 'Retrain now'}</button>
-    <button id="train-fresh" ${m.training ? 'disabled' : ''}>Train from scratch</button></div>`;
+    <button id="diag" title="The recorded history, settings without secrets, the model and its report, as one file">Download diagnostics</button>
+    <button id="train" ${m.training ? 'disabled' : ''}>Retrain now</button>
+    <button id="train-fresh" ${m.training ? 'disabled' : ''}>Train from scratch</button></div>
+    <div id="diag-msg"></div>`;
+  if (m.training) html += `<div class="card" id="train-card"><h3>Training</h3><div id="train-progress">${trainingProgress(m.progress)}</div></div>`;
+  if (S.trainDone) { html += `<div class="msg ok">${esc(S.trainDone)}</div>`; S.trainDone = null; }
   if (m.error) html += `<div class="msg err">Last training failed: ${esc(m.error)}</div>`;
   if (!rep) {
     html += `<div class="msg">Not trained yet${m.training ? ' — training is running' : ''}. The optimizer uses a generic apartment until then. Training reads the recorded history (up to ${S.config.history_days} days) and runs every night at ${S.config.retrain_hour}:00.</div>`;
@@ -509,23 +570,67 @@ pages.model = async () => {
     }
     html += `</table></div><p class="hint">Heating output at 7 °C outside; it falls ${num((m.params.plant.cap_slope || 0) * 100, 1)} % per kelvin colder. The shared outdoor unit delivers at most ${num(m.params.plant.Qmax, 1)} kW.</p></div>`;
     if (rep.validation?.length) {
-      html += `<div class="card"><div class="toolbar"><h3 style="margin:0">A check day: predicted from midnight against measured</h3><span class="spacer"></span><div class="chips" id="val-zones"></div></div><div id="val-chart"></div></div>`;
+      html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Check days: predicted from midnight against measured</h3><span class="spacer"></span><div class="chips" id="val-days"></div></div>
+        <div class="toolbar"><div class="chips" id="val-zones"></div></div><div id="val-chart"></div></div>`;
     }
   }
   root.innerHTML = html;
-  $('#train').onclick = () => api('model/train', { method: 'POST' }).then(() => setTimeout(() => pages.model(), 1500));
-  $('#train-fresh').onclick = () => api('model/train?fresh=true', { method: 'POST' }).then(() => setTimeout(() => pages.model(), 1500));
+  $('#train').onclick = () => api('model/train', { method: 'POST' }).then(() => pages.model());
+  $('#train-fresh').onclick = () => api('model/train?fresh=true', { method: 'POST' }).then(() => pages.model());
+  $('#diag').onclick = async () => {
+    const b = $('#diag'), box = $('#diag-msg');
+    b.disabled = true;
+    box.innerHTML = '<div class="msg">Collecting…</div>';
+    try {
+      const blob = await api('diagnostics?days=' + S.config.history_days, { blob: true });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `climate-optimizer-diagnostics-${new Date().toISOString().slice(0, 10)}.json.gz`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      box.innerHTML = `<div class="msg ok">Saved ${(blob.size / 1e6).toFixed(1)} MB. It holds the recorded temperatures, unit states and power, the settings without tokens, and the model.</div>`;
+    } catch (e) { box.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+    b.disabled = false;
+  };
+  if (m.training) {
+    // follow the training, and show the new model when it is done
+    const poll = async () => {
+      if (current !== 'model') return;
+      try {
+        const n = await api('model');
+        if (n.training) {
+          const box = $('#train-progress');
+          if (box) box.innerHTML = trainingProgress(n.progress);
+          modelPoll = setTimeout(poll, 2000);
+        } else {
+          S.trainDone = n.error ? null : `Training finished.`;
+          pages.model();
+        }
+      } catch { modelPoll = setTimeout(poll, 5000); }
+    };
+    modelPoll = setTimeout(poll, 2000);
+  }
   if (rep?.validation?.length) {
     S.valZone = S.valZone || L.zones[0].id;
+    const nd = rep.validation.length;
+    S.valDay = Math.min(S.valDay ?? nd - 1, nd - 1);
+    const zi = L.zones.findIndex(z => z.id === S.valZone);
+    const rmse = d => {
+      let s2 = 0, n = 0;
+      d.pred.forEach((r, k) => { const mv = d.meas[k]?.[zi]; if (mv !== null && mv !== undefined) { s2 += (r[zi] - mv) ** 2; n++; } });
+      return n ? Math.sqrt(s2 / n) : null;
+    };
+    const dchips = $('#val-days');
+    dchips.innerHTML = rep.validation.map((d, i) => `<button class="chip ${S.valDay === i ? 'active' : ''}" data-d="${i}">${fmtDay(d.t0 + 12 * H, S.tz)} · ${num(rmse(d), 2)} K</button>`).join('');
+    dchips.querySelectorAll('button').forEach(b => b.onclick = () => { S.valDay = +b.dataset.d; pages.model(); });
     const chips = $('#val-zones');
     chips.innerHTML = L.zones.map(z => `<button class="chip ${S.valZone === z.id ? 'active' : ''}" data-z="${z.id}"><i style="background:${zoneColor(z.id)}"></i>${esc(z.name)}</button>`).join('');
     chips.querySelectorAll('button').forEach(b => b.onclick = () => { S.valZone = b.dataset.z; pages.model(); });
-    const day = rep.validation[rep.validation.length - 1];
-    const zi = L.zones.findIndex(z => z.id === S.valZone);
+    const day = rep.validation[S.valDay];
     const t = day.pred.map((_, k) => day.t0 + k * 5 * MIN);
     const g = new ChartGroup($('#val-chart'), { x0: t[0], x1: t[t.length - 1], now: t[t.length - 1] + 1, tz: S.tz });
     g.add({ title: `${zoneName(S.valZone)} (°C)`, unit: '°C', height: 200 })
-      .line({ name: 'Measured', color: css('--muted'), t, y: day.meas.map(r => r[zi]) })
+      .line({ name: 'Measured', color: css('--muted'), t, y: day.meas.map(r => r?.[zi] ?? null) })
       .line({ name: 'Predicted', color: zoneColor(S.valZone), t, y: day.pred.map(r => r[zi]) });
     g.panels.forEach(p => p.draw());
   }
@@ -550,10 +655,7 @@ pages.settings = async () => {
   const L = C.layout;
   const M = C.mapping = C.mapping || {};
   M.zones = M.zones || {}; M.units = M.units || {};
-  const dl = (id, pred) => `<datalist id="${id}">${S.entities.filter(pred).map(e => `<option value="${esc(e.id)}">${esc(e.name || '')}</option>`).join('')}</datalist>`;
-  const temp = e => e.id.startsWith('sensor.') && (e.device_class === 'temperature' || /°/.test(e.unit || ''));
-  const power = e => e.id.startsWith('sensor.') && (e.device_class === 'power' || /^k?W$/.test(e.unit || ''));
-  const field = (label, path, list, placeholder = '') => `<label class="field">${label}<input data-path="${path}" list="${list}" value="${esc(get(C, path) ?? '')}" placeholder="${placeholder}"></label>`;
+  const field = (label, path, kind) => `<label class="field">${label}${entitySelect(path, kind, get(C, path) || '')}</label>`;
   let html = `<div class="toolbar"><h2 style="margin:0">Settings</h2><span class="spacer"></span><span id="st-msg" class="hint"></span><button class="primary" id="st-save">Save</button></div>`;
   html += `<div class="card"><h3>Mode</h3>
     <label class="check"><input type="checkbox" data-path="shadow" ${C.shadow ? 'checked' : ''}> Shadow mode: plan and show, but let the proxies’ own thermostats decide</label>
@@ -563,33 +665,34 @@ pages.settings = async () => {
     <label class="field">URL<input data-path="ha.url" value="${esc(C.ha.url)}" placeholder="http://homeassistant.local:8123"></label>
     <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}"></label></div>
     <label class="check" style="margin-top:8px"><input type="checkbox" data-path="ha.verify_ssl" ${C.ha.verify_ssl ? 'checked' : ''}> Verify TLS certificate</label>
-    <p class="hint">${S.status.ha.connected ? 'Connected to Home Assistant ' + esc(S.status.ha.version) + '.' : 'Not connected: ' + esc(S.status.ha.error || '')}</p></div>`;
-  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors (comma separated)</th></tr>`;
+    <p class="hint">${S.status.ha.connected ? 'Connected to Home Assistant ' + esc(S.status.ha.version) + '.' : 'Not connected: ' + esc(S.status.ha.error || '') + '. The entity lists below fill once it is.'}</p></div>`;
+  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors</th></tr>`;
   for (const z of L.zones) {
     M.zones[z.id] = M.zones[z.id] || {};
-    html += `<tr><td>${esc(z.name)}</td><td><input data-path="mapping.zones.${z.id}.thermometer" list="dl-temp" value="${esc(M.zones[z.id].thermometer || '')}" style="width:100%"></td>
-      <td>${z.windows ? `<input data-path="mapping.zones.${z.id}.windows" data-list="1" list="dl-binary" value="${esc((M.zones[z.id].windows || []).join(', '))}" style="width:100%">` : '<span class="hint">none in the layout</span>'}</td></tr>`;
+    html += `<tr><td>${esc(z.name)}</td><td>${entitySelect(`mapping.zones.${z.id}.thermometer`, 'temp', M.zones[z.id].thermometer || '')}</td>
+      <td>${z.windows ? entityMulti(`mapping.zones.${z.id}.windows`, 'opening', M.zones[z.id].windows) : '<span class="hint">none in the layout</span>'}</td></tr>`;
   }
   html += `</table></div></div>`;
   html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Proxy (what the optimizer answers)</th><th>Device under the proxy</th><th>${L.units.some(u => u.kind === 'heater') ? 'Heater power sensor' : ''}</th></tr>`;
   for (const u of L.units) {
     M.units[u.id] = M.units[u.id] || {};
     html += `<tr><td>${esc(u.name)}<div class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</div></td>
-      <td><input data-path="mapping.units.${u.id}.proxy" list="dl-climate" value="${esc(M.units[u.id].proxy || '')}" style="width:100%"></td>
-      <td><input data-path="mapping.units.${u.id}.source" list="${u.kind === 'ac' ? 'dl-climate' : 'dl-switch'}" value="${esc(M.units[u.id].source || '')}" style="width:100%">
-      ${u.kind === 'ac' ? `<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" value="${esc((M.units[u.id].fan_modes || []).join(', '))}" placeholder="fan modes, quietest first (empty: as the proxy reports them)" style="width:100%;margin-top:4px">` : ''}</td>
-      <td>${u.kind === 'heater' ? `<input data-path="mapping.units.${u.id}.power" list="dl-power" value="${esc(M.units[u.id].power || '')}" style="width:100%">` : ''}</td></tr>`;
+      <td>${entitySelect(`mapping.units.${u.id}.proxy`, 'climate', M.units[u.id].proxy || '')}</td>
+      <td>${entitySelect(`mapping.units.${u.id}.source`, u.kind === 'ac' ? 'climate' : 'switch', M.units[u.id].source || '')}
+      ${u.kind === 'ac' ? `<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" data-fan-for="${u.id}" value="${esc((M.units[u.id].fan_modes || []).join(', '))}" style="width:100%;margin-top:4px">
+        <div class="hint" data-fan-hint="${u.id}"></div>` : ''}</td>
+      <td>${u.kind === 'heater' ? entitySelect(`mapping.units.${u.id}.power`, 'power', M.units[u.id].power || '') : ''}</td></tr>`;
   }
-  html += `</table></div><p class="hint">Fan modes: the device’s fan modes the proxy uses, quietest first (its <code>source_fan_modes</code>); level 0 is the first.</p></div>`;
+  html += `</table></div><p class="hint">Fan modes: the device’s fan modes the proxy uses, quietest first (its <code>source_fan_modes</code>); level 0 is the first. Left empty, the optimizer takes the list the proxy sends.</p></div>`;
   html += `<div class="card"><h3>Outside, power and prices</h3><div class="fields wide">
-    ${field('Outdoor thermometer', 'mapping.outdoor', 'dl-temp')}
-    ${field('Weather (forecast)', 'mapping.weather', 'dl-weather')}
-    ${field('Phase with the outdoor unit', 'mapping.phase', 'dl-power')}
-    <label class="field">Other phases (comma separated)<input data-path="mapping.phases_other" data-list="1" list="dl-power" value="${esc((M.phases_other || []).join(', '))}"></label>
-    ${field('Car charger power (optional)', 'mapping.car', 'dl-power')}
+    ${field('Outdoor thermometer', 'mapping.outdoor', 'temp')}
+    ${field('Weather (forecast)', 'mapping.weather', 'weather')}
+    ${field('Phase with the outdoor unit', 'mapping.phase', 'power')}
+    <label class="field">Other phases${entityMulti('mapping.phases_other', 'power', M.phases_other)}</label>
+    ${field('Car charger power (optional)', 'mapping.car', 'power')}
     <label class="field">Prices from<select data-path="prices.source"><option value="tibber_prices" ${C.prices.source === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${C.prices.source === 'attributes' ? 'selected' : ''}>a sensor's attributes</option></select></label>
-    ${field('tibber_prices entry id (if several)', 'prices.entry_id', '')}
-    ${field('Price sensor', 'prices.sensor', 'dl-price')}
+    <label class="field">tibber_prices entry id (if several)<input data-path="prices.entry_id" value="${esc(C.prices.entry_id || '')}"></label>
+    ${field('Price sensor', 'prices.sensor', 'price')}
     </div><p class="hint">The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
   html += `<div class="card"><h3>Optimizer</h3><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
     <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
@@ -597,27 +700,39 @@ pages.settings = async () => {
   html += `<div class="card"><h3>Training</h3><div class="fields">
     <label class="field">Retrain every night at (hour)<input type="number" min="0" max="23" data-path="retrain_hour" value="${C.retrain_hour}"></label>
     <label class="field">History kept and trained on (days)<input type="number" min="3" max="365" data-path="history_days" value="${C.history_days}"></label></div>
-    <div class="row" style="margin-top:10px"><label class="field">Load an export from the browser snippet<input type="file" id="import-file" accept=".json,application/json"></label><span id="import-msg" class="hint"></span></div></div>`;
+    <div class="row" style="margin-top:10px"><label class="field">Load an export (browser snippet or diagnostics file)<input type="file" id="import-file" accept=".json,.gz,application/json,application/gzip"></label><span id="import-msg" class="hint"></span></div></div>`;
   html += `<div class="card"><h3>Layout (advanced)</h3><p class="hint">Rooms, how they connect, and which units heat them. Changing it means retraining.</p>
     <textarea id="layout-json" rows="12">${esc(JSON.stringify(C.layout, null, 2))}</textarea>
     <div class="fields" style="margin-top:8px"><label class="field">Latitude (default: Home Assistant’s)<input type="number" step="0.1" id="lat" value="${C.location?.lat ?? ''}"></label><label class="field">Longitude<input type="number" step="0.1" id="lon" value="${C.location?.lon ?? ''}"></label></div></div>`;
-  html += dl('dl-temp', temp) + dl('dl-power', power) + dl('dl-climate', e => e.id.startsWith('climate.'))
-    + dl('dl-binary', e => e.id.startsWith('binary_sensor.')) + dl('dl-switch', e => /^(switch|input_boolean)\./.test(e.id))
-    + dl('dl-weather', e => e.id.startsWith('weather.')) + dl('dl-price', e => e.id.startsWith('sensor.') && /kwh/i.test(e.unit || ''));
   root.innerHTML = html;
+  root.querySelectorAll('[data-multi]').forEach(initMulti);
+  // what each AC device offers, next to its fan modes
+  const fanHint = uid => {
+    const src = root.querySelector(`[data-path="mapping.units.${uid}.source"]`)?.value;
+    const offered = (S.entities || []).find(e => e.id === src)?.fan_modes;
+    const inp = root.querySelector(`[data-fan-for="${uid}"]`);
+    const hint = root.querySelector(`[data-fan-hint="${uid}"]`);
+    inp.placeholder = 'empty: as the proxy reports them';
+    hint.innerHTML = offered?.length ? `The device offers: ${offered.map(esc).join(', ')}` : '';
+  };
+  for (const u of L.units.filter(u => u.kind === 'ac')) {
+    fanHint(u.id);
+    root.querySelector(`[data-path="mapping.units.${u.id}.source"]`).addEventListener('change', () => fanHint(u.id));
+  }
 
   $('#import-file').onchange = async e => {
     const f = e.target.files[0];
     if (!f) return;
     $('#import-msg').textContent = 'Loading…';
     try {
-      const r = await api('import', { method: 'POST', body: await f.text() });
+      const r = await api('import', { method: 'POST', body: await f.arrayBuffer(), raw: true });
       $('#import-msg').textContent = `${r.rows} rows loaded. Retrain on the Model page.`;
     } catch (err) { $('#import-msg').textContent = 'Failed: ' + err.message; }
   };
   $('#st-save').onclick = async () => {
     const msg = $('#st-msg');
     root.querySelectorAll('[data-path]').forEach(inp => {
+      if (inp.dataset.multi !== undefined) { set(C, inp.dataset.path, JSON.parse(inp.dataset.multi)); return; }
       let v = inp.type === 'checkbox' ? inp.checked : inp.type === 'number' ? (inp.value === '' ? null : +inp.value) : inp.value.trim();
       if (inp.dataset.list) v = String(v).split(',').map(s => s.trim()).filter(Boolean);
       set(C, inp.dataset.path, v);

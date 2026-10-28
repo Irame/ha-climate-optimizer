@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
+import json
 import logging
 import os
 import time
@@ -12,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .collector import Collector, tracked_entities
@@ -32,13 +34,14 @@ MIN = 60_000
 class Service:
     def __init__(self, data_dir: Path = DATA, ha: HomeAssistant | None = None):
         self.cfgs = ConfigStore(data_dir / "config.json")
-        self.store = Store(data_dir / "optimizer.db")
+        self.store_path = data_dir / "optimizer.db"
+        self.store = Store(self.store_path)
         c = self.cfgs.config
         self.ha = ha or HomeAssistant(c.ha.url, c.ha.token, c.ha.verify_ssl)
         self.collector = Collector(self.ha, self.store)
         self.collector.track(tracked_entities(c.mapping))
         self.planner = Planner(lambda: self.cfgs.config, self.store, self.collector, self.ha)
-        self.trainer = Trainer(self.planner)
+        self.trainer = Trainer(self.planner, str(data_dir / "training.json"))
         self.stop = asyncio.Event()
         self.tasks: list[asyncio.Task] = []
         self.started = time.time()
@@ -177,7 +180,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
                                            "mode": p.state.plan.mode if p.state.plan else None,
                                            "cost": p.state.plan.cost if p.state.plan else None},
             "model": {"trained": p.params is not None, "finished": (p.report or {}).get("finished"),
-                      "training": s.trainer.running, "error": s.trainer.error},
+                      "training": s.trainer.running, "progress": s.trainer.progress(), "error": s.trainer.error},
             "backfill": s.collector.backfill_status, "units": units, "zones": zones,
             "outdoor": p.live(cfg.mapping.get("outdoor")), "uptime_s": time.time() - s.started, "tz": str(p.tz()),
         })
@@ -261,8 +264,11 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         out = []
         for eid, st in sorted(svc().collector.states.items()):
             a = st.get("attributes") or {}
-            out.append({"id": eid, "name": a.get("friendly_name"), "state": st.get("state"),
-                        "unit": a.get("unit_of_measurement"), "device_class": a.get("device_class")})
+            e = {"id": eid, "name": a.get("friendly_name"), "state": st.get("state"),
+                 "unit": a.get("unit_of_measurement"), "device_class": a.get("device_class")}
+            if eid.startswith("climate."):
+                e["fan_modes"] = a.get("fan_modes")
+            out.append(e)
         return out
 
     @app.get("/api/model", dependencies=[Depends(auth)])
@@ -270,7 +276,8 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         s = svc()
         _, params = s.planner.model()
         return _json({"params": params.to_dict(), "trained": s.planner.params is not None, "report": s.planner.report,
-                      "training": s.trainer.running, "started": s.trainer.started, "error": s.trainer.error})
+                      "training": s.trainer.running, "started": s.trainer.started, "progress": s.trainer.progress(),
+                      "error": s.trainer.error})
 
     @app.post("/api/model/train", dependencies=[Depends(auth)])
     async def train(fresh: bool = False):
@@ -295,9 +302,25 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         return {"start": int(t0.timestamp() * 1000), "step_min": step_min, "function": res.function,
                 "offset": res.offset, "locked": res.locked, "source": res.source}
 
+    @app.get("/api/diagnostics", dependencies=[Depends(auth)])
+    async def diagnostics(days: float = 30):
+        from .diagnostics import collect, to_gzip
+        s = svc()
+        days = max(1.0, min(days, 365.0))
+        blob = await asyncio.to_thread(lambda: to_gzip(collect(s.cfgs.config, s.store, s.collector.meta, days)))
+        name = datetime.now(s.planner.tz()).strftime("climate-optimizer-diagnostics-%Y%m%d-%H%M.json.gz")
+        return Response(blob, media_type="application/gzip", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
     @app.post("/api/import", dependencies=[Depends(auth)])
-    async def import_export(export: dict):
-        """Load an export from the browser snippet into the store, e.g. before the first training."""
+    async def import_export(request: Request):
+        """Load an export (the browser snippet's, or a diagnostics file) into the store, e.g. before the first training."""
+        raw = await request.body()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        try:
+            export = json.loads(raw)
+        except ValueError:
+            raise HTTPException(422, "not a JSON export")
         s = svc()
         n = 0
         for eid, rows in (export.get("history") or {}).items():

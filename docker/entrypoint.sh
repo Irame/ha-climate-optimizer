@@ -7,9 +7,8 @@ if [ "$(id -u)" = "0" ]; then
   PUID="${PUID:-1000}"
   PGID="${PGID:-1000}"
   mkdir -p "$DATA_DIR"
-  if [ "$(stat -c %u:%g "$DATA_DIR")" != "$PUID:$PGID" ]; then
-    chown -R "$PUID:$PGID" "$DATA_DIR"
-  fi
+  # whatever in it is someone else's: the directory itself, or a file root wrote
+  find "$DATA_DIR" \( ! -user "$PUID" -o ! -group "$PGID" \) -exec chown "$PUID:$PGID" {} +
   HOME=/tmp exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups -- "$@"
 fi
 if [ ! -w "$DATA_DIR" ]; then

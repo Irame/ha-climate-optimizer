@@ -56,6 +56,16 @@ docker run --rm -p 8099:8099 -e DEMO=1 $(docker build -q .)
 
 The container starts as root, hands its data directory to `PUID:PGID` (default `1000:1000`) and then runs as that user, so a `./data` directory that Docker created as root works as it is. With `user:` set in the compose file the container cannot change ownership; the directory must then already be writable for that user.
 
+### Diagnostics
+
+**Download diagnostics** on the Model page writes one file with what the training reads: the recorded temperatures, unit states and power (numeric sensors as 5-minute means), the settings without the Home Assistant URL and tokens, the trained model and its report, and the last three days of plans. Without the page:
+
+```sh
+docker exec climate-optimizer python -m climate_optimizer.diagnostics --out /data/diagnostics.json.gz
+```
+
+The file is an export: Settings, "Load an export" reads it back in.
+
 ### Prices
 
 - `tibber_prices`: the `tibber_prices.get_price` action of the Tibber Prices integration.

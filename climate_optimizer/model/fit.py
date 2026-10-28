@@ -275,15 +275,23 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
         return np.concatenate([np.nan_to_num(rt), rp, rpr])
 
     calls = {"n": 0}
+    # least_squares counts at most max_nfev rounds, each one Jacobian (one
+    # evaluation per parameter) and a step: an upper bound, often not reached
+    budget = (len(plist) + 1) * FIT["max_nfev"]
 
     def fun(theta):
         calls["n"] += 1
         if progress and calls["n"] % 25 == 0:
-            progress({"stage": "fit", "evaluations": calls["n"]})
+            progress({"stage": "fit", "evaluations": calls["n"], "budget": budget})
         return residuals(theta)
+
+    if progress:
+        progress({"stage": "fit", "evaluations": 0, "budget": budget})
 
     res = least_squares(fun, theta0, method="trf", loss="huber", f_scale=1.5, max_nfev=FIT["max_nfev"], x_scale="jac")
     model = from_theta(res.x, plist, base)
+    if progress:
+        progress({"stage": "check"})
     for uid, kw in heater_power(grid).items():
         model.units[uid]["kw"] = kw
     report = check(layout, model, grid, pw, train_days, val_days, per_day)
