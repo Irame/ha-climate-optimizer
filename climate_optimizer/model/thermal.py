@@ -8,8 +8,12 @@ exchange heat through their air along the layout's links.
 
     Ca dTa/dt = H (Tout - Ta) + Hw open (Tout - Ta) + Ham (Tm - Ta)
               + sum L (Ta_other - Ta) + Q_units + q + qc cos(h) + qs sin(h)
-    Cm dTm/dt = Ham (Ta - Tm) + Hmw (Tw - Tm) + sD D + sE E + sS S + sW W
+              + fa (sD D + sE E + sS S + sW W)
+    Cm dTm/dt = Ham (Ta - Tm) + Hmw (Tw - Tm) + (1 - fa) (sD D + sE E + sS S + sW W)
     Cw dTw/dt = Hmw (Tm - Tw) + Hwo (Tout - Tw) + Hwn (Tnb - Tw)
+
+The sun through the windows mostly lands on floors and furniture; the share
+fa (building "solar_air") warms the air at once.
 
 Everything is linear in the temperatures, so a step of any length is exact
 (zero-order hold through the matrix exponential), which the optimizer needs.
@@ -88,8 +92,10 @@ def build(layout: Layout, params: Params) -> System:
         d0 = nu
         B[a, d0 + DIST.index("tout")] += p["H"] / Ca
         B[w, d0 + DIST.index("tout")] += p["Hwo"] / Cw
+        fa = params.building.get("solar_air", 0.0)
         for f in FACADES:
-            B[mm, d0 + DIST.index(f)] += p["s" + f] / Cm
+            B[mm, d0 + DIST.index(f)] += (1 - fa) * p["s" + f] / Cm
+            B[a, d0 + DIST.index(f)] += fa * p["s" + f] / Ca
         B[a, d0 + DIST.index("hc")] += p.get("qc", 0.0) / Ca
         B[a, d0 + DIST.index("hs")] += p.get("qs", 0.0) / Ca
         B[a, d0 + DIST.index("one")] += p["q"] / Ca
@@ -171,7 +177,8 @@ def estimate_hidden(sys: System, T: np.ndarray, tout: np.ndarray, sol: np.ndarra
         T0 = float(np.nanmean(ta[:first])) if np.isfinite(ta[:first]).any() else 20.0
         Ac = np.array([[-(p["Ham"] + p["Hmw"]) / p["Cm"], p["Hmw"] / p["Cm"]],
                        [p["Hmw"] / p["Cw"], -(p["Hmw"] + p["Hwo"] + p["Hwn"]) / p["Cw"]]])
-        Bc = np.array([[p["Ham"] / p["Cm"], 0.0, 1.0 / p["Cm"], 0.0],
+        fa = params.building.get("solar_air", 0.0)
+        Bc = np.array([[p["Ham"] / p["Cm"], 0.0, (1 - fa) / p["Cm"], 0.0],
                        [0.0, p["Hwo"] / p["Cw"], 0.0, p["Hwn"] / p["Cw"]]])
         M = np.zeros((6, 6))
         M[:2, :2] = Ac * dt_h

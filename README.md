@@ -6,7 +6,7 @@ It runs as a container next to Home Assistant, with its own web page for the pla
 
 ## How it decides
 
-**The model.** Every room is three heat stores: its air (what the thermometer reads), its surfaces and furniture (charged within hours), and the structure behind them (walls and floors: days). Rooms exchange heat through their air. Losses go to the outside and to the neighbours; sun comes in through the facades; open windows and doors add losses. Each AC unit delivers a learned amount of heat per fan level, a little less the colder it is outside, and all units share one outdoor unit with a learned efficiency. The numbers are fitted every night to the recorded temperatures, unit states, plug and phase power, and checked on days held back from the fit.
+**The model.** Every room is three heat stores: its air (what the thermometer reads), its surfaces and furniture (charged within hours), and the structure behind them (walls and floors: days). Rooms exchange heat through their air. Losses go to the outside and to the neighbours; sun comes in through the facades; open windows and doors add losses. Each AC unit delivers a learned amount of heat per fan level, a little less the colder it is outside, and all units share one outdoor unit with a learned efficiency. The numbers are fitted every night to the recorded temperatures, unit states, plug and phase power, and checked on days held back from the fit. Two weeks of history cannot tell every number apart (a bigger heat store or a smaller loss look much alike for a while), so the fit leans on what a typical apartment is like and lets the data move away from it where it clearly says so; the units' heat per fan level comes from the phase measurement. A thermometer that stands still for hours counts as having stopped reporting. Sunny days teach the model about sun; until it has seen a few, it predicts them too cool.
 
 **The plan.** Every five minutes the optimizer minimises, over the horizon of known prices:
 
@@ -37,7 +37,7 @@ docker compose up -d --build
 
 Then open `http://<host>:8099`:
 
-1. **Settings:** check the Home Assistant connection. For every room, choose the thermometer and the window or door sensors. For every unit, choose its proxy entity and the device under it, plus the fan modes quietest first. Then set the outdoor thermometer, the weather entity, the phase the outdoor unit hangs on, and the price source. Save.
+1. **Settings:** check the Home Assistant connection. For every room, choose the thermometer and the window or door sensors, and tick where its windows face: the model then looks for sun only from there, which it learns much sooner. For every unit, choose its proxy entity and the device under it, plus the fan modes quietest first. Then set the outdoor thermometer, the weather entity, the phase the outdoor unit hangs on, and the price source. Save.
 2. The optimizer backfills what Home Assistant's recorder has (10 days by default) and trains on it. This takes a minute or two. The **Model** page shows how well it predicts.
 3. Point every proxy at the optimizer and set it to `auto`:
 

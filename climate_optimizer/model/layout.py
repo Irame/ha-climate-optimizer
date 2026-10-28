@@ -15,6 +15,11 @@ class Zone:
     name: str
     windows: bool = False  # has door/window sensors that raise its losses when open
     solar: bool = True  # gets sun through its own windows
+    facades: tuple[str, ...] = ()  # where its windows face, of N/E/S/W; empty: not known
+
+    def sun_from(self, facade: str) -> bool:
+        """Whether direct sun on this facade (E, S or W) can reach the zone."""
+        return self.solar and (not self.facades or facade in self.facades)
 
 
 @dataclass(frozen=True)
@@ -56,7 +61,7 @@ class Layout:
 
     def to_dict(self) -> dict:
         return {
-            "zones": [z.__dict__ for z in self.zones],
+            "zones": [{**z.__dict__, "facades": list(z.facades)} for z in self.zones],
             "links": [list(lk) for lk in self.links],
             "units": [u.__dict__ for u in self.units],
             "hub": self.hub,
@@ -64,7 +69,10 @@ class Layout:
 
     @staticmethod
     def from_dict(d: dict) -> Layout:
-        zones = tuple(Zone(**z) for z in d["zones"])
+        zones = tuple(Zone(**{**z, "facades": tuple(z.get("facades") or ())}) for z in d["zones"])
+        for z in zones:
+            if set(z.facades) - set("NESW"):
+                raise ValueError(f"zone {z.id}: facades are N, E, S or W")
         units = tuple(Unit(**u) for u in d["units"])
         ids = {z.id for z in zones}
         links = tuple((a, b) for a, b in d.get("links", []))
@@ -145,6 +153,11 @@ def default_params(layout: Layout) -> Params:
             p["Hw"] = 0.0
         if not z.solar:
             p.update(sD=0.0, sE=0.0, sS=0.0, sW=0.0)
+        for f in "ESW":
+            if not z.sun_from(f):
+                p["s" + f] = 0.0
+            elif z.facades:
+                p["s" + f] = max(p["s" + f], 0.6)  # a known sunny facade: start from a typical window
         p.update(qc=0.0, qs=0.0)
         zones[z.id] = p
     links = {}

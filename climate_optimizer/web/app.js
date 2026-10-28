@@ -32,7 +32,8 @@ async function api(path, opts = {}) {
 // which entities fit a field: its domains, and the ones that most likely are meant listed first
 const KINDS = {
   temp: { domains: ['sensor'], likely: e => e.device_class === 'temperature' || /°/.test(e.unit || '') },
-  power: { domains: ['sensor'], likely: e => e.device_class === 'power' || /^k?W$/.test(e.unit || '') },
+  // power (W, kW), not energy (kWh): energy meters are listed last and flagged when picked
+  power: { domains: ['sensor'], likely: e => e.device_class === 'power' || /^[kM]?W$/.test(e.unit || ''), wrong: e => isEnergy(e) },
   opening: { domains: ['binary_sensor'], likely: e => ['door', 'window', 'opening', 'garage_door'].includes(e.device_class) },
   climate: { domains: ['climate'] },
   switch: { domains: ['switch', 'input_boolean'] },
@@ -40,6 +41,7 @@ const KINDS = {
   price: { domains: ['sensor'], likely: e => /kwh/i.test(e.unit || '') || e.device_class === 'monetary' },
   calendar: { domains: ['calendar'] },
 };
+const isEnergy = e => e.device_class === 'energy' || /^[kM]?Wh$/i.test(e.unit || '');
 function entityOptions(kind, value, none = '— none —') {
   const k = KINDS[kind];
   const all = (S.entities || []).filter(e => k.domains.includes(e.id.split('.')[0]))
@@ -48,10 +50,20 @@ function entityOptions(kind, value, none = '— none —') {
   let html = none === null ? '' : `<option value="">${none}</option>`;
   if (value && !all.some(e => e.id === value)) html += `<option value="${esc(value)}" selected>${esc(value)} (not in Home Assistant)</option>`;
   const likely = k.likely ? all.filter(k.likely) : all;
-  const other = k.likely ? all.filter(e => !k.likely(e)) : [];
-  if (other.length && likely.length) html += `<optgroup label="Likely">${likely.map(opt).join('')}</optgroup><optgroup label="Other">${other.map(opt).join('')}</optgroup>`;
-  else html += all.map(opt).join('');
+  const wrong = k.wrong ? all.filter(e => !k.likely?.(e) && k.wrong(e)) : [];
+  const other = k.likely ? all.filter(e => !k.likely(e) && !wrong.includes(e)) : [];
+  if ((other.length || wrong.length) && likely.length) {
+    html += `<optgroup label="Likely">${likely.map(opt).join('')}</optgroup>`;
+    if (other.length) html += `<optgroup label="Other">${other.map(opt).join('')}</optgroup>`;
+    if (wrong.length) html += `<optgroup label="Energy meters (kWh): not what is asked for">${wrong.map(opt).join('')}</optgroup>`;
+  } else html += all.map(opt).join('');
   return html;
+}
+// a hint under power fields when an energy meter is picked
+function powerCheck(sel) {
+  const hint = sel.parentElement.querySelector('.kind-hint') || sel.insertAdjacentElement('afterend', Object.assign(document.createElement('div'), { className: 'hint kind-hint' }));
+  const e = (S.entities || []).find(x => x.id === sel.value);
+  hint.innerHTML = e && isEnergy(e) ? `<span class="badge warn">${esc(e.unit || 'energy')}</span> This is an energy meter; this needs the power (W or kW).` : '';
 }
 const entitySelect = (path, kind, value) => `<select data-path="${path}" data-kind="${kind}" style="width:100%">${entityOptions(kind, value)}</select>`;
 const entityMulti = (path, kind, values) => `<div class="multi" data-path="${path}" data-kind="${kind}" data-multi="${esc(JSON.stringify(values || []))}"></div>`;
@@ -666,14 +678,16 @@ pages.settings = async () => {
     <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}"></label></div>
     <label class="check" style="margin-top:8px"><input type="checkbox" data-path="ha.verify_ssl" ${C.ha.verify_ssl ? 'checked' : ''}> Verify TLS certificate</label>
     <p class="hint">${S.status.ha.connected ? 'Connected to Home Assistant ' + esc(S.status.ha.version) + '.' : 'Not connected: ' + esc(S.status.ha.error || '') + '. The entity lists below fill once it is.'}</p></div>`;
-  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors</th></tr>`;
+  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors</th><th>Windows face</th></tr>`;
   for (const z of L.zones) {
     M.zones[z.id] = M.zones[z.id] || {};
+    const fac = z.facades || [];
     html += `<tr><td>${esc(z.name)}</td><td>${entitySelect(`mapping.zones.${z.id}.thermometer`, 'temp', M.zones[z.id].thermometer || '')}</td>
-      <td>${z.windows ? entityMulti(`mapping.zones.${z.id}.windows`, 'opening', M.zones[z.id].windows) : '<span class="hint">none in the layout</span>'}</td></tr>`;
+      <td>${z.windows ? entityMulti(`mapping.zones.${z.id}.windows`, 'opening', M.zones[z.id].windows) : '<span class="hint">none in the layout</span>'}</td>
+      <td>${z.solar === false ? '<span class="hint">no windows</span>' : `<div class="days" style="flex-wrap:nowrap">${['N', 'E', 'S', 'W'].map(f => `<label><input type="checkbox" data-facade="${z.id}" value="${f}" ${fac.includes(f) ? 'checked' : ''}>${f}</label>`).join('')}</div>`}</td></tr>`;
   }
-  html += `</table></div></div>`;
-  html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Proxy (what the optimizer answers)</th><th>Device under the proxy</th><th>${L.units.some(u => u.kind === 'heater') ? 'Heater power sensor' : ''}</th></tr>`;
+  html += `</table></div><p class="hint">Windows face: where each room gets its sun from. Ticked, the model only looks for direct sun from those sides (north gets none), which it learns much faster; none ticked, it looks everywhere. Retrain after changing it.</p></div>`;
+  html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Proxy (what the optimizer answers)</th><th>Device under the proxy</th><th>${L.units.some(u => u.kind === 'heater') ? 'Heater power (W or kW, not kWh)' : ''}</th></tr>`;
   for (const u of L.units) {
     M.units[u.id] = M.units[u.id] || {};
     html += `<tr><td>${esc(u.name)}<div class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</div></td>
@@ -687,13 +701,13 @@ pages.settings = async () => {
   html += `<div class="card"><h3>Outside, power and prices</h3><div class="fields wide">
     ${field('Outdoor thermometer', 'mapping.outdoor', 'temp')}
     ${field('Weather (forecast)', 'mapping.weather', 'weather')}
-    ${field('Phase with the outdoor unit', 'mapping.phase', 'power')}
-    <label class="field">Other phases${entityMulti('mapping.phases_other', 'power', M.phases_other)}</label>
-    ${field('Car charger power (optional)', 'mapping.car', 'power')}
+    ${field('Power on the phase with the outdoor unit (W or kW)', 'mapping.phase', 'power')}
+    <label class="field">Power on the other phases (W or kW)${entityMulti('mapping.phases_other', 'power', M.phases_other)}</label>
+    ${field('Car charger power (W or kW, optional)', 'mapping.car', 'power')}
     <label class="field">Prices from<select data-path="prices.source"><option value="tibber_prices" ${C.prices.source === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${C.prices.source === 'attributes' ? 'selected' : ''}>a sensor's attributes</option></select></label>
     <label class="field">tibber_prices entry id (if several)<input data-path="prices.entry_id" value="${esc(C.prices.entry_id || '')}"></label>
     ${field('Price sensor', 'prices.sensor', 'price')}
-    </div><p class="hint">The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
+    </div><p class="hint">Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
   html += `<div class="card"><h3>Optimizer</h3><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
     <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
     <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents. On/off is decided as such for the first quarter hour; after that the plan counts what share of each step a unit runs.</p></div>`;
@@ -706,6 +720,7 @@ pages.settings = async () => {
     <div class="fields" style="margin-top:8px"><label class="field">Latitude (default: Home Assistant’s)<input type="number" step="0.1" id="lat" value="${C.location?.lat ?? ''}"></label><label class="field">Longitude<input type="number" step="0.1" id="lon" value="${C.location?.lon ?? ''}"></label></div></div>`;
   root.innerHTML = html;
   root.querySelectorAll('[data-multi]').forEach(initMulti);
+  root.querySelectorAll('select[data-kind="power"]').forEach(sel => { powerCheck(sel); sel.addEventListener('change', () => powerCheck(sel)); });
   // what each AC device offers, next to its fan modes
   const fanHint = uid => {
     const src = root.querySelector(`[data-path="mapping.units.${uid}.source"]`)?.value;
@@ -740,6 +755,10 @@ pages.settings = async () => {
     try {
       C.layout = JSON.parse($('#layout-json').value);
     } catch (e) { msg.textContent = 'Layout is not valid JSON'; return; }
+    for (const z of C.layout.zones || []) {
+      const boxes = [...root.querySelectorAll(`[data-facade="${z.id}"]`)];
+      if (boxes.length) z.facades = boxes.filter(b => b.checked).map(b => b.value);
+    }
     const lat = $('#lat').value, lon = $('#lon').value;
     C.location = lat !== '' && lon !== '' ? { lat: +lat, lon: +lon } : null;
     try {

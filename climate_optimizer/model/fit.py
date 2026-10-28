@@ -22,18 +22,29 @@ from scipy.optimize import least_squares
 
 from .dataset import Grid
 from .layout import Layout, Params, default_params, link_key
-from .thermal import DIST, build, capacity_factor, carnot_heat, electric, estimate_hidden, zone_summary
+from .thermal import DIST, _ffill, build, capacity_factor, carnot_heat, electric, estimate_hidden, zone_summary
 
-FIT = dict(window_h=6.0, stride_h=3.0, every=3, sigma_t=0.25, sigma_p=0.3, burn_in_h=36.0, max_nfev=60)
+SOLAR_AIR = 0.3  # share of the sun through a window that warms the air at once, before training
+FIT = dict(window_h=6.0, stride_h=3.0, every=3, sigma_t=0.25, sigma_p=0.3, burn_in_h=36.0, max_nfev=60,
+           huber=1.5, prior_weight=10.0, eta_measured=0.5)
+
+
+def robust(r: np.ndarray, c: float) -> np.ndarray:
+    """Huber's loss as a residual: sum(robust(r)**2) / 2 is the Huber cost of r.
+    Only the data gets it; the priors stay quadratic, or the fit could leave
+    them behind at the price of a straight line."""
+    a = np.abs(r)
+    return np.where(a <= c, r, np.sign(r) * np.sqrt(np.maximum(0.0, 2 * c * a - c * c)))
 
 
 # ---- parameters ---------------------------------------------------------------
 @dataclass
 class P:
     path: tuple
-    kind: str  # "log" | "lin" | "inc" (increment on the previous level, log)
+    kind: str  # "log" | "lin" | "inc" (increment on the previous level, log) | "unit" (a share, logit)
     sigma: float
     floor: float = 1e-6
+    measured: float = 0.0  # 1: pinned down by the power measurement, its prior is not weighted up; between: partly
 
 
 def param_list(layout: Layout, params: Params) -> list[P]:
@@ -47,14 +58,17 @@ def param_list(layout: Layout, params: Params) -> list[P]:
         if z.windows:
             out.append(P(zp + ("Hw",), "log", 1.2, 1e-2))
         if z.solar:
-            out += [P(zp + ("s" + f,), "log", 1.5, 5e-2) for f in "DESW"]
+            out += [P(zp + ("s" + f,), "log", 1.5, 5e-2) for f in "DESW" if f == "D" or z.sun_from(f)]
     for a, b in layout.links:
         out.append(P(("links", link_key(a, b)), "log", 0.9, 3e-3))
     for u in layout.ac_units:
         for i in range(u.levels):
-            out.append(P(("units", u.id, "heat", i), "log" if i == 0 else "inc", 0.5, 0.05))
-    out += [P(("plant", "Qmax"), "log", 0.5), P(("plant", "eta"), "log", 0.15), P(("plant", "cap_slope"), "lin", 0.02),
+            out.append(P(("units", u.id, "heat", i), "log" if i == 0 else "inc", 0.5, 0.05, measured=1.0))
+    out += [P(("plant", "Qmax"), "log", 0.5), P(("plant", "eta"), "log", 0.15, measured=FIT["eta_measured"]),
+            P(("plant", "cap_slope"), "lin", 0.02),
             P(("building", "Tnb"), "lin", 2.0)]
+    if any(z.solar for z in layout.zones):
+        out.append(P(("building", "solar_air"), "unit", 1.0))
     # Standby stays at its preset: other loads on the same phase that run
     # whenever the units do cannot be told apart from it.
     return out
@@ -80,6 +94,10 @@ def to_theta(params: Params, plist: list[P]) -> np.ndarray:
         if p.kind == "inc":
             prev = _get(d, p.path[:-1] + (p.path[-1] - 1,))
             v = max(v - prev, p.floor)
+        if p.kind == "unit":
+            v = min(max(v, 0.01), 0.99)
+            out.append(np.log(v / (1 - v)))
+            continue
         out.append(np.log(max(v, p.floor)) if p.kind in ("log", "inc") else v)
     return np.array(out, dtype=float)
 
@@ -91,6 +109,8 @@ def from_theta(theta: np.ndarray, plist: list[P], base: Params) -> Params:
             _set(d, p.path, float(th))
         elif p.kind == "log":
             _set(d, p.path, float(np.exp(th)))
+        elif p.kind == "unit":
+            _set(d, p.path, float(1 / (1 + np.exp(-th))))
         else:
             prev = _get(d, p.path[:-1] + (p.path[-1] - 1,))
             _set(d, p.path, float(prev + np.exp(th)))
@@ -174,6 +194,30 @@ def heater_power(grid: Grid) -> dict[str, float]:
     return out
 
 
+def _merged(base: Params, other: Params) -> Params:
+    """base with every value other has for the same thing (a model trained
+    on another layout still lends what fits)."""
+    d = base.to_dict()
+    o = other.to_dict()
+    for z, zp in d["zones"].items():
+        oz = o["zones"].get(z, {})
+        for k in zp:
+            if k in oz and not (k in ("sD", "sE", "sS", "sW") and zp[k] == 0.0):  # no sun stays no sun
+                zp[k] = oz[k]
+    for k in d["links"]:
+        if k in o["links"]:
+            d["links"][k] = o["links"][k]
+    for u, up in d["units"].items():
+        ou = o["units"].get(u) or {}
+        if ("heat" in up and len(ou.get("heat", [])) == len(up["heat"])) or ("kw" in up and "kw" in ou):
+            d["units"][u] = dict(ou)
+    for sect in ("plant", "building"):
+        for k in d[sect]:
+            if k in o[sect]:
+                d[sect][k] = o[sect][k]
+    return Params.from_dict(d)
+
+
 def initial_params(layout: Layout, grid: Grid) -> Params:
     p = default_params(layout)
     for uid, kw in heater_power(grid).items():
@@ -204,7 +248,8 @@ def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray
     if hidden is None:
         hidden = estimate_hidden(sysm, grid.T, grid.tout, grid.sol, grid.dt_h)
     Tm, Tw = hidden
-    X = np.concatenate([grid.T[k0s], Tm[k0s], Tw[k0s]], axis=1)  # (nw, n)
+    Tf = np.column_stack([_ffill(grid.T[:, i]) for i in range(nz)]) if nz else grid.T  # a masked start: the last reading
+    X = np.concatenate([Tf[k0s], Tm[k0s], Tw[k0s]], axis=1)  # (nw, n)
     nw = len(k0s)
     Ta = np.empty((nw, L + 1, nz))
     Pel = np.empty((nw, L))
@@ -237,7 +282,7 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
     t_start = time.time()
     pw = power_observation(grid)
     train_days, val_days, per_day = split_days(grid, val_share)
-    warnings = list(pw["notes"])
+    warnings = list(grid.notes) + list(pw["notes"])
     if not train_days:
         raise ValueError("not enough complete days of room temperatures to train on")
     if not val_days:
@@ -251,10 +296,24 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
         raise ValueError("too few gap-free six-hour stretches to train on")
     L = int(FIT["window_h"] * 60 / grid.step_min)
     e = FIT["every"]
-    base = initial or initial_params(layout, grid)
+    # The priors are physics (a plausible apartment, the heater's measured
+    # power), always; a previous model is only where the search starts.
+    # Centred on the previous model, strong priors would freeze it.
+    base = initial_params(layout, grid)
+    base.building.setdefault("solar_air", SOLAR_AIR)
+    for z in layout.zones:  # facades the zone's windows don't face get no direct sun
+        for f in "ESW":
+            if not z.sun_from(f):
+                base.zones[z.id]["s" + f] = 0.0
     plist = param_list(layout, base)
     theta0 = to_theta(base, plist)
-    sig = np.array([p.sigma for p in plist])
+    start = to_theta(_merged(base, initial), plist) if initial else theta0
+    # Temperatures five minutes apart, in windows that overlap, are far from
+    # independent: taken one by one they would outvote the priors and push
+    # what the data cannot tell apart to implausible values. Weighting the
+    # priors up keeps those near physics; what the phase measurement shows
+    # (the units' heat, the efficiency) keeps its own say.
+    sig = np.array([p.sigma / FIT["prior_weight"] ** (1.0 - p.measured) for p in plist])
     obs_ok, obs = pw["ok"], pw["obs"]
     sel = np.arange(e, L + 1, e)
 
@@ -272,7 +331,8 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
         po = np.nan_to_num(obs[idx][:, : nb * e]).reshape(len(k0s), nb, e).mean(axis=2)
         rp = np.where(okb, (ps - po) / FIT["sigma_p"], 0.0).ravel()
         rpr = (theta - theta0) / sig
-        return np.concatenate([np.nan_to_num(rt), rp, rpr])
+        c = FIT["huber"]
+        return np.concatenate([robust(np.nan_to_num(rt), c), robust(rp, c), rpr])
 
     calls = {"n": 0}
     # least_squares counts at most max_nfev rounds, each one Jacobian (one
@@ -288,7 +348,7 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
     if progress:
         progress({"stage": "fit", "evaluations": 0, "budget": budget})
 
-    res = least_squares(fun, theta0, method="trf", loss="huber", f_scale=1.5, max_nfev=FIT["max_nfev"], x_scale="jac")
+    res = least_squares(fun, start, method="trf", loss="linear", max_nfev=FIT["max_nfev"], x_scale="jac")
     model = from_theta(res.x, plist, base)
     if progress:
         progress({"stage": "check"})

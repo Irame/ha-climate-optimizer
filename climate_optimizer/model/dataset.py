@@ -164,6 +164,7 @@ class Grid:
     valid: np.ndarray  # (K,) all thermometers and the outdoor temperature present
     price: list  # [(t_ms, price)] as recorded
     tz: str = "UTC"
+    notes: list = field(default_factory=list)  # problems with the data worth telling
 
     @property
     def K(self) -> int:
@@ -180,12 +181,13 @@ class Grid:
 
 
 def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, start=None, end=None,
-               min_hours: float = 24) -> Grid:
+               min_hours: float = 24, stuck_h: float | None = 3.0) -> Grid:
     """mapping: {"zones": {zid: {"thermometer": eid, "windows": [eid]}},
                  "units": {uid: {"source": eid, "proxy": eid, "fan_modes": [...], "power": eid}},
                  "outdoor": eid, "weather": eid, "phase": eid, "phases_other": [...], "car": eid, "price": eid}"""
     step = step_min * MIN
     zones = mapping.get("zones", {})
+    notes = []
     series = [parsed.num[zones[z]["thermometer"]][0] for z in layout.zone_ids
               if zones.get(z, {}).get("thermometer") in parsed.num]
     if not series:
@@ -250,6 +252,13 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
     def kw(eid):
         return resample(parsed, eid, t0, step, K, 1e18) * _unit_w(parsed.meta, eid) if eid else np.full(K, np.nan)
 
+    power_ids = [mapping.get("phase"), mapping.get("car"), *(mapping.get("phases_other") or []),
+                 *[(units.get(u.id) or {}).get("power") for u in layout.heaters]]
+    for eid in filter(None, power_ids):
+        meta = parsed.meta.get(eid) or {}
+        if meta.get("device_class") == "energy" or str(meta.get("unit") or "").lower() in ("kwh", "wh", "mwh"):
+            notes.append(f"{eid} is an energy meter ({meta.get('unit')}); it needs to be a power sensor (W or kW).")
+
     phase = kw(mapping.get("phase", ""))
     others = [kw(e) for e in mapping.get("phases_other", []) if e and e != mapping.get("phase")]
     car = kw(mapping["car"]) if mapping.get("car") else None
@@ -258,8 +267,31 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
         pt, pv = parsed.num[mapping["price"]]
         price = [(float(a_), float(b_)) for a_, b_ in zip(pt, pv) if np.isfinite(b_)]
     valid = np.isfinite(T).all(axis=1) & np.isfinite(tout)
+    T, stuck = mask_stuck(T, step_min, min_h=stuck_h) if stuck_h else (T, np.zeros(T.shape[1]))
+    for i, z in enumerate(layout.zone_ids):
+        if stuck[i] > 0.02:
+            notes.append(f"The {z} thermometer stood still for {stuck[i] * 100:.0f} % of the time; those stretches count as missing.")
     return Grid(t=t, step_min=step_min, T=T, tout=tout, open=opn, sol=sol, hc=hc, hs=hs, ac_frac=ac_frac,
-                heater_kw=heater_kw, phase=phase, others=others, car=car, valid=valid, price=price, tz=tzname)
+                heater_kw=heater_kw, phase=phase, others=others, car=car, valid=valid, price=price, tz=tzname, notes=notes)
+
+
+def mask_stuck(T: np.ndarray, step_min: int, keep_h: float = 1.0, min_h: float = 3.0) -> tuple[np.ndarray, np.ndarray]:
+    """A thermometer that shows the same value for hours has most likely stopped
+    reporting. Of every such stretch the first hour stays; the rest counts as
+    missing. Returns the masked temperatures and each column's masked share."""
+    T = np.array(T, dtype=float)
+    keep, least = int(keep_h * 60 / step_min), int(min_h * 60 / step_min)
+    share = np.zeros(T.shape[1])
+    for i in range(T.shape[1]):
+        col = T[:, i]
+        start = 0
+        for k in range(1, len(col) + 1):
+            if k == len(col) or not (abs(col[k] - col[start]) < 1e-6):
+                if k - start >= least and np.isfinite(col[start]):
+                    col[start + keep:k] = np.nan
+                    share[i] += (k - start - keep) / len(col)
+                start = k
+    return T, share
 
 
 def _ac_fractions(parsed: Parsed, cfg: dict, levels: int, t0, step, K, room) -> np.ndarray:
