@@ -117,7 +117,20 @@ const showError = page => e => {
 };
 window.addEventListener('hashchange', route);
 let resizeTimer;
-window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => current && pages[current](true).catch(() => { }), 250); });
+// Charts are drawn for a width: redraw them when it changes. Only then: on a
+// phone the keyboard changes the height, and redrawing a form under it would
+// take the focus and what was typed.
+const CHART_PAGES = new Set(['dashboard', 'history', 'model']);
+let lastWidth = window.innerWidth;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (window.innerWidth === lastWidth) return;
+    lastWidth = window.innerWidth;
+    const typing = document.activeElement?.matches?.('input, select, textarea');
+    if (current && CHART_PAGES.has(current) && !typing) pages[current](true).catch(() => { });
+  }, 250);
+});
 
 async function loadBase() {
   [S.config, S.status] = await Promise.all([api('config'), api('status')]);
@@ -173,6 +186,7 @@ pages.dashboard = async (redraw) => {
     }
     const notes = [];
     if (ui.note) notes.push(`<span class="badge warn">${esc(ui.note)}</span>`);
+    if (ui.anyway && st.shadow) notes.push('<span class="badge">planned anyway</span>');
     if ((z.windows_open || []).length) notes.push('<span class="badge warn">window open</span>');
     const opt = us.proxy_attrs?.optimizer;
     html += `<div class="card unit-card">
@@ -677,7 +691,16 @@ pages.settings = async () => {
   html += `<div class="card"><h3>Mode</h3>
     <label class="check"><input type="checkbox" data-path="shadow" ${C.shadow ? 'checked' : ''}> Shadow mode: plan and show, but let the proxies’ own thermostats decide</label>
     <p class="hint">Set each proxy to <b>auto</b> and point its <code>optimizer_url</code> here: <code>${esc(location.origin + location.pathname.replace(/\/$/, ''))}</code>. In shadow mode the optimizer answers <code>follow: false</code>.</p>
-    <div class="fields"><label class="field">API token for proxies and this page<input type="password" data-path="api_token" value="${esc(C.api_token)}" placeholder="none"></label></div></div>`;
+    <h3 style="margin-top:14px">In shadow mode</h3>
+    <p class="hint">To watch the optimizer beside another automation that switches the units and moves their setpoints: plan these units even when their proxy is off or not in auto, and use these comfort temperatures instead of the proxies’ targets. Outside shadow mode the proxies decide both.</p>
+    <div class="table-wrap"><table><tr><th>Unit</th><th>Plan it anyway</th><th>Comfort temperature of its room</th></tr>
+    ${L.units.map((u, i) => {
+      const first = L.units.findIndex(v => v.zone === u.zone) === i;
+      const zname = (L.zones.find(z => z.id === u.zone) || {}).name || u.zone;
+      return `<tr><td>${esc(u.name)}</td><td><label class="check"><input type="checkbox" data-shadow-unit="${u.id}" ${(C.shadow_units || []).includes(u.id) ? 'checked' : ''}> even when its proxy is off</label></td>
+        <td>${first ? `<input type="number" step="0.5" style="width:90px" data-shadow-comfort="${u.zone}" value="${C.shadow_comfort?.[u.zone] ?? ''}" placeholder="proxy’s"> °C <span class="hint">${esc(zname)}</span>` : ''}</td></tr>`;
+    }).join('')}</table></div>
+    <div class="fields" style="margin-top:12px"><label class="field">API token for proxies and this page<input type="password" data-path="api_token" value="${esc(C.api_token)}" placeholder="none"></label></div></div>`;
   html += `<div class="card"><h3>Home Assistant</h3><div class="fields wide">
     <label class="field">URL<input data-path="ha.url" value="${esc(C.ha.url)}" placeholder="http://homeassistant.local:8123" ${C.env?.ha_url ? 'disabled' : ''}>${C.env?.ha_url ? '<span class="hint">set by the container’s HA_URL</span>' : ''}</label>
     <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}" ${C.env?.ha_token ? 'disabled' : ''}>${C.env?.ha_token ? '<span class="hint">set by the container’s HA_TOKEN</span>' : ''}</label></div>
@@ -764,6 +787,8 @@ pages.settings = async () => {
       const boxes = [...root.querySelectorAll(`[data-facade="${z.id}"]`)];
       if (boxes.length) z.facades = boxes.filter(b => b.checked).map(b => b.value);
     }
+    C.shadow_units = [...root.querySelectorAll('[data-shadow-unit]')].filter(b => b.checked).map(b => b.dataset.shadowUnit);
+    C.shadow_comfort = Object.fromEntries([...root.querySelectorAll('[data-shadow-comfort]')].filter(i => i.value !== '').map(i => [i.dataset.shadowComfort, +i.value]));
     const lat = $('#lat').value, lon = $('#lon').value;
     C.location = lat !== '' && lon !== '' ? { lat: +lat, lon: +lon } : null;
     try {

@@ -260,8 +260,10 @@ class Planner:
         # comfort temperatures: the proxy's target, else the configured one
         comfort, functions, proxies = {}, {}, {}
         for z in zids:
-            base = math.nan
+            base = cfg.shadow_comfort.get(z, math.nan) if cfg.shadow else math.nan
             for u in layout.units:
+                if math.isfinite(base):
+                    break
                 if u.zone == z:
                     s = self.collector.states.get((umap.get(u.id) or {}).get("proxy", ""))
                     if s:
@@ -284,7 +286,10 @@ class Planner:
             allowed = ~np.array(res.locked[u.id])
             mode_now = ps.get("state") if ps else None
             note = None
-            if ps is None:
+            anyway = cfg.shadow and u.id in cfg.shadow_units  # planned whatever the proxy does
+            if anyway:
+                pass
+            elif ps is None:
                 allowed[:] = False
                 note = "proxy not found"
             elif mode_now in OFF_STATES:
@@ -313,7 +318,7 @@ class Planner:
                     pass
             units.append(mpc.UnitSpec(u.id, u.kind, u.zone, levels=(lo, hi), allowed=allowed, on=running,
                                       since_min=max(0.0, since), modes=modes))
-            proxies[u.id] = {"proxy": m.get("proxy"), "state": mode_now, "note": note, "levels": [lo, hi],
+            proxies[u.id] = {"proxy": m.get("proxy"), "state": mode_now, "note": note, "levels": [lo, hi], "anyway": anyway,
                              "running": running, "comfort": comfort.get(u.zone, [None])[0] if u.zone in comfort else None}
 
         # A room whose units are all off is not the plan's to keep warm: pricing its

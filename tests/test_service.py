@@ -174,3 +174,28 @@ def test_environment_wins_over_saved_settings(tmp_path, monkeypatch):
     cs.update({"ha": {"url": "http://ui:8123"}})  # the UI cannot override it
     assert cs.config.ha.url == "http://host.docker.internal:8123"
     assert cs.config.public()["env"] == {"ha_url": True, "ha_token": False}
+
+
+def test_shadow_mode_plans_units_and_comfort_as_set(client):
+    """Watching beside another automation: plan a unit whose proxy is off, with our own comfort temperature."""
+    svc = client.svc
+    world = svc.ha.world
+    world.units["bath"]["proxy_mode"] = "off"
+    for s in world.states():
+        svc.collector.states[s["entity_id"]] = s
+    try:
+        client.put("/api/config", json={"shadow": True, "shadow_units": ["bath"], "shadow_comfort": {"bath": 21.5, "living": 19.0}})
+        r = client.post("/api/plan").json()
+        assert r["plan"]["comfort"]["bath"][0] == 21.5
+        assert r["plan"]["comfort"]["living"][-1] == 19.0  # the living room's proxy says 21.5
+        assert r["info"]["units"]["bath"]["anyway"] and r["info"]["units"]["bath"]["note"] is None
+        assert "no_comfort" not in r["info"]
+        # outside shadow mode the proxies decide again
+        client.put("/api/config", json={"shadow": False})
+        r = client.post("/api/plan").json()
+        assert "bath" not in r["plan"]["comfort"] and r["plan"]["comfort"]["living"][-1] == 21.5
+    finally:
+        client.put("/api/config", json={"shadow": False, "shadow_units": [], "shadow_comfort": {}})
+        world.units["bath"]["proxy_mode"] = "auto"
+        for s in world.states():
+            svc.collector.states[s["entity_id"]] = s

@@ -48,6 +48,9 @@ class Config(BaseModel):
     calendar: str = ""  # calendar entity whose events override the rules
     settings: dict = Field(default_factory=lambda: Settings().__dict__.copy())
     shadow: bool = True  # plan and show, but let the proxies' own thermostats decide
+    # in shadow mode, to watch the optimizer beside another automation:
+    shadow_units: list[str] = Field(default_factory=list)  # plan these even when their proxy is off or not in auto
+    shadow_comfort: dict[str, float] = Field(default_factory=dict)  # zone -> comfort temperature instead of the proxy's
     api_token: str = ""  # required from the proxies and the UI when set
     retrain_hour: int = 3
     history_days: int = 30
