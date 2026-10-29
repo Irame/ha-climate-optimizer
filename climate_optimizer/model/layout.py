@@ -16,6 +16,7 @@ class Zone:
     windows: bool = False  # has door/window sensors that raise its losses when open
     solar: bool = True  # gets sun through its own windows
     facades: tuple[str, ...] = ()  # where its windows face, of N/E/S/W; empty: not known
+    aliases: tuple[str, ...] = ()  # more names for it, as calendar events use them
 
     def sun_from(self, facade: str) -> bool:
         """Whether direct sun on this facade (E, S or W) can reach the zone."""
@@ -61,7 +62,7 @@ class Layout:
 
     def to_dict(self) -> dict:
         return {
-            "zones": [{**z.__dict__, "facades": list(z.facades)} for z in self.zones],
+            "zones": [{**z.__dict__, "facades": list(z.facades), "aliases": list(z.aliases)} for z in self.zones],
             "links": [list(lk) for lk in self.links],
             "units": [u.__dict__ for u in self.units],
             "hub": self.hub,
@@ -69,7 +70,8 @@ class Layout:
 
     @staticmethod
     def from_dict(d: dict) -> Layout:
-        zones = tuple(Zone(**{**z, "facades": tuple(z.get("facades") or ())}) for z in d["zones"])
+        zones = tuple(Zone(**{**z, "facades": tuple(z.get("facades") or ()), "aliases": tuple(z.get("aliases") or ())})
+                      for z in d["zones"])
         for z in zones:
             if set(z.facades) - set("NESW"):
                 raise ValueError(f"zone {z.id}: facades are N, E, S or W")

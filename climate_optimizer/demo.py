@@ -84,6 +84,17 @@ class World:
             t += timedelta(minutes=15)
         return out
 
+    def calendar_events(self) -> list[dict]:
+        """A few events in the demo calendar, one of them not meant for the optimizer."""
+        day = datetime.fromtimestamp(self.t / 1000, self.tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        at = lambda d, h: (day + timedelta(days=d, hours=h)).isoformat()
+        return [
+            {"start": at(1, 18), "end": at(1, 23), "summary": "Wohnzimmer: Strict"},
+            {"start": at(3, 13), "end": at(3, 16), "summary": "Schlafzimmer: aus"},
+            {"start": at(5, 0), "end": at(7, 0), "summary": "Alle: Frost protection only"},
+            {"start": at(2, 9), "end": at(2, 10), "summary": "Zahnarzt"},
+        ]
+
     def forecast(self) -> list[dict]:
         h0 = self.t // HOUR * HOUR
         return [{"datetime": _iso(h0 + i * HOUR), "temperature": round(self.tout_at(h0 + i * HOUR) + 0.3 * math.sin(i / 5), 1),
@@ -203,6 +214,7 @@ class World:
         add("weather.forecast_home", "cloudy" if self.cloud > 0.7 else "partlycloudy", temperature=round(self.tout_at(self.t), 1),
             cloud_coverage=int(self.cloud * 100), friendly_name="Forecast Home")
         add("sensor.zuhause_strompreis", self.price_at(self.t), unit_of_measurement="EUR/kWh", friendly_name="Zuhause Strompreis")
+        add("calendar.klima", "off", friendly_name="Klima")
         return out
 
 
@@ -257,7 +269,7 @@ class FakeHA:
         if (domain, service) == ("weather", "get_forecasts"):
             return {target["entity_id"]: {"forecast": self.world.forecast()}}
         if (domain, service) == ("calendar", "get_events"):
-            return {target["entity_id"]: {"events": []}}
+            return {target["entity_id"]: {"events": self.world.calendar_events()}}
         return {}
 
     async def history(self, *a, **k):
@@ -277,7 +289,8 @@ def demo_service(data: Path):
     cs = ConfigStore(data / "config.json")
     if not (data / "config.json").exists():
         cs.update({"mapping": world.mapping, "prices": {"source": "tibber_prices", "sensor": "sensor.zuhause_strompreis"},
-                   "shadow": False, "comfort": {"bath": 22.0}, "location": {"lat": world.lat, "lon": world.lon}})
+                   "shadow": False, "comfort": {"bath": 22.0}, "location": {"lat": world.lat, "lon": world.lon},
+                   "calendar": "calendar.klima"})
     svc = Service(data, ha=FakeHA(world))
     world.planner = svc.planner
     # a week of history, as if the collector had recorded it

@@ -288,19 +288,29 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         return {"started": True}
 
     @app.get("/api/schedule/preview", dependencies=[Depends(auth)])
-    async def schedule_preview(days: int = 14, step_min: int = 30):
+    async def schedule_preview(days: int = 14, step_min: int = 30, refresh: bool = False):
+        """The saved rules and the calendar's events over the coming days; refresh fetches the calendar now."""
         s = svc()
         cfg = s.cfgs.config
         tz = s.planner.tz()
         layout = cfg.layout_obj()
-        days = max(1, min(days, 62))
+        days = max(1, min(days, 14))  # the calendar is fetched for two weeks
         t0 = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
         n = days * 24 * 60 // step_min
         starts = [t0 + timedelta(minutes=step_min * k) for k in range(n)]
         ends = [x + timedelta(minutes=step_min) for x in starts]
-        res = resolve(starts, ends, layout.zone_ids, [u.id for u in layout.units], cfg.defaults, cfg.rule_objs())
-        return {"start": int(t0.timestamp() * 1000), "step_min": step_min, "function": res.function,
-                "offset": res.offset, "locked": res.locked, "source": res.source}
+        cal = await s.planner.calendar(refresh=refresh) if s.ha.connected.is_set() or not cfg.calendar else \
+            {"calendar": cfg.calendar, "events": [], "fetched": None, "error": "Home Assistant is not connected"}
+        inside = [e for e in cal["events"] if e["end"] > starts[0] and e["start"] < ends[-1]]
+        specs, listing = s.planner.event_specs(inside)
+        res = resolve(starts, ends, layout.zone_ids, [u.id for u in layout.units], cfg.defaults, cfg.rule_objs(), specs)
+        if refresh and s.ha.connected.is_set():
+            asyncio.create_task(s.planner.replan())  # the plan sees the calendar as it is now
+        return _json({"start": int(t0.timestamp() * 1000), "step_min": step_min, "function": res.function,
+                      "offset": res.offset, "locked": res.locked, "source": res.source,
+                      "event_zone": res.event_zone, "event_unit": res.event_unit,
+                      "calendar": {"entity": cal["calendar"], "fetched": cal["fetched"], "error": cal["error"],
+                                   "events": sorted(listing, key=lambda e: e["start"])}})
 
     @app.get("/api/diagnostics", dependencies=[Depends(auth)])
     async def diagnostics(days: float = 30):

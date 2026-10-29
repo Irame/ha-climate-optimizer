@@ -173,18 +173,32 @@ OFF_WORDS = {"aus", "off", "sperre", "lock", "lockout", "gesperrt"}
 ALL_WORDS = {"alle", "all", "wohnung", "apartment"}
 
 
+# Names a calendar may use for the usual rooms and functions, besides their ids and names
+ZONE_ALIASES = {"office": ("Büro", "Arbeitszimmer"), "bedroom": ("Schlafzimmer",),
+                "living": ("Wohnzimmer", "Küche", "Wohnküche"), "bath": ("Bad", "Badezimmer"), "hall": ("Flur", "Diele")}
+FUNCTION_ALIASES = {"standard": ("Normal",), "relaxed": ("Entspannt", "Locker"), "strict": ("Streng",),
+                    "frost": ("Frostschutz",)}
+
+
 def parse_event(summary: str, zones: dict[str, str], units: dict[str, tuple[str, str]],
-                functions: dict[str, str]) -> dict | None:
+                functions: dict[str, str], zone_aliases: dict[str, list[str]] | None = None) -> dict | None:
     """A calendar event's title as a rule: 'Wohnzimmer: Relaxed' picks a comfort
     function, 'Schlafzimmer: aus' locks the units there, 'Alle: +1' moves the
-    comfort temperature. Names match case-insensitively on id or display name.
-    zones: id -> name; units: id -> (name, zone id); functions: id -> name."""
+    comfort temperature. Names match case-insensitively on id, display name or
+    alias. zones: id -> name; units: id -> (name, zone id); functions: id -> name;
+    zone_aliases: id -> more names (the usual German ones are always known)."""
     if ":" not in summary:
         return None
-    who, what = (x.strip().lower() for x in summary.split(":", 1))
-    znorm = {**{k.lower(): k for k in zones}, **{v.lower(): k for k, v in zones.items()}}
+    who, what = (" ".join(x.split()).lower() for x in summary.split(":", 1))
+    znorm = {}
+    for k, v in zones.items():
+        for name in (k, v, *ZONE_ALIASES.get(k, ()), *((zone_aliases or {}).get(k) or ())):
+            znorm.setdefault(str(name).strip().lower(), k)
     unorm = {**{k.lower(): k for k in units}, **{v[0].lower(): k for k, v in units.items()}}
-    fnorm = {**{k.lower(): k for k in functions}, **{v.lower(): k for k, v in functions.items()}}
+    fnorm = {}
+    for k, v in functions.items():
+        for name in (k, v, *FUNCTION_ALIASES.get(k, ())):
+            fnorm.setdefault(name.lower(), k)
     everyone = who in ALL_WORDS
     zone = [] if everyone else [znorm[who]] if who in znorm else None
     if what in OFF_WORDS:
@@ -214,6 +228,8 @@ class Resolved:
     offset: dict[str, list[float]]
     locked: dict[str, list[bool]]
     source: dict[str, list[str]]  # what decided the function, for the UI
+    event_zone: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event set the zone's function or offset
+    event_unit: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event keeps the unit off
 
 
 def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[str], units: list[str],
@@ -226,12 +242,14 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
         if r.enabled:
             active.append((r.priority, i, r.to_dict(), r.intervals(t0, t1)))
     for j, ev in enumerate(events or []):
-        active.append((10_000, j, dict(ev, name=ev.get("name", "calendar")), [(ev["start"], ev["end"])]))
+        active.append((10_000, j, dict(ev, name=ev.get("name", "calendar"), calendar=True), [(ev["start"], ev["end"])]))
     active.sort(key=lambda a: (a[0], a[1]))  # later in the list wins on equal priority
     fn = {z: [defaults.get(z, "standard")] * N for z in zones}
     src = {z: ["default"] * N for z in zones}
     off = {z: [0.0] * N for z in zones}
     lock = {u: [False] * N for u in units}
+    ev_z = {z: [False] * N for z in zones}
+    ev_u = {u: [False] * N for u in units}
     for _, _, spec, ivs in active:
         if not ivs:
             continue
@@ -244,12 +262,15 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
                     if z in fn:
                         fn[z][k] = spec["function"]
                         src[z][k] = spec.get("name", "")
+                        ev_z[z][k] = bool(spec.get("calendar"))
             elif spec["action"] == "offset":
                 for z in (spec.get("zones") or zones):
                     if z in off:
                         off[z][k] = spec.get("offset", 0.0)
+                        ev_z[z][k] = ev_z[z][k] or bool(spec.get("calendar"))
             elif spec["action"] == "lockout":
                 for u in (spec.get("units") or units):
                     if u in lock:
                         lock[u][k] = True
-    return Resolved(function=fn, offset=off, locked=lock, source=src)
+                        ev_u[u][k] = ev_u[u][k] or bool(spec.get("calendar"))
+    return Resolved(function=fn, offset=off, locked=lock, source=src, event_zone=ev_z, event_unit=ev_u)

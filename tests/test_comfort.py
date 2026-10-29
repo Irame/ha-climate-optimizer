@@ -127,3 +127,14 @@ def test_parse_event():
 def test_function_roundtrip():
     f = default_functions()[0]
     assert ComfortFunction.from_dict(f.to_dict()) == f
+
+
+def test_parse_event_german_and_aliases():
+    zones = {"living": "Living room & kitchen", "bedroom": "Bedroom", "office": "Office"}
+    units = {"living": ("Living room", "living"), "bedroom": ("Bedroom", "bedroom")}
+    fns = {f.id: f.name for f in default_functions()}
+    assert parse_event("Wohnzimmer: Strict", zones, units, fns) == {"action": "comfort", "zones": ["living"], "function": "strict"}
+    assert parse_event("Küche:  entspannt", zones, units, fns)["function"] == "relaxed"
+    assert parse_event("Schlafzimmer: aus", zones, units, fns) == {"action": "lockout", "units": ["bedroom"]}
+    assert parse_event("Kinderzimmer: aus", zones, units, fns) is None
+    assert parse_event("Kinderzimmer: aus", zones, {**units, "office": ("Office", "office")}, fns, {"office": ["Kinderzimmer"]}) == {"action": "lockout", "units": ["office"]}

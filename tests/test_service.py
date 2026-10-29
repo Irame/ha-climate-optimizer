@@ -199,3 +199,25 @@ def test_shadow_mode_plans_units_and_comfort_as_set(client):
         world.units["bath"]["proxy_mode"] = "auto"
         for s in world.states():
             svc.collector.states[s["entity_id"]] = s
+
+
+def test_preview_shows_the_calendar(client):
+    svc = client.svc
+    client.put("/api/config", json={"calendar": "calendar.klima"})
+    pv = client.get("/api/schedule/preview?days=7&refresh=true").json()
+    cal = pv["calendar"]
+    assert cal["entity"] == "calendar.klima" and cal["error"] is None and cal["fetched"]
+    by = {e["summary"]: e for e in cal["events"]}
+    assert by["Wohnzimmer: Strict"]["understood"] and by["Wohnzimmer: Strict"]["effect"] == "Strict in Living room & kitchen"
+    assert by["Schlafzimmer: aus"]["effect"] == "off: Bedroom"
+    assert not by["Zahnarzt"]["understood"]
+    # tomorrow 18:00-23:00 the living room is strict, from the calendar
+    k = (24 + 19) * 2
+    assert pv["function"]["living"][k] == "strict" and pv["event_zone"]["living"][k] and pv["source"]["living"][k] == "Wohnzimmer: Strict"
+    k = (3 * 24 + 14) * 2
+    assert pv["locked"]["bedroom"][k] and pv["event_unit"]["bedroom"][k]
+    # without refresh the cached calendar is used
+    t = cal["fetched"]
+    assert client.get("/api/schedule/preview?days=7").json()["calendar"]["fetched"] == t
+    client.put("/api/config", json={"calendar": ""})
+    assert client.get("/api/schedule/preview?days=7").json()["calendar"]["events"] == []

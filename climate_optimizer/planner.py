@@ -80,6 +80,7 @@ class Planner:
         self.state = PlanState()
         self.dispatcher = FanDispatcher()
         self.requests: dict[str, ProxyRequest] = {}
+        self._calendar: dict | None = None
         self.lock = asyncio.Lock()
         p = store.get("params")
         self.params: Params | None = Params.from_dict(p) if p else None
@@ -150,15 +151,56 @@ class Planner:
                 out["forecast"] = await fetch_forecast(self.ha, weather)
             except Exception as e:
                 out["errors"].append(f"forecast: {e}")
-        out["events"] = []
-        if cfg.calendar:
-            tz = self.tz()
-            now = datetime.fromtimestamp(now_ms / 1000, tz)
-            try:
-                out["events"] = await fetch_events(self.ha, cfg.calendar, now - timedelta(hours=1), now + timedelta(hours=40), tz)
-            except Exception as e:
-                out["errors"].append(f"calendar: {e}")
+        cal = await self.calendar()
+        out["events"] = cal["events"]
+        if cal["error"]:
+            out["errors"].append(f"calendar: {cal['error']}")
         return out
+
+    async def calendar(self, refresh: bool = False) -> dict:
+        """The calendar's events from yesterday to two weeks ahead, fetched at most
+        every ten minutes (or now, with refresh) and shared by plan and preview."""
+        cfg = self.cfg
+        if not cfg.calendar:
+            return {"calendar": "", "events": [], "fetched": None, "error": None}
+        now = time.time() * 1000
+        c = self._calendar
+        if not refresh and c and c["calendar"] == cfg.calendar and now - c["fetched"] < 10 * MIN:
+            return c
+        tz = self.tz()
+        start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        try:
+            events = await fetch_events(self.ha, cfg.calendar, start, start + timedelta(days=17), tz)
+            c = {"calendar": cfg.calendar, "events": events, "fetched": now, "error": None}
+        except Exception as e:
+            kept = c["events"] if c and c["calendar"] == cfg.calendar else []
+            c = {"calendar": cfg.calendar, "events": kept, "fetched": now, "error": str(e) or e.__class__.__name__}
+        self._calendar = c
+        return c
+
+    def event_specs(self, events: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Calendar events as rules for resolve(), and each one with what it was taken to mean."""
+        layout = self.cfg.layout_obj()
+        fns = self.cfg.function_objs()
+        zones = {z.id: z.name for z in layout.zones}
+        units = {u.id: (u.name, u.zone) for u in layout.units}
+        specs, listing = [], []
+        for ev in events:
+            spec = parse_event(ev["summary"], zones, units, {f.id: f.name for f in fns.values()},
+                               {z.id: list(z.aliases) for z in layout.zones})
+            item = {"start": int(ev["start"].timestamp() * 1000), "end": int(ev["end"].timestamp() * 1000),
+                    "summary": ev["summary"], "understood": spec is not None}
+            if spec:
+                specs.append({**spec, "start": ev["start"], "end": ev["end"], "name": ev["summary"]})
+                every = "every room" if spec["action"] != "lockout" else "every unit"
+                if spec["action"] == "comfort":
+                    item["effect"] = f"{fns[spec['function']].name} in " + (", ".join(zones[z] for z in spec["zones"]) or every)
+                elif spec["action"] == "offset":
+                    item["effect"] = f"comfort {spec['offset']:+g} K in " + (", ".join(zones[z] for z in spec["zones"]) or every)
+                else:
+                    item["effect"] = "off: " + (", ".join(units[u][0] for u in spec["units"]) or every)
+            listing.append(item)
+        return specs, listing
 
     def hidden_state(self, layout: Layout, params: Params, now_ms: float) -> tuple[np.ndarray, np.ndarray, str]:
         """Surfaces and structure from the last days of air temperatures."""
@@ -246,15 +288,11 @@ class Planner:
         step_starts = [datetime.fromtimestamp(x / 1000, tz) for x in t[:-1]]
         step_ends = [datetime.fromtimestamp(x / 1000, tz) for x in t[1:]]
         fns = self.cfg.function_objs()
-        zone_names = {z.id: z.name for z in layout.zones}
-        unit_names = {u.id: (u.name, u.zone) for u in layout.units}
-        events = []
-        for ev in inputs.get("events", []):
-            spec = parse_event(ev["summary"], zone_names, unit_names, {f.id: f.name for f in fns.values()})
-            if spec:
-                events.append({**spec, "start": ev["start"], "end": ev["end"], "name": ev["summary"]})
-            else:
-                info["notes"].append(f"calendar event not understood: {ev['summary']}")
+        events, listing = self.event_specs([e for e in inputs.get("events", [])
+                                            if e["end"] > step_starts[0] and e["start"] < step_ends[-1]])
+        for item in listing:
+            if not item["understood"]:
+                info["notes"].append(f"calendar event not understood: {item['summary']}")
         res = resolve(step_starts, step_ends, zids, [u.id for u in layout.units], cfg.defaults, cfg.rule_objs(), events)
 
         # comfort temperatures: the proxy's target, else the configured one

@@ -380,8 +380,11 @@ pages.comfort = async (redraw) => {
     <p class="hint">A rule switches a room to another comfort function, moves its comfort temperature, or keeps units off, at recurring times. Where rules overlap, the higher priority wins. "Every other week, Monday to Thursday evenings": weekly, every 2 weeks, those four days, 18:00–23:00, starting on a Monday of an "on" week.</p>
     <div id="rule-list"></div></div>`;
   html += `<div class="card"><h3>Calendar</h3><div class="fields"><label class="field">Calendar entity<select id="cal">${entityOptions('calendar', D.calendar, '— no calendar —')}</select></label></div>
-    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K. Rooms and functions match by name or id.</p></div>`;
-  html += `<div class="card"><div class="toolbar"><h3 style="margin:0">The next two weeks</h3><span class="spacer"></span><span class="hint">saved rules · hatched: units kept off</span></div><div id="preview"></div></div>`;
+    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K. Rooms match by their name, id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or the names given in Settings; functions by name or id, and Normal, Entspannt, Streng, Frostschutz.</p></div>`;
+  html += `<div class="card"><div class="toolbar"><h3 style="margin:0">The next two weeks</h3><span class="spacer"></span>
+    <span class="hint" id="cal-status"></span><button id="cal-reload" ${D.calendar ? '' : 'disabled'}>Reload calendar</button></div>
+    <p class="hint" style="margin-top:0">Saved rules and the calendar’s events. Hatched: units kept off; outlined: set by a calendar event.</p>
+    <div id="preview"></div></div>`;
   root.innerHTML = html;
 
   // functions
@@ -445,11 +448,18 @@ pages.comfort = async (redraw) => {
     try {
       S.config = await api('config', { method: 'PUT', body: JSON.stringify(D) });
       msg.textContent = 'Saved. The next plan uses it.';
-      S.draft = JSON.parse(JSON.stringify({ functions: S.config.functions, defaults: S.config.defaults, comfort: S.config.comfort, rules: S.config.rules, calendar: S.config.calendar }));
+      $('#cal-reload').disabled = !S.config.calendar;
       drawPreview();
     } catch (e) { msg.textContent = 'Not saved: ' + e.message; }
   };
   drawPreview();
+  $('#cal-reload').onclick = async () => {
+    const b = $('#cal-reload');
+    b.disabled = true;
+    try { await drawPreview(true); $('#cal-status').textContent += ' · the plan is being recomputed'; }
+    catch (e) { $('#cal-status').textContent = e.message; }
+    b.disabled = false;
+  };
 };
 
 function parseRrule(s) {
@@ -513,10 +523,13 @@ function ruleEditor(r, i, D, fnOpts) {
   return box;
 }
 
-async function drawPreview() {
+async function drawPreview(refresh = false) {
   const box = $('#preview');
   if (!box) return;
-  const pv = await api('schedule/preview?days=14&step_min=30');
+  const pv = await api('schedule/preview?days=14&step_min=30' + (refresh ? '&refresh=true' : ''));
+  const cal = pv.calendar || {};
+  const status = $('#cal-status');
+  if (status) status.textContent = !cal.entity ? 'no calendar set' : cal.error ? `calendar: ${cal.error}` : cal.fetched ? `calendar read ${ago(cal.fetched)}` : '';
   const L = S.config.layout;
   const fnIdx = Object.fromEntries(S.config.functions.map((f, i) => [f.id, i]));
   const per = 24 * 60 / pv.step_min;
@@ -533,15 +546,25 @@ async function drawPreview() {
       html += `<div class="heat-row"><span>${day}</span><div class="heat-cells" style="grid-template-columns:repeat(${per},1fr)">`;
       for (let k = d * per; k < (d + 1) * per; k++) {
         const locked = lockUnits.some(l => l?.[k]);
+        const fromEvent = pv.event_zone?.[z.id]?.[k] || L.units.some(u => u.zone === z.id && pv.event_unit?.[u.id]?.[k]);
         const off = pv.offset[z.id][k];
         const t = pv.start + k * pv.step_min * MIN;
-        html += `<span class="${locked ? 'locked' : ''}" style="background:${slot(fnIdx[fn[k]] ?? 0)}" title="${fmtTime(t, S.tz)} ${esc(fnName(fn[k]))}${off ? ' ' + (off > 0 ? '+' : '') + off + ' K' : ''}${locked ? ' · units off' : ''} (${esc(pv.source[z.id][k])})"></span>`;
+        html += `<span class="${locked ? 'locked' : ''} ${fromEvent ? 'ev' : ''}" style="background:${slot(fnIdx[fn[k]] ?? 0)}" title="${fmtTime(t, S.tz)} ${esc(fnName(fn[k]))}${off ? ' ' + (off > 0 ? '+' : '') + off + ' K' : ''}${locked ? ' · units off' : ''} (${esc(pv.source[z.id][k])})"></span>`;
       }
       html += `</div></div>`;
     }
     html += `<div class="heat-row"><span></span><div class="row hint" style="justify-content:space-between"><span>0:00</span><span>6:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div></div></div></div>`;
   }
   html += '</div>';
+  if (cal.entity) {
+    const evs = cal.events || [];
+    html += `<h3 style="margin:16px 0 6px">Calendar events</h3>`;
+    html += evs.length ? `<div class="table-wrap"><table><tr><th>When</th><th>Title</th><th>What the optimizer makes of it</th></tr>${evs.map(e => {
+      const sameDay = fmtDay(e.start, S.tz) === fmtDay(e.end - 1, S.tz);
+      const when = `${fmtDay(e.start, S.tz)} ${fmtTime(e.start, S.tz)}–${sameDay ? '' : fmtDay(e.end, S.tz) + ' '}${fmtTime(e.end, S.tz)}`;
+      return `<tr><td>${esc(when)}</td><td>${esc(e.summary)}</td><td>${e.understood ? esc(e.effect) : '<span class="hint">not understood, ignored (expected for example “Wohnzimmer: Relaxed”)</span>'}</td></tr>`;
+    }).join('')}</table></div>` : '<p class="hint">No events in the next two weeks.</p>';
+  }
   box.innerHTML = html;
 }
 
@@ -706,13 +729,14 @@ pages.settings = async () => {
     <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}" ${C.env?.ha_token ? 'disabled' : ''}>${C.env?.ha_token ? '<span class="hint">set by the container’s HA_TOKEN</span>' : ''}</label></div>
     <label class="check" style="margin-top:8px"><input type="checkbox" data-path="ha.verify_ssl" ${C.ha.verify_ssl ? 'checked' : ''}> Verify TLS certificate</label>
     <p class="hint">${S.status.ha.connected ? 'Connected to Home Assistant ' + esc(S.status.ha.version) + '.' : 'Not connected: ' + esc(S.status.ha.error || '') + '. The entity lists below fill once it is.'}</p></div>`;
-  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors</th><th>Windows face</th></tr>`;
+  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors</th><th>Windows face</th><th>Names in calendar events</th></tr>`;
   for (const z of L.zones) {
     M.zones[z.id] = M.zones[z.id] || {};
     const fac = z.facades || [];
     html += `<tr><td>${esc(z.name)}</td><td>${entitySelect(`mapping.zones.${z.id}.thermometer`, 'temp', M.zones[z.id].thermometer || '')}</td>
       <td>${z.windows ? entityMulti(`mapping.zones.${z.id}.windows`, 'opening', M.zones[z.id].windows) : '<span class="hint">none in the layout</span>'}</td>
-      <td>${z.solar === false ? '<span class="hint">no windows</span>' : `<div class="days" style="flex-wrap:nowrap">${['N', 'E', 'S', 'W'].map(f => `<label><input type="checkbox" data-facade="${z.id}" value="${f}" ${fac.includes(f) ? 'checked' : ''}>${f}</label>`).join('')}</div>`}</td></tr>`;
+      <td>${z.solar === false ? '<span class="hint">no windows</span>' : `<div class="days" style="flex-wrap:nowrap">${['N', 'E', 'S', 'W'].map(f => `<label><input type="checkbox" data-facade="${z.id}" value="${f}" ${fac.includes(f) ? 'checked' : ''}>${f}</label>`).join('')}</div>`}</td>
+      <td><input data-alias="${z.id}" value="${esc((z.aliases || []).join(', '))}" placeholder="${esc({ office: 'Büro', bedroom: 'Schlafzimmer', living: 'Wohnzimmer, Küche', bath: 'Bad', hall: 'Flur' }[z.id] || 'more names')}" style="width:100%;min-width:120px"></td></tr>`;
   }
   html += `</table></div><p class="hint">Windows face: where each room gets its sun from. Ticked, the model only looks for direct sun from those sides (north gets none), which it learns much faster; none ticked, it looks everywhere. Retrain after changing it.</p></div>`;
   html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Proxy (what the optimizer answers)</th><th>Device under the proxy</th><th>${L.units.some(u => u.kind === 'heater') ? 'Heater power (W or kW, not kWh)' : ''}</th></tr>`;
@@ -786,6 +810,8 @@ pages.settings = async () => {
     for (const z of C.layout.zones || []) {
       const boxes = [...root.querySelectorAll(`[data-facade="${z.id}"]`)];
       if (boxes.length) z.facades = boxes.filter(b => b.checked).map(b => b.value);
+      const al = root.querySelector(`[data-alias="${z.id}"]`);
+      if (al) z.aliases = al.value.split(',').map(x => x.trim()).filter(Boolean);
     }
     C.shadow_units = [...root.querySelectorAll('[data-shadow-unit]')].filter(b => b.checked).map(b => b.dataset.shadowUnit);
     C.shadow_comfort = Object.fromEntries([...root.querySelectorAll('[data-shadow-comfort]')].filter(i => i.value !== '').map(i => [i.dataset.shadowComfort, +i.value]));

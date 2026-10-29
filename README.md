@@ -24,6 +24,8 @@ subject to the model, each unit's lowest and highest fan level, the outdoor unit
 | `Schlafzimmer: aus` | the bedroom's units stay off |
 | `Alle: +1` | every comfort temperature 1 K higher |
 
+Rooms match by their name, their id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or names given per room in Settings; functions by name, id, or Normal, Entspannt, Streng, Frostschutz. The comfort page shows the next two weeks with the calendar's events in them, lists each event with what was made of it, and reloads the calendar on request.
+
 **Fan levels.** The plan gives each unit a heat output for the current five minutes. A fan level delivers fixed heat, so a target between two levels is met by alternating between them minute by minute.
 
 **Heating or cooling.** All AC units share one outdoor unit, so they run in the same mode. When rooms would drift too warm and it gets warm enough outside, cooling is planned too and the cheaper plan wins.
