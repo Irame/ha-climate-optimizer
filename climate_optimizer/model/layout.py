@@ -173,5 +173,6 @@ def default_params(layout: Layout) -> Params:
             units[u.id] = {"heat": [round(top * (0.35 + 0.65 * i / max(1, n - 1)), 3) for i in range(n)], "cool_ratio": 0.9}
         else:
             units[u.id] = {"kw": 2.0}
-    plant = {"Qmax": 7.0, "eta": 0.42, "standby": 0.03, "cap_slope": 0.02}
+    # base: kW while the outdoor unit runs at all; kq: extra kW per kW² of total heat; Pmax: its electric limit
+    plant = {"Qmax": 7.0, "eta": 0.42, "standby": 0.03, "cap_slope": 0.02, "base": 0.25, "kq": 0.005, "Pmax": 3.0}
     return Params(zones=zones, links=links, units=units, plant=plant)

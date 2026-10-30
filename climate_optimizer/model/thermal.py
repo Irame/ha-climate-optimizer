@@ -156,6 +156,43 @@ def electric(params: Params, q, tin, tout):
     return heat + cool
 
 
+def plant_base(params: Params) -> float:
+    """kW the outdoor unit draws whenever it runs at all (older models: the standby)."""
+    return params.plant.get("base", params.plant.get("standby", 0.03))
+
+
+def outdoor_unit(params: Params, q, tin, tout, share):
+    """What the shared outdoor unit makes of the heat the AC units ask for.
+
+    Its electricity: a base while it runs at all, the heat over the
+    efficiency, and an extra that grows with the square of the total, for
+    the efficiency lost at high load (low load is dear by the base, high load
+    by the extra, the middle is best). No more than Pmax: where the units ask
+    for more, each gets the same share less.
+
+    q: (..., n) heat asked per unit (negative cooling); tin: (..., n); tout: (...);
+    share: (...) of the step the outdoor unit runs. Returns (heat delivered, electricity kW).
+    """
+    q = np.asarray(q, dtype=float)
+    lin = electric(params, q, tin, np.asarray(tout)[..., None]).sum(axis=-1)
+    Q = np.abs(q).sum(axis=-1)
+    base = plant_base(params) * np.asarray(share, dtype=float)
+    kq = params.plant.get("kq", 0.0)
+    pmax = params.plant.get("Pmax")
+    P = base + lin + kq * Q ** 2
+    scale = np.ones_like(P)
+    if pmax:
+        over = P > pmax
+        if np.any(over):
+            a, b, c = kq * Q ** 2, lin, base - pmax  # a s² + b s + c = 0 gives the share s of what was asked
+            with np.errstate(divide="ignore", invalid="ignore"):
+                s_q = np.where(a > 1e-12, (-b + np.sqrt(np.maximum(b * b - 4 * a * c, 0.0))) / (2 * a),
+                               -c / np.maximum(b, 1e-12))
+            scale = np.where(over, np.clip(s_q, 0.0, 1.0), 1.0)
+            P = np.where(over, pmax, P)
+    return q * scale[..., None], P
+
+
 # ---- hidden states --------------------------------------------------------------
 def estimate_hidden(sys: System, T: np.ndarray, tout: np.ndarray, sol: np.ndarray, dt_h: float):
     """Surfaces and structure are never measured. Driving them with the

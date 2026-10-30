@@ -22,7 +22,8 @@ from scipy.optimize import least_squares
 
 from .dataset import Grid
 from .layout import Layout, Params, default_params, link_key
-from .thermal import DIST, _ffill, build, capacity_factor, carnot_heat, electric, estimate_hidden, zone_summary
+from .thermal import (DIST, _ffill, build, capacity_factor, carnot_heat, electric, estimate_hidden, outdoor_unit,
+                      plant_base, zone_summary)
 
 SOLAR_AIR = 0.3  # share of the sun through a window that warms the air at once, before training
 FIT = dict(window_h=6.0, stride_h=3.0, every=3, sigma_t=0.25, sigma_p=0.3, burn_in_h=36.0, max_nfev=60,
@@ -66,6 +67,9 @@ def param_list(layout: Layout, params: Params) -> list[P]:
             out.append(P(("units", u.id, "heat", i), "log" if i == 0 else "inc", 0.5, 0.05, measured=1.0))
     out += [P(("plant", "Qmax"), "log", 0.5), P(("plant", "eta"), "log", 0.15, measured=FIT["eta_measured"]),
             P(("plant", "cap_slope"), "lin", 0.02),
+            # the outdoor unit: its base shows in the power at low load, its limit where the power stops rising
+            P(("plant", "base"), "log", 0.8, 0.02, measured=0.5), P(("plant", "kq"), "log", 1.0, 1e-4),
+            P(("plant", "Pmax"), "log", 0.3, 0.3, measured=1.0),
             P(("building", "Tnb"), "lin", 2.0)]
     if any(z.solar for z in layout.zones):
         out.append(P(("building", "solar_air"), "unit", 1.0))
@@ -222,6 +226,16 @@ def initial_params(layout: Layout, grid: Grid) -> Params:
     p = default_params(layout)
     for uid, kw in heater_power(grid).items():
         p.units[uid]["kw"] = kw
+    # The outdoor unit's limit: start well above the most its phase ever showed
+    # while units ran. The fit only brings it down where the power stops rising
+    # although more is asked; data that never reached the limit leave it above.
+    pw = power_observation(grid)
+    ac = [u.id for u in layout.ac_units]
+    if ac:
+        running = np.max([grid.unit_running(u) for u in ac], axis=0) > 0.5
+        seen = pw["obs"][pw["ok"] & running]
+        if len(seen) >= 50:
+            p.plant["Pmax"] = float(max(1.5, 1.3 * np.quantile(seen, 0.995)))
     return p
 
 
@@ -257,20 +271,19 @@ def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray
     ac_idx = [j for j, u in enumerate(layout.units) if u.kind == "ac"]
     ac_zone = [layout.zone_index(layout.units[j].zone) for j in ac_idx]
     win_zone = [layout.zone_index(z) for z in layout.window_zones]
-    standby = params.plant.get("standby", 0.03)
+    running = np.max([grid.unit_running(layout.units[i].id) for i in ac_idx], axis=0) if ac_idx else None
     for j in range(L):
         ks = k0s + j
-        q = unit_heat(params, layout, grid, ks)  # (nw, nu)
+        q = unit_heat(params, layout, grid, ks)  # (nw, nu), as asked
         dist = np.column_stack([grid.tout[ks], grid.sol[ks, 0], grid.sol[ks, 1], grid.sol[ks, 2], grid.sol[ks, 3],
                                 grid.hc[ks], grid.hs[ks], np.ones(nw)])
         wv = grid.open[ks] * (grid.tout[ks][:, None] - X[:, win_zone]) if win_zone else np.zeros((nw, 0))
-        V = np.concatenate([q, dist, wv], axis=1)
         if ac_idx:
-            qa = q[:, ac_idx]
-            pe = electric(params, qa, X[:, ac_zone], grid.tout[ks][:, None]).sum(axis=1)
-            pe = pe + standby * (np.abs(qa).sum(axis=1) > 0)
+            qd, pe = outdoor_unit(params, q[:, ac_idx], X[:, ac_zone], grid.tout[ks], running[ks])
+            q[:, ac_idx] = qd  # what the outdoor unit could deliver
         else:
             pe = np.zeros(nw)
+        V = np.concatenate([q, dist, wv], axis=1)
         Pel[:, j] = pe
         X = X @ Ad.T + V @ Bd.T
         Ta[:, j + 1] = X[:, :nz]
@@ -360,8 +373,43 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
                   range=[float(grid.t[0]), float(grid.t[-1])],
                   days={"train": [float(grid.t[k]) for k in train_days], "val": [float(grid.t[k]) for k in val_days]},
                   zones={z.id: zone_summary(model, z.id) for z in layout.zones},
-                  cop7=float(model.plant["eta"] * carnot_heat(21.0, 7.0)))
+                  cop7=float(model.plant["eta"] * carnot_heat(21.0, 7.0)),
+                  plant=plant_curve(layout, model, grid, pw))
     return {"params": model, "report": report}
+
+
+def plant_curve(layout: Layout, params: Params, grid: Grid, pw: dict, n_points: int = 400) -> dict | None:
+    """The outdoor unit's electricity against the heat it delivers, at 7 °C outside
+    and 21 °C inside, with what the phase measured in heating steps for comparison."""
+    ac = [j for j, u in enumerate(layout.units) if u.kind == "ac"]
+    if not ac:
+        return None
+    qs = np.linspace(0.0, 10.0, 81)
+    one = np.zeros((len(qs), 1))
+    one[:, 0] = qs
+    _, p = outdoor_unit(params, one, np.full_like(one, 21.0), np.full(len(qs), 7.0), np.ones(len(qs)))
+    curve_q, curve_p = [], []
+    for q, pe in zip(qs, p):
+        if params.plant.get("Pmax") and pe >= params.plant["Pmax"] - 1e-9:
+            break
+        curve_q.append(float(q))
+        curve_p.append(float(pe))
+    # measured: steps with only heating at the AC units, no heater, power known
+    ks = np.arange(grid.K)
+    q = unit_heat(params, layout, grid, ks)[:, ac]
+    share = np.max([grid.unit_running(layout.units[j].id) for j in ac], axis=0)
+    heater = sum(grid.heater_kw.values()) > 0.05 if grid.heater_kw else np.zeros(grid.K, bool)
+    room = grid.T[:, [layout.zone_index(layout.units[j].zone) for j in ac]]
+    qd, pel = outdoor_unit(params, q, np.nan_to_num(room, nan=21.0), grid.tout, share)
+    at_limit = bool(params.plant.get("Pmax")) & (pel >= params.plant.get("Pmax", np.inf) - 1e-6) & (np.abs(qd).sum(1) < np.abs(q).sum(1) - 1e-6)
+    sel = pw["ok"] & (share > 0.99) & ~heater & (q.min(axis=1) >= 0)
+    idx = np.flatnonzero(sel)
+    if len(idx) > n_points:
+        idx = idx[np.linspace(0, len(idx) - 1, n_points).astype(int)]
+    return {"q": curve_q, "p": curve_p, "pmax": params.plant.get("Pmax"), "base": plant_base(params),
+            "points": [[round(float(qd[k].sum()), 3), round(float(pw["obs"][k]), 3)] for k in idx],
+            "hours_at_limit": round(float(at_limit.sum()) * grid.dt_h, 1),
+            "tout_points": [round(float(grid.tout[k]), 1) for k in idx]}
 
 
 def check(layout: Layout, params: Params, grid: Grid, pw: dict, train_days, val_days, per_day) -> dict:

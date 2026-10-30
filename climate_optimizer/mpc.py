@@ -40,9 +40,10 @@ from scipy.sparse import coo_matrix
 
 from .comfort import ComfortFunction, Side
 from .model.layout import Layout, Params
-from .model.thermal import DIST, System, build, capacity_factor, carnot_cool, carnot_heat, level_heat
+from .model.thermal import DIST, System, build, capacity_factor, carnot_cool, carnot_heat, level_heat, plant_base
 
 MIN = 60_000
+EXTRA_EDGES = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 12.0)  # kW of total heat: the high-load extra in pieces
 
 
 @dataclass
@@ -397,17 +398,37 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
         sign.append(sgn)
         info.append((u, lo, hi, el))
 
-    # the outdoor unit: its capacity is shared, and it draws standby power whenever any AC runs
+    # The outdoor unit is shared: its capacity, a base draw whenever any AC runs,
+    # an extra that grows with the square of the total heat (convex, so exact in
+    # pieces), and an electric limit for all of it.
     ac = [j for j, u in enumerate(U) if u.kind == "ac"]
+    extra_vars, extra_slope = [], None
     if ac:
         qmax = params.plant.get("Qmax", 7.0)
         cap = qmax * (capacity_factor(params, tout) if mode == "heat" else np.full(N, 0.9))
-        standby = params.plant.get("standby", 0.03)
-        anyon = V.add(N, lb=0.0, ub=1.0, c=standby * pr.price * dts)
+        base_kw = plant_base(params)
+        kq = params.plant.get("kq", 0.0)
+        pmax = params.plant.get("Pmax")
+        anyon = V.add(N, lb=0.0, ub=1.0, c=base_kw * pr.price * dts)
+        if kq > 0:
+            edges = np.array(EXTRA_EDGES)
+            extra_slope = kq * (edges[1:] ** 2 - edges[:-1] ** 2) / np.diff(edges)  # kW of electricity per kW of heat
         for k in range(N):
             R.add([Q[j][k] for j in ac], [1.0] * len(ac), hi=float(cap[k]))
             for j in ac:
                 R.add([anyon[k], ON[j][k]], [1.0, -1.0], lo=0.0)
+            cols, vals = [anyon[k]], [base_kw]  # the electricity of the step, for the limit
+            for j in ac:
+                cols.append(Q[j][k])
+                vals.append(float(info[j][3][k]))
+            if extra_slope is not None:
+                seg = V.add(len(extra_slope), lb=0.0, ub=np.diff(EXTRA_EDGES), c=extra_slope * pr.price[k] * dts[k])
+                extra_vars.append(seg)
+                R.add(list(seg) + [Q[j][k] for j in ac], [1.0] * len(seg) + [-1.0] * len(ac), lo=0.0, hi=0.0)
+                cols += list(seg)
+                vals += list(extra_slope)
+            if pmax:
+                R.add(cols, vals, hi=float(pmax))
 
     # dynamics
     for k in range(N):
@@ -488,7 +509,9 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
         electric += e
         energy += float(np.sum(e * pr.price * dts))
     if ac:
-        sb = params.plant.get("standby", 0.03) * np.max([share[U[j].id] for j in ac], axis=0)
+        sb = plant_base(params) * np.max([share[U[j].id] for j in ac], axis=0)
+        if extra_vars:
+            sb = sb + np.array([float(np.dot(x[seg], extra_slope)) for seg in extra_vars])
         electric += sb
         energy += float(np.sum(sb * pr.price * dts))
     starts_cost = float(sum(np.dot(x[ST[j]], V.c[ST[j][0]:ST[j][-1] + 1]) for j in range(nu)))

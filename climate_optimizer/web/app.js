@@ -647,7 +647,19 @@ pages.model = async () => {
       const p = m.params.units[u.id] || {};
       html += `<tr><td>${esc(u.name)}</td><td>${p.heat ? p.heat.map((v, i) => `level ${i}: ${num(v, 2)} kW`).join(' · ') : num(p.kw, 2) + ' kW'}</td></tr>`;
     }
-    html += `</table></div><p class="hint">Heating output at 7 °C outside; it falls ${num((m.params.plant.cap_slope || 0) * 100, 1)} % per kelvin colder. The shared outdoor unit delivers at most ${num(m.params.plant.Qmax, 1)} kW.</p></div>`;
+    html += `</table></div><p class="hint">Heating output at 7 °C outside; it falls ${num((m.params.plant.cap_slope || 0) * 100, 1)} % per kelvin colder.</p></div>`;
+    const pc = rep.plant;
+    if (pc) {
+      const pl = m.params.plant;
+      html += `<div class="card"><h3>Outdoor unit</h3><div class="two"><div>
+        <div class="stats" style="grid-template-columns:repeat(auto-fill,minmax(120px,1fr))">
+          <div class="stat"><div class="k">Base while running</div><div class="v">${num(pl.base ?? pl.standby, 2)} kW</div></div>
+          <div class="stat"><div class="k">Electric limit</div><div class="v">${pl.Pmax ? num(pl.Pmax, 2) + ' kW' : '–'}</div><div class="s">${pc.hours_at_limit > 0.5 ? `reached for ${num(pc.hours_at_limit, 1)} h` : 'not reached yet: at least this'}</div></div>
+          <div class="stat"><div class="k">Extra at high load</div><div class="v">${num((pl.kq || 0) * 1000, 1)} W/kW²</div></div>
+        </div>
+        <p class="hint">What all units together draw on the phase, against the heat they deliver: a base whenever the outdoor unit runs at all, the heat over the efficiency, and an extra that grows with the square of the total, up to the limit. Little heat is dear by the base, a lot by the extra; the plan bundles heating where it can and keeps clear of full load. The dots are five-minute steps the phase measured, with heat as the model reckons it (it is not measured).</p>
+      </div><div><div id="plant-chart"></div><p class="hint" style="margin:4px 0 0">Electricity (kW) against heat (kW), at 7 °C outside and 21 °C inside.</p></div></div></div>`;
+    }
     if (rep.validation?.length) {
       html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Check days: predicted from midnight against measured</h3><span class="spacer"></span><div class="chips" id="val-days"></div></div>
         <div class="toolbar"><div class="chips" id="val-zones"></div></div><div id="val-chart"></div></div>`;
@@ -688,6 +700,17 @@ pages.model = async () => {
       } catch { modelPoll = setTimeout(poll, 5000); }
     };
     modelPoll = setTimeout(poll, 2000);
+  }
+  if (rep?.plant && $('#plant-chart')) {
+    const pc = rep.plant;
+    const xs = pc.points.map(p => p[0]), ys = pc.points.map(p => p[1]);
+    const xmax = Math.max(1, ...xs, ...pc.q) * 1.05;
+    curveChart($('#plant-chart'), {
+      series: [{ x: pc.q, y: pc.p, color: slot(0) }],
+      dots: [{ x: xs, y: ys, color: css('--ink-2') }],
+      hlines: pc.pmax ? [{ y: pc.pmax, label: 'limit' }] : [],
+      domain: [0, xmax], height: 200, xFmt: v => v + ' kW', yFmt: v => v.toFixed(1),
+    });
   }
   if (rep?.validation?.length) {
     S.valZone = S.valZone || L.zones[0].id;

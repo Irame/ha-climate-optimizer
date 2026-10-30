@@ -53,6 +53,10 @@ def matching_params(params: Params | None, layout: Layout) -> Params:
         if src and (("heat" in d and len(src.get("heat", [])) == len(d["heat"])) or ("kw" in d and "kw" in src)):
             base.units[u] = dict(src)
     base.plant.update(params.plant)
+    if "base" not in params.plant:  # trained before the outdoor unit had a base, an extra and a limit
+        base.plant["base"] = params.plant.get("standby", 0.03)
+        base.plant.pop("kq", None)
+        base.plant.pop("Pmax", None)
     base.building.update(params.building)
     return base
 

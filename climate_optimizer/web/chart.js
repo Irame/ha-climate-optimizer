@@ -296,13 +296,15 @@ function idxAt(ts, t, step) {
 }
 
 // A plain XY line chart (comfort cost curves).
-export function curveChart(container, { series, marks = [], domain, height = 150, xFmt = v => v, yFmt = v => v.toFixed(2) }) {
+export function curveChart(container, { series, marks = [], dots = [], hlines = [], domain, yDomain, height = 150, xFmt = v => v, yFmt = v => v.toFixed(2) }) {
   container.innerHTML = '';
   const width = Math.max(240, container.clientWidth || 420);
   const L = 48, R = 8, T = 8, B = 26;
   let xlo = Infinity, xhi = -Infinity, yhi = 0;
-  for (const s of series) s.x.forEach((x, i) => { xlo = Math.min(xlo, x); xhi = Math.max(xhi, x); if (isFinite(s.y[i])) yhi = Math.max(yhi, s.y[i]); });
+  for (const s of [...series, ...dots]) s.x.forEach((x, i) => { xlo = Math.min(xlo, x); xhi = Math.max(xhi, x); if (isFinite(s.y[i])) yhi = Math.max(yhi, s.y[i]); });
+  for (const h of hlines) yhi = Math.max(yhi, h.y);
   if (domain) [xlo, xhi] = domain;
+  if (yDomain) yhi = yDomain[1];
   yhi = yhi || 1;
   const yt = niceTicks(0, yhi, 3);
   const ymax = Math.max(yhi, yt[yt.length - 1]);
@@ -321,6 +323,13 @@ export function curveChart(container, { series, marks = [], domain, height = 150
     if (m.x < xlo || m.x > xhi) continue;
     el('line', { x1: X(m.x), x2: X(m.x), y1: T, y2: height - B, class: 'now' }, svg);
     el('text', { x: X(m.x) + (m.x < 0 ? 4 : -4), y: T + 10, class: 'tick', 'text-anchor': m.x < 0 ? 'start' : 'end' }, svg).textContent = m.label;
+  }
+  for (const s of dots) {
+    s.x.forEach((x, i) => el('circle', { cx: X(x).toFixed(1), cy: Y(s.y[i]).toFixed(1), r: 2.2, fill: s.color, opacity: s.opacity ?? 0.35 }, svg));
+  }
+  for (const h of hlines) {
+    el('line', { x1: L, x2: width - R, y1: Y(h.y), y2: Y(h.y), class: 'now', 'stroke-dasharray': '4 3' }, svg);
+    if (h.label) el('text', { x: width - R - 4, y: Y(h.y) - 4, class: 'tick', 'text-anchor': 'end' }, svg).textContent = h.label;
   }
   for (const s of series) {
     const d = s.x.map((x, i) => `${i ? 'L' : 'M'}${X(x).toFixed(1)},${Y(s.y[i]).toFixed(1)}`).join('');
