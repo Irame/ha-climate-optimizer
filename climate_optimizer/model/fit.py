@@ -32,7 +32,7 @@ FIT = dict(window_h=6.0, stride_h=3.0, every=3, sigma_t=0.25, sigma_p=0.3, burn_
            huber=1.5, prior_weight=10.0, eta_measured=0.5,
            # after the check, once more on every day, from the checked model; taken unless it
            # predicts the days it learned from much worse, or a number jumps (bad recent data)
-           refit_nfev=25, refit_rmse_factor=1.15, refit_rmse_slack=0.03, refit_jump_sigma=1.5)
+           refit_nfev=25, refit_rmse_factor=1.15, refit_rmse_slack=0.03, refit_jump_factor=2.0)
 
 
 def robust(r: np.ndarray, c: float) -> np.ndarray:
@@ -231,15 +231,20 @@ def initial_params(layout: Layout, grid: Grid) -> Params:
     p = default_params(layout)
     for uid, kw in heater_power(grid).items():
         p.units[uid]["kw"] = kw
-    # The outdoor unit's limit: start well above the most its phase ever showed
-    # while units ran. The fit only brings it down where the power stops rising
-    # although more is asked; data that never reached the limit leave it above.
+    # The outdoor unit's limit: start just above where the phase levels off with
+    # several units running, so the fit sees the limit bind and can move it either
+    # way (a limit above everything the units ask is never told otherwise). Not the
+    # top of the data: an energy meter catches every kettle and oven on the phase too.
+    # With few such steps, start well above the most seen, and leave it there.
     pw = power_observation(grid)
     ac = [u.id for u in layout.ac_units]
     if ac:
-        running = np.max([grid.unit_running(u) for u in ac], axis=0) > 0.5
-        seen = pw["obs"][pw["ok"] & running]
-        if len(seen) >= 50:
+        on = np.sum([grid.unit_running(u) > 0.5 for u in ac], axis=0)
+        busy = pw["ok"] & (on >= min(2, len(ac)))
+        seen = pw["obs"][pw["ok"] & (on >= 1)]
+        if busy.sum() >= 30:
+            p.plant["Pmax"] = float(max(1.5, 1.1 * np.quantile(pw["obs"][busy], 0.9)))
+        elif len(seen) >= 50:
             p.plant["Pmax"] = float(max(1.5, 1.3 * np.quantile(seen, 0.995)))
     return p
 
@@ -381,7 +386,7 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
     if progress:
         progress({"stage": "check"})
     report = check(layout, model, grid, pw, train_days, val_days, per_day)
-    checked = model
+    checked = model2 = model
     if val_days:
         # learn once more with the check days, the latest there are; keep it if it holds up
         t_refit = time.time()
@@ -389,15 +394,13 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
         before = np.nanmean(report["rmse_train"]) if report["rmse_train"] else None
         after = check(layout, model2, grid, pw, train_days, [], per_day)["rmse_train"]
         after = np.nanmean(after) if after else None
-        jump = np.abs(res2.x - res.x) / np.array([p.sigma for p in plist])
-        worst = int(np.argmax(jump))
-        name = "/".join(map(str, plist[worst].path[1:] if plist[worst].path[0] == "zones" else plist[worst].path))
+        name, factor = largest_change(layout, model, model2)
         refit = {"days": len(train_days) + len(val_days), "rmse_before": before, "rmse_after": after,
-                 "seconds": round(time.time() - t_refit, 1), "largest_change": {"param": name, "sigma": float(jump[worst])}}
+                 "seconds": round(time.time() - t_refit, 1), "largest_change": {"what": name, "factor": factor}}
         if before is not None and after is not None and after > before * FIT["refit_rmse_factor"] + FIT["refit_rmse_slack"]:
             refit.update(used=False, reason=f"it predicts the days learned from worse ({after:.2f} K against {before:.2f} K)")
-        elif jump[worst] > FIT["refit_jump_sigma"]:
-            refit.update(used=False, reason=f"{name} would change by {jump[worst]:.1f} times its usual range")
+        elif factor > FIT["refit_jump_factor"]:
+            refit.update(used=False, reason=f"{name} would change by a factor of {factor:.1f}")
         else:
             refit.update(used=True)
             model = model2
@@ -411,7 +414,31 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
                   zones={z.id: zone_summary(model, z.id) for z in layout.zones},
                   cop7=float(model.plant["eta"] * carnot_heat(21.0, 7.0)),
                   plant=plant_curve(layout, model, grid, pw))
-    return {"params": model, "checked": checked, "report": report}
+    # params: the one to plan with; checked: learned without the check days; refitted: with them, taken or not
+    return {"params": model, "checked": checked, "refitted": model2, "report": report}
+
+
+def largest_change(layout: Layout, a: Params, b: Params) -> tuple[str, float]:
+    """What changes most between two models, as a factor, in the numbers that mean
+    something (not in how the fit parametrises them: a level's increment on the one
+    below can halve while both levels hardly move)."""
+    out = []
+    for z in layout.zones:
+        sa, sb = zone_summary(a, z.id), zone_summary(b, z.id)
+        out += [(f"{z.name}: heat stored", sa["C"], sb["C"]), (f"{z.name}: heat loss", sa["Hloss"], sb["Hloss"])]
+    for u in layout.ac_units:
+        for i, (x, y) in enumerate(zip(a.units[u.id]["heat"], b.units[u.id]["heat"])):
+            out.append((f"{u.name}: heat at fan level {i + 1}", x, y))
+    for k, what in (("eta", "efficiency"), ("base", "outdoor unit base"), ("Pmax", "outdoor unit limit")):
+        if k in a.plant and k in b.plant:
+            out.append((what, a.plant[k], b.plant[k]))
+    best = ("nothing", 1.0)
+    for what, x, y in out:
+        if x > 0 and y > 0:
+            f = max(x / y, y / x)
+            if f > best[1]:
+                best = (what, float(f))
+    return best
 
 
 def plant_curve(layout: Layout, params: Params, grid: Grid, pw: dict, n_points: int = 400) -> dict | None:

@@ -76,14 +76,14 @@ def test_training_recovers_the_apartment(trained):
 def test_a_refit_that_does_not_hold_up_is_not_taken(trained):
     layout, truth, grid, _, _ = trained
     old = dict(fit.FIT)
-    fit.FIT.update(max_nfev=6, refit_nfev=4, burn_in_h=24, refit_jump_sigma=0.0)  # any change is too much
+    fit.FIT.update(max_nfev=6, refit_nfev=4, burn_in_h=24, refit_jump_factor=1.0)  # any change is too much
     try:
         res = fit.train(layout, grid)
     finally:
         fit.FIT.clear()
         fit.FIT.update(old)
     rf = res["report"]["refit"]
-    assert not rf["used"] and "would change by" in rf["reason"]
+    assert not rf["used"] and "would change by a factor of" in rf["reason"]
     assert res["params"] is res["checked"]
     assert any(w.startswith("Not learned again") for w in res["report"]["warnings"])
 
