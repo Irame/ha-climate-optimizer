@@ -27,6 +27,7 @@ modes are planned and the cheaper plan wins.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import math
 import os
 import sys
@@ -85,6 +86,18 @@ class UnitSpec:
 
 
 @dataclass
+class Airing:
+    """Airing the whole apartment: a candidate opens every window zone for its interval."""
+
+    cand: list[tuple[int, int]]  # (start ms, end ms)
+    groups: list[tuple[list[int], int]]  # the candidates of a day, and how many of them to take
+    # The first day is decided as such; later ones as shares, the best taken: they only
+    # preview, are planned again on their day, and keep the problem quick.
+    min_gap_ms: float  # from one airing's start to the next
+    tref: dict[str, np.ndarray]  # window zone -> (N,) the air temperature its loss is reckoned from
+
+
+@dataclass
 class Problem:
     sys: System
     t: np.ndarray  # (N+1,) step boundaries, ms
@@ -96,6 +109,7 @@ class Problem:
     functions: dict[str, list[ComfortFunction]]  # zone -> (N,) function per step
     units: list[UnitSpec]
     settings: Settings = field(default_factory=Settings)
+    airing: Airing | None = None
 
     @property
     def N(self) -> int:
@@ -123,6 +137,9 @@ class Plan:
     gap: float | None = None
     alternatives: dict[str, float] = field(default_factory=dict)  # mode -> objective of the others tried
     comfort_cost: dict[str, float] = field(default_factory=dict)  # zone -> € of deviation over the plan
+    airing: list[tuple[int, int]] = field(default_factory=list)  # (start ms, end ms) of the airings chosen
+    airing_cost: float | None = None  # what they add to the plan's cost (€), heating them back up included
+    airing_share: np.ndarray | None = None  # per candidate, as solved (shares when relaxed)
 
     def step_at(self, t_ms: float) -> int | None:
         if self.t[0] - 5 * MIN <= t_ms < self.t[0]:
@@ -144,6 +161,8 @@ class Plan:
             "status": self.status, "seconds": round(self.seconds, 2), "gap": self.gap,
             "alternatives": {k: round(v, 4) for k, v in self.alternatives.items()},
             "comfort_cost": {k: round(v, 4) for k, v in self.comfort_cost.items()},
+            "airing": [[int(a), int(b)] for a, b in self.airing],
+            "airing_cost": None if self.airing_cost is None else round(self.airing_cost, 4),
         }
 
 
@@ -320,8 +339,11 @@ def _quiet_stdout():
             os.close(saved)
 
 
-def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
-    """One MILP with the AC units in `mode`. Returns the plan and its objective."""
+def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = None,
+               relax_airing: bool = False) -> tuple[Plan | None, float]:
+    """One MILP with the AC units in `mode`. Returns the plan and its objective.
+    fix_on: the on/off of the first steps, as given (to compare plans that differ
+    in something else); relax_airing: airing candidates as shares, an LP for them."""
     t_start = time.time()
     s = pr.settings
     sys = pr.sys
@@ -366,6 +388,8 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
             on_lb[keep] = 1.0
         if not u.on and u.since_min < s.min_off_min:
             on_ub[starts < s.min_off_min - u.since_min] = 0.0
+        if fix_on is not None and u.id in fix_on:
+            on_lb[fine] = on_ub[fine] = np.round(np.asarray(fix_on[u.id])[fine])
         on = np.concatenate([V.add(int(fine.sum()), lb=on_lb[fine], ub=on_ub[fine], integer=True),
                              V.add(int((~fine).sum()), lb=on_lb[~fine], ub=on_ub[~fine])])
         st = V.add(N, lb=0.0, ub=1.0, c=s.start_cost if u.kind == "ac" else s.heater_start_cost)
@@ -430,13 +454,40 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
             if pmax:
                 R.add(cols, vals, hi=float(pmax))
 
+    # airing: which candidates, how many a day, apart enough; the window zones' units stay off meanwhile
+    AIR, air_open = [], {}  # air_open: step -> [(candidate, share of the step open)]
+    if pr.airing is not None and sys.nw and pr.airing.cand:
+        A = pr.airing
+        AIR = V.add(len(A.cand), lb=0.0, ub=1.0)
+        if not relax_airing:
+            for i in A.groups[0][0]:
+                V.integ[AIR[i]] = 1
+        for idx, count in A.groups:
+            R.add([AIR[i] for i in idx], [1.0] * len(idx), lo=float(count), hi=float(count))
+        # at most one in any stretch of min_gap: much tighter than pairs, and so much faster
+        starts = np.array([a for a, _ in A.cand], float)
+        for i in range(len(A.cand)):
+            near = np.flatnonzero((starts >= starts[i]) & (starts < starts[i] + A.min_gap_ms))
+            if len(near) > 1:
+                R.add([AIR[j] for j in near], [1.0] * len(near), hi=1.0)
+        for c, (a, b) in enumerate(A.cand):
+            for k in range(N):
+                ov = (min(b, pr.t[k + 1]) - max(a, pr.t[k])) / (pr.t[k + 1] - pr.t[k])
+                if ov > 1e-6:
+                    air_open.setdefault(k, []).append((c, ov))
+        win_units = [j for j, u in enumerate(U) if u.zone in layout.window_zones]
+        for k, opens in air_open.items():
+            for c, ov in opens:
+                for j in win_units:
+                    R.add([ON[j][k], AIR[c]], [1.0, ov], hi=1.0)
+
     # dynamics
+    wz = [layout.zone_index(z) for z in layout.window_zones]
     for k in range(N):
         Ad, Bd = mats[k]
         d = pr.dist[k]
         free = Bd[:, sl_d] @ d
         if sys.nw:
-            wz = [layout.zone_index(z) for z in layout.window_zones]
             free = free + Bd[:, sl_w] @ (pr.window[k] * (tout[k] - pr.x0[wz]))
         for i in range(n):
             cols = [X[k + 1, i]] + list(X[k])
@@ -446,6 +497,12 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
                 if b:
                     cols.append(Q[j][k])
                     vals.append(-b * sign[j])
+            for c, ov in air_open.get(k, []):  # an open window: Hw (Tout - Ta), Ta taken as the reference
+                coef = sum(Bd[i, sl_w.start + jw] * ov * (1.0 - pr.window[k, jw]) * (tout[k] - pr.airing.tref[z][k])
+                           for jw, z in enumerate(layout.window_zones))
+                if coef:
+                    cols.append(AIR[c])
+                    vals.append(-coef)
             R.add(cols, vals, lo=float(free[i]), hi=float(free[i]))
 
     # comfort
@@ -501,6 +558,14 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
     temps = x[X[:, :nz].ravel()].reshape(N + 1, nz)
     share = {u.id: np.clip(x[ON[j]], 0.0, 1.0) for j, u in enumerate(U)}
     on = {u.id: share[u.id] > 0.01 for u in U}
+    air_share = x[AIR] if len(AIR) else np.zeros(0)
+    aired = []
+    for idx, count in (pr.airing.groups if len(AIR) else []):
+        took = []  # the largest shares, apart enough (the first day's are whole already)
+        for i in sorted(idx, key=lambda i: -air_share[i]):
+            if len(took) < count and all(abs(pr.airing.cand[i][0] - pr.airing.cand[j][0]) >= pr.airing.min_gap_ms for j in took):
+                took.append(i)
+        aired += [pr.airing.cand[i] for i in sorted(took)]
     heat = {u.id: sign[j] * x[Q[j]] * on[u.id] for j, u in enumerate(U)}
     electric = np.zeros(N)
     energy = 0.0
@@ -527,6 +592,7 @@ def solve_mode(pr: Problem, mode: str) -> tuple[Plan | None, float]:
               "total": energy + comfort_cost + starts_cost + term_cost},
         status=status, seconds=seconds, gap=getattr(res, "mip_gap", None),
         comfort_cost={z: float(np.dot(x[v], np.array(V.c)[v])) for z, v in seg_zone.items()},
+        airing=aired, airing_share=air_share,
     )
     return plan, float(res.fun)
 
@@ -580,6 +646,17 @@ def candidate_modes(pr: Problem) -> list[str]:
     return modes
 
 
+def airing_cost(pr: Problem, plan: Plan) -> float | None:
+    """What the plan's airings add, heating back up included: the plan with and without
+    them, both with the first steps switched as planned and nothing else left to chance,
+    so no solver tolerance gets into the difference."""
+    n = len(plan.airing)
+    only = dataclasses.replace(pr.airing, cand=list(plan.airing), groups=[(list(range(n)), n)])
+    _, w = solve_mode(dataclasses.replace(pr, airing=only), plan.mode, fix_on=plan.share)
+    _, wo = solve_mode(dataclasses.replace(pr, airing=None), plan.mode, fix_on=plan.share)
+    return w - wo if math.isfinite(w) and math.isfinite(wo) else None
+
+
 def solve(pr: Problem) -> Plan:
     best, best_obj, objs = None, math.inf, {}
     for mode in candidate_modes(pr):
@@ -587,9 +664,13 @@ def solve(pr: Problem) -> Plan:
         objs[mode] = obj
         if plan is not None and obj < best_obj:
             best, best_obj = plan, obj
+    if best is None and pr.airing is not None:  # airing as asked does not fit: plan without
+        return solve(dataclasses.replace(pr, airing=None))
     if best is None:
         raise RuntimeError("no feasible plan")
     best.alternatives = {m: o for m, o in objs.items() if m != best.mode}
+    if pr.airing is not None and best.airing:
+        best.airing_cost = airing_cost(pr, best)
     return best
 
 

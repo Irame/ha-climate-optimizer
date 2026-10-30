@@ -33,6 +33,16 @@ class PriceConfig(BaseModel):
     sensor: str = ""  # for source attributes; also the price history shown in the UI
 
 
+class AiringConfig(BaseModel):
+    """One airing of the whole apartment at a time: every room with a window sensor at once."""
+    model_config = ConfigDict(extra="ignore")
+    enabled: bool = False
+    duration_min: float = Field(10.0, ge=2, le=60)
+    per_day: int = Field(1, ge=1, le=4)
+    min_gap_h: float = Field(4.0, ge=0.5, le=12)
+    sensor: str = "sensor.climate_optimizer_airing"  # where Home Assistant gets the next suggestion
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="ignore")
     ha: HAConfig = Field(default_factory=HAConfig)
@@ -46,6 +56,7 @@ class Config(BaseModel):
     comfort: dict[str, float] = Field(default_factory=dict)  # zone -> comfort temperature when no proxy sets one
     rules: list[dict] = Field(default_factory=lambda: [r.to_dict() for r in default_rules()])
     calendar: str = ""  # calendar entity whose events override the rules
+    airing: AiringConfig = Field(default_factory=AiringConfig)
     settings: dict = Field(default_factory=lambda: Settings().__dict__.copy())
     shadow: bool = True  # plan and show, but let the proxies' own thermostats decide
     # in shadow mode, to watch the optimizer beside another automation:
@@ -145,7 +156,7 @@ class ConfigStore:
             if patch.get("api_token") == "********":
                 patch.pop("api_token")
             for k, v in patch.items():
-                if isinstance(v, dict) and isinstance(cur.get(k), dict) and k in ("ha", "prices"):
+                if isinstance(v, dict) and isinstance(cur.get(k), dict) and k in ("ha", "prices", "airing"):
                     cur[k].update(v)
                 else:
                     cur[k] = v

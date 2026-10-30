@@ -81,6 +81,8 @@ class Planner:
         self.store = store
         self.collector = collector
         self.ha = ha
+        self.airing_now: tuple[int, int] | None = None  # the airing the sensor suggests
+        self._airing_sent = False
         self.state = PlanState()
         self.dispatcher = FanDispatcher()
         self.requests: dict[str, ProxyRequest] = {}
@@ -201,6 +203,8 @@ class Planner:
                     item["effect"] = f"{fns[spec['function']].name} in " + (", ".join(zones[z] for z in spec["zones"]) or every)
                 elif spec["action"] == "offset":
                     item["effect"] = f"comfort {spec['offset']:+g} K in " + (", ".join(zones[z] for z in spec["zones"]) or every)
+                elif spec["action"] == "no_airing":
+                    item["effect"] = "no airing suggested"
                 else:
                     item["effect"] = "off: " + (", ".join(units[u][0] for u in spec["units"]) or every)
             listing.append(item)
@@ -376,12 +380,128 @@ class Planner:
                 info.setdefault("no_comfort", {})[z] = proxies[here[0]]["note"]
                 for uid in here:
                     proxies[uid]["comfort"] = None
-        pr = mpc.Problem(sysm, t, dist, win, price, x0, comfort, functions, units, st)
+        airing = None
+        if cfg.airing.enabled and layout.window_zones:
+            airing, info["airing"] = self.airing_spec(now_ms, t, comfort, x0, layout, tz, events)
+        pr = mpc.Problem(sysm, t, dist, win, price, x0, comfort, functions, units, st, airing)
         info["ghi"] = (ghi * 1000).round(0).tolist()  # W/m²
         info["cloud"] = (cloud * 100).round(0).tolist()  # %
         info.update({"units": proxies, "schedule": {"function": res.function, "source": res.source, "offset": res.offset,
                                                     "locked": res.locked}, "x0": x0.tolist(), "trained": self.params is not None})
         return pr, info
+
+    # ---- airing ----
+    def airing_done_today(self, now_ms: float, tz) -> tuple[int, float | None]:
+        """Airings since midnight, from the window sensors: stretches with windows open
+        in at least half the window rooms, for long enough (one tilted window is not
+        the apartment aired); and when the last one ended. A suggestion under way
+        counts too, so the next plan does not suggest another before it is over."""
+        a = self.cfg.airing
+        midnight = datetime.fromtimestamp(now_ms / 1000, tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        t0 = int(midnight.timestamp() * 1000)
+        spans = []
+        zmap = self.cfg.mapping.get("zones") or {}
+        rooms = [zid for zid in self.cfg.layout_obj().window_zones if (zmap.get(zid) or {}).get("windows")]
+        for zid in rooms:
+            for w in zmap[zid]["windows"]:
+                rows = self.store.rows(w, t0, int(now_ms))
+                for r, nxt in zip(rows, rows[1:] + [[now_ms, None]]):
+                    if r[1] == "on":
+                        spans.append((max(r[0], t0), nxt[0], zid))
+        spans.sort()
+        merged = []  # [start, end, rooms]
+        for a0, b0, zid in spans:
+            if merged and a0 <= merged[-1][1] + 2 * MIN:
+                merged[-1][1] = max(merged[-1][1], b0)
+                merged[-1][2].add(zid)
+            else:
+                merged.append([a0, b0, {zid}])
+        enough = math.ceil(len(rooms) / 2)
+        done = [m[:2] for m in merged if len(m[2]) >= enough and m[1] - m[0] >= max(3, a.duration_min / 2) * MIN]
+        cur = self.airing_now
+        if cur and cur[0] <= now_ms < cur[1]:
+            if not any(m[0] < cur[1] and m[1] > cur[0] - 2 * MIN for m in done):
+                done.append([cur[0], cur[1]])
+            done[-1][1] = max(done[-1][1], cur[1])
+        return len(done), (done[-1][1] if done else None)
+
+    def airing_spec(self, now_ms: float, t: np.ndarray, comfort: dict, x0: np.ndarray, layout: Layout, tz,
+                    events: list[dict]) -> tuple[mpc.Airing | None, dict]:
+        """When the plan may air: on the half hours, outside the 'no airing' times,
+        as many a day as set, and apart enough."""
+        cfg = self.cfg
+        a = cfg.airing
+        D = int(a.duration_min * MIN)
+        gap = a.min_gap_h * 3.6e6
+        grid = 30 * MIN
+        end = int(t[-1])
+        done, last = self.airing_done_today(now_ms, tz)
+        today = datetime.fromtimestamp(now_ms / 1000, tz).date()
+        info = {"done_today": done, "per_day": a.per_day, "duration_min": a.duration_min}
+        # every half hour from now to the end of the plan's last day, to see each day's allowed times whole
+        last_day = datetime.fromtimestamp(end / 1000, tz).date()
+        day_end = datetime.combine(last_day, datetime.min.time(), tz) + timedelta(days=1)
+        starts = list(range(int(math.ceil(now_ms / grid) * grid), int(day_end.timestamp() * 1000), grid))
+        if not starts:
+            return None, info
+        s_dt = [datetime.fromtimestamp(x / 1000, tz) for x in starts]
+        e_dt = [datetime.fromtimestamp((x + D) / 1000, tz) for x in starts]
+        blocked = resolve(s_dt, e_dt, [], [], {}, cfg.rule_objs(), events).no_airing
+        cand, groups, by_day = [], [], {}
+        for x, d, no in zip(starts, s_dt, blocked):
+            if no or (last is not None and d.date() == today and x - last < gap):
+                continue
+            by_day.setdefault(d.date(), []).append(x)
+        for day, xs in sorted(by_day.items()):
+            due = a.per_day - (done if day == today else 0)
+            if due <= 0 or xs[-1] + D > end:
+                continue  # done, or the day's allowed times run past the plan: planned later
+            idx = list(range(len(cand), len(cand) + len(xs)))
+            cand += [(x, x + D) for x in xs]
+            groups.append((idx, min(due, len(xs))))
+        if not cand:
+            info["none"] = "done today" if done >= a.per_day else "no allowed time in the plan"
+            return None, info
+        N = len(t) - 1
+        tref = {}
+        for z in layout.window_zones:
+            i = layout.zone_index(z)
+            tref[z] = np.asarray(comfort[z], float) if z in comfort else np.full(N, float(x0[i]))
+        return mpc.Airing(cand=cand, groups=groups, min_gap_ms=gap, tref=tref), info
+
+    async def publish_airing(self, plan: mpc.Plan, info: dict) -> None:
+        """The next suggestion as a sensor in Home Assistant, for its own automations."""
+        a = self.cfg.airing
+        if not a.sensor or not hasattr(self.ha, "set_state") or not (a.enabled or self._airing_sent):
+            return
+        now = time.time() * 1000
+        cur = self.airing_now
+        if not a.enabled:
+            nxt = None
+        elif cur and cur[0] <= now < cur[1]:
+            nxt = cur  # under way: it stays the suggestion until it is over
+        else:
+            nxt = next(((s0, e0) for s0, e0 in plan.airing if e0 > now), None)
+        self.airing_now = nxt
+        ai = info.setdefault("airing", {})
+        ai["suggested"] = list(nxt) if nxt else None
+        layout = self.cfg.layout_obj()
+        attrs = {"friendly_name": "Climate optimizer: airing", "device_class": "timestamp", "icon": "mdi:window-open-variant",
+                 "duration_min": a.duration_min, "rooms": [z.name for z in layout.zones if z.windows],
+                 "done_today": ai.get("done_today")}
+        if nxt:
+            state = datetime.fromtimestamp(nxt[0] / 1000, timezone.utc).isoformat()
+            attrs["end"] = datetime.fromtimestamp(nxt[1] / 1000, timezone.utc).isoformat()
+            if tuple(nxt) in plan.airing and plan.airing_cost is not None:
+                attrs["extra_cost_eur"] = round(plan.airing_cost, 3)  # all of the plan's airings together
+        else:
+            state = "unknown"
+            attrs["reason"] = "airing suggestions are off" if not a.enabled else ai.get("none") or "none in the plan yet"
+        try:
+            await self.ha.set_state(a.sensor, state, attrs)
+            self._airing_sent = a.enabled
+        except Exception as e:  # the plan stands without it
+            log.warning("airing sensor: %s", e)
 
     # ---- planning ----
     async def replan(self, fresh: bool = False) -> None:
@@ -407,6 +527,7 @@ class Planner:
             info["sun"] = pr.dist[:, 1:5].sum(axis=1).round(3).tolist()
             info["prices"] = inputs["prices"]
             self.state = PlanState(plan=plan, created=now, error=None, info=info)
+            await self.publish_airing(plan, info)
             self.store.put("plan", {"plan": plan.to_dict(), "info": info, "created": now})
             k1 = min(len(plan.t) - 1, int(np.searchsorted(plan.t, now + 2 * 3.6e6)))
             self.store.add_plan(int(now), {

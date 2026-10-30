@@ -16,15 +16,30 @@ subject to the model, each unit's lowest and highest fan level, the outdoor unit
 
 **Comfort costs.** Being off the comfort temperature costs money, per kelvin and hour, separately for too cold and too warm: a deadband that costs nothing, a linear and a quadratic part, and a limit that is not crossed unless it can't be helped. Four functions come predefined (standard, relaxed, strict, frost protection); any number can be added. The comfort temperature itself is the proxy's target temperature.
 
-**Schedules.** Rules switch a room to another function, move its comfort temperature, or keep units off, at times that recur by an iCalendar rule. "Every other week, Monday to Thursday, 18:00 to 23:00" is weekly, every 2 weeks, those days, from 18:00 to 23:00. Rules have priorities. Events in a Home Assistant calendar override them for single occasions, by their title:
+**Schedules.** Rules switch a room to another function, move its comfort temperature, keep units off, or keep airing from being suggested, at times that recur by an iCalendar rule. "Every other week, Monday to Thursday, 18:00 to 23:00" is weekly, every 2 weeks, those days, from 18:00 to 23:00. Rules have priorities. Events in a Home Assistant calendar override them for single occasions, by their title:
 
 | Title | Effect |
 |---|---|
 | `Wohnzimmer: Relaxed` | the living room uses the relaxed function |
 | `Schlafzimmer: aus` | the bedroom's units stay off |
 | `Alle: +1` | every comfort temperature 1 K higher |
+| `Lüften: aus` | no airing suggested then |
 
 Rooms match by their name, their id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or names given per room in Settings; functions by name, id, or Normal, Entspannt, Streng, Frostschutz. The comfort page shows the next two weeks with the calendar's events in them, lists each event with what was made of it, and reloads the calendar on request.
+
+**Airing.** Switched on in Comfort & schedules, the plan also says when to air the whole apartment: every room with window sensors at once, for 10 minutes by default, once a day or more, a few hours apart. It reckons each candidate time (on the hour and half hour) the way an open window shows in the model, with the units in those rooms off meanwhile, and takes the one where the heat let out and heated back costs least, or, when the rooms are warmer than wanted or the plan cools, where the outside air helps most. A "No airing" rule (22:00 to 07:00 to start with) or a `Lüften: aus` event keeps it from those times. An airing already done today is seen at the window sensors: windows open in at least half the window rooms for at least half the duration. The next suggestion goes to Home Assistant as `sensor.climate_optimizer_airing`, a timestamp with `end`, `extra_cost_eur` and `rooms` as attributes, for a notification:
+
+```yaml
+triggers:
+  - trigger: time
+    at: sensor.climate_optimizer_airing
+actions:
+  - action: notify.mobile_app_phone
+    data:
+      message: "Time to air, for {{ state_attr('sensor.climate_optimizer_airing', 'duration_min') | int }} minutes"
+```
+
+The sensor lives until Home Assistant restarts; the next plan, at most five minutes later, sets it again. Setting it takes a token of an administrator. Only the next day with an airing is decided exactly; later ones are a preview, planned again on their day.
 
 **Fan levels.** The plan gives each unit a heat output for the current five minutes. A fan level delivers fixed heat, so a target between two levels is met by alternating between them minute by minute.
 

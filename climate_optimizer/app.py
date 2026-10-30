@@ -309,7 +309,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
             asyncio.create_task(s.planner.replan(fresh=True))  # the plan sees the calendar as it is now
         return _json({"start": int(t0.timestamp() * 1000), "step_min": step_min, "function": res.function,
                       "offset": res.offset, "locked": res.locked, "source": res.source,
-                      "event_zone": res.event_zone, "event_unit": res.event_unit,
+                      "event_zone": res.event_zone, "event_unit": res.event_unit, "no_airing": res.no_airing,
                       "calendar": {"entity": cal["calendar"], "fetched": cal["fetched"], "error": cal["error"],
                                    "events": sorted(listing, key=lambda e: e["start"])}})
 

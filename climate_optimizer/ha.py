@@ -154,6 +154,17 @@ class HomeAssistant:
     async def ha_config(self) -> dict:
         return await self.call({"type": "get_config"})
 
+    async def set_state(self, entity_id: str, state: str, attributes: dict) -> None:
+        """A state of the optimizer's own in Home Assistant (REST: the WebSocket API has no such call).
+        It lives until Home Assistant restarts, and the next plan sets it again."""
+        if self._session is None:
+            raise HAError("not connected")
+        async with self._session.post(f"{self.url}/api/states/{entity_id}", json={"state": state, "attributes": attributes},
+                                      headers={"Authorization": f"Bearer {self.token}"},
+                                      timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status >= 300:
+                raise HAError(f"{entity_id}: HTTP {r.status}")
+
     async def service(self, domain: str, service: str, data: dict | None = None, target: dict | None = None,
                       response: bool = False) -> Any:
         msg = {"type": "call_service", "domain": domain, "service": service, "service_data": data or {}}

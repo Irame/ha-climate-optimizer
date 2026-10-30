@@ -219,6 +219,7 @@ pages.dashboard = async (redraw) => {
         return top.length ? 'mostly ' + top.map(([z, v]) => `${esc(zoneName(z))} ${num(v, 2)} €`).join(', ') : 'deviations, as priced';
       })()}</div></div>
       <div class="stat"><div class="k">Starts</div><div class="v">${num(c.starts, 2)} €</div><div class="s">compressor and heater</div></div>
+      ${airTile(P, info)}
       <div class="stat"><div class="k">Heat missing at the end</div><div class="v">${num(c.terminal, 2)} €</div><div class="s">solved in ${num(P.seconds, 1)} s · ${esc(P.status)}</div></div>
     </div>`;
   }
@@ -228,6 +229,32 @@ pages.dashboard = async (redraw) => {
   zoneChips($('#zone-chips'), () => pages.dashboard(true));
   drawTimeline($('#dash-chart'), P, info, S.history);
 };
+
+function airTile(P, info) {
+  const ai = info.airing;
+  if (!S.config.airing?.enabled || !ai) return '';
+  const sug = ai.suggested || P.airing?.[0];
+  const later = (P.airing || []).filter(a => !sug || a[0] > sug[0]);
+  const now = Date.now();
+  let v, sub;
+  if (sug && sug[0] <= now && now < sug[1]) {
+    v = 'Now';
+    sub = `until ${fmtTime(sug[1], S.tz)}`;
+  } else if (sug) {
+    v = fmtTime(sug[0], S.tz);
+    const day = fmtDay(sug[0], S.tz) !== fmtDay(now, S.tz) ? fmtDay(sug[0], S.tz) + ' · ' : '';
+    const c = P.airing_cost;
+    // what it adds; when the rooms are warmer than wanted (or it cools), it saves instead
+    const cost = c === null || c === undefined ? '' : c >= 0.005 ? ` · costs ${num(c, 2)} €` : c <= -0.005 ? ` · saves ${num(-c, 2)} €` : ' · costs next to nothing';
+    sub = `${day}${num(ai.duration_min, 0)} min${cost}`;
+  } else {
+    v = '—';
+    sub = ai.none || 'none in the plan';
+  }
+  if (later.length) sub += ` · then ${later.map(a => (fmtDay(a[0], S.tz) !== fmtDay(now, S.tz) ? fmtDay(a[0], S.tz).split(',')[0] + ' ' : '') + fmtTime(a[0], S.tz)).join(', ')}`;
+  sub += ai.done_today >= ai.per_day ? ' · done for today' : ai.done_today ? ` · ${ai.done_today} of ${ai.per_day} done today` : '';
+  return `<div class="stat"><div class="k">Airing</div><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div></div>`;
+}
 
 function zoneChips(box, redraw) {
   const zones = S.config.layout.zones;
@@ -283,6 +310,20 @@ function drawTimeline(box, P, info, hist) {
     P.share[u.id].forEach((v, k) => spans.push({ t0: P.t[k], t1: P.t[k + 1], v, label: v > 0.01 ? `${num(Math.abs(P.heat[u.id][k]), 2)} kW${v < 0.99 ? ', ' + Math.round(v * 100) + ' % of the step' : ''}` : 'off' }));
     return { name: u.name, short: u.name.split(' ')[0], color: zoneColor(u.zone), spans };
   });
+  if (S.config.airing?.enabled || hist?.open) {
+    // windows: open as recorded (any window room), then the airing planned
+    const spans = [];
+    const zs = Object.keys(hist?.open || {});
+    if (zs.length && hist?.t) hist.t.forEach((t, i) => {
+      const v = Math.max(...zs.map(z => hist.open[z][i] || 0));
+      if (v > 0.01 && t < now) spans.push({ t0: t, t1: Math.min(now, t + 5 * MIN), v, label: `open ${Math.round(v * 100)} % of the 5 minutes: ${zs.filter(z => hist.open[z][i] > 0.01).map(zoneName).join(', ')}` });
+    });
+    const planned = [...(P.airing || [])];
+    const sug = info.airing?.suggested;
+    if (sug && !planned.some(a => a[0] === sug[0])) planned.unshift(sug);
+    for (const [a, b] of planned) if (b > now) spans.push({ t0: Math.max(a, now), t1: b, v: 1, label: `airing suggested ${fmtTime(a, S.tz)}–${fmtTime(b, S.tz)}` });
+    if (spans.length || S.config.airing?.enabled) rows.push({ name: 'Windows', short: 'Windows', color: css('--muted'), spans });
+  }
   g.add({ title: 'Units: recorded, then planned (height: share of each step running)' }).gantt(rows);
   // price
   const pp = g.add({ title: 'Electricity price (ct/kWh)', unit: 'ct', height: 120, fmt: v => v.toFixed(0) });
@@ -383,7 +424,7 @@ pages.comfort = async (redraw) => {
   if (!redraw || !S.draft) {
     await loadBase();
     if (!S.entities) S.entities = await api('entities').catch(() => []);
-    S.draft = JSON.parse(JSON.stringify({ functions: S.config.functions, defaults: S.config.defaults, comfort: S.config.comfort, rules: S.config.rules, calendar: S.config.calendar }));
+    S.draft = JSON.parse(JSON.stringify({ functions: S.config.functions, defaults: S.config.defaults, comfort: S.config.comfort, rules: S.config.rules, calendar: S.config.calendar, airing: S.config.airing }));
   }
   const D = S.draft, L = S.config.layout;
   const fnOpts = sel => D.functions.map(f => `<option value="${esc(f.id)}" ${f.id === sel ? 'selected' : ''}>${esc(f.name)}</option>`).join('');
@@ -402,10 +443,24 @@ pages.comfort = async (redraw) => {
   html += '</table></div><p class="hint">Rooms without a comfort temperature carry no comfort cost (the hallway, usually).</p></div>';
   // rules
   html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Rules</h3><span class="spacer"></span><button id="rule-add">Add rule</button></div>
-    <p class="hint">A rule switches a room to another comfort function, moves its comfort temperature, or keeps units off, at recurring times. Where rules overlap, the higher priority wins. "Every other week, Monday to Thursday evenings": weekly, every 2 weeks, those four days, 18:00–23:00, starting on a Monday of an "on" week.</p>
+    <p class="hint">A rule switches a room to another comfort function, moves its comfort temperature, keeps units off, or keeps airing from being suggested, at recurring times. Where rules overlap, the higher priority wins. "Every other week, Monday to Thursday evenings": weekly, every 2 weeks, those four days, 18:00–23:00, starting on a Monday of an "on" week.</p>
     <div id="rule-list"></div></div>`;
   html += `<div class="card"><h3>Calendar</h3><div class="fields"><label class="field">Calendar entity<select id="cal">${entityOptions('calendar', D.calendar, '— no calendar —')}</select></label></div>
-    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K. Rooms match by their name, id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or the names given in Settings; functions by name or id, and Normal, Entspannt, Streng, Frostschutz.</p></div>`;
+    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K, <code>Lüften: aus</code> suggests no airing then. Rooms match by their name, id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or the names given in Settings; functions by name or id, and Normal, Entspannt, Streng, Frostschutz.</p></div>`;
+  const A = D.airing, windowRooms = L.zones.filter(z => z.windows && (S.config.mapping?.zones?.[z.id]?.windows || []).length);
+  const airRule = D.rules.some(r => r.action === 'no_airing' && r.enabled);
+  html += `<div class="card"><h3>Airing</h3>
+    <label class="check"><input type="checkbox" id="air-on" ${A.enabled ? 'checked' : ''}> Suggest when to air the whole apartment</label>
+    <div class="fields" style="margin-top:10px">
+      <label class="field">Minutes, all windows open<input type="number" min="2" max="60" step="1" data-air="duration_min" value="${A.duration_min}"></label>
+      <label class="field">Times a day<input type="number" min="1" max="4" step="1" data-air="per_day" value="${A.per_day}"></label>
+      <label class="field">At least apart (h)<input type="number" min="0.5" max="12" step="0.5" data-air="min_gap_h" value="${A.min_gap_h}"></label>
+      <label class="field">Sensor in Home Assistant<input data-air="sensor" value="${esc(A.sensor)}" placeholder="none"></label>
+    </div>
+    <p class="hint">The plan puts it where the heat let out and heated back costs least (when cooling: where the outside air cools best), with the units in the window rooms off meanwhile, on the hour or half hour. Not when a <b>No airing</b> rule or a <code>Lüften: aus</code> event says so. Airings done today are seen at the window sensors${windowRooms.length ? ' (' + windowRooms.map(z => esc(z.name)).join(', ') + ')' : ''}. Home Assistant gets the next one as a timestamp sensor, with its end and extra cost as attributes, to notify with.</p>
+    ${A.enabled && !windowRooms.length ? '<div class="msg">No room has window sensors yet: set them in <a href="#settings">Settings</a>, the plan airs the rooms that have them.</div>' : ''}
+    ${A.enabled && !airRule ? '<div class="row"><span class="hint">No rule keeps it from the night.</span><button id="air-night">Add “No airing at night”</button></div>' : ''}
+  </div>`;
   html += `<div class="card"><div class="toolbar"><h3 style="margin:0">The next two weeks</h3><span class="spacer"></span>
     <span class="hint" id="cal-status"></span><button id="cal-reload" ${D.calendar ? '' : 'disabled'}>Reload calendar</button></div>
     <p class="hint" style="margin-top:0">Saved rules and the calendar’s events. Hatched: units kept off; outlined: set by a calendar event.</p>
@@ -458,6 +513,14 @@ pages.comfort = async (redraw) => {
   root.querySelectorAll('[data-default]').forEach(s => s.onchange = () => { if (s.value) D.defaults[s.dataset.default] = s.value; else delete D.defaults[s.dataset.default]; });
   root.querySelectorAll('[data-comfort]').forEach(s => s.oninput = () => { if (s.value === '') delete D.comfort[s.dataset.comfort]; else D.comfort[s.dataset.comfort] = +s.value; });
   $('#cal').onchange = e => { D.calendar = e.target.value; };
+  const nightRule = () => ({ id: 'night-no-airing', name: 'No airing at night', action: 'no_airing', zones: [], units: [], function: null, offset: 0, rrule: 'FREQ=DAILY', dtstart: new Date().toISOString().slice(0, 10), start: '22:00', end: '07:00', priority: 10, enabled: true });
+  $('#air-on').onchange = e => {
+    A.enabled = e.target.checked;
+    if (A.enabled && !D.rules.some(r => r.action === 'no_airing')) D.rules.unshift(nightRule());  // nights off, to start with
+    pages.comfort(true);
+  };
+  root.querySelectorAll('[data-air]').forEach(i => i.oninput = () => { A[i.dataset.air] = i.type === 'number' ? +i.value : i.value.trim(); });
+  if ($('#air-night')) $('#air-night').onclick = () => { D.rules.unshift(nightRule()); pages.comfort(true); };
 
   // rules
   const rl = $('#rule-list');
@@ -501,16 +564,16 @@ function ruleEditor(r, i, D, fnOpts) {
   const rr = parseRrule(r.rrule);
   const freq = rr.FREQ || 'DAILY';
   const byday = (rr.BYDAY || '').split(',').filter(Boolean);
-  const targets = r.action === 'lockout'
+  const targets = r.action === 'no_airing' ? '' : r.action === 'lockout'
     ? L.units.map(u => `<label class="check"><input type="checkbox" data-unit="${u.id}" ${r.units.includes(u.id) ? 'checked' : ''}>${esc(u.name)}</label>`).join(' ')
     : L.zones.map(z => `<label class="check"><input type="checkbox" data-zone="${z.id}" ${r.zones.includes(z.id) ? 'checked' : ''}>${esc(z.name)}</label>`).join(' ');
   box.innerHTML = `<div class="row" style="margin-bottom:8px"><label class="check"><input type="checkbox" data-k="enabled" ${r.enabled ? 'checked' : ''}></label>
       <input data-k="name" value="${esc(r.name)}" style="font-weight:600;flex:1;min-width:160px">
-      <select data-k="action"><option value="comfort" ${r.action === 'comfort' ? 'selected' : ''}>Comfort function</option><option value="offset" ${r.action === 'offset' ? 'selected' : ''}>Comfort temperature ±</option><option value="lockout" ${r.action === 'lockout' ? 'selected' : ''}>Keep units off</option></select>
+      <select data-k="action"><option value="comfort" ${r.action === 'comfort' ? 'selected' : ''}>Comfort function</option><option value="offset" ${r.action === 'offset' ? 'selected' : ''}>Comfort temperature ±</option><option value="lockout" ${r.action === 'lockout' ? 'selected' : ''}>Keep units off</option><option value="no_airing" ${r.action === 'no_airing' ? 'selected' : ''}>No airing suggested</option></select>
       ${r.action === 'comfort' ? `<select data-k="function">${fnOpts(r.function)}</select>` : ''}
       ${r.action === 'offset' ? `<input type="number" step="0.5" data-k="offset" value="${r.offset}" style="width:80px"> K` : ''}
       <button class="danger" data-del>Delete</button></div>
-    <div class="row" style="margin-bottom:8px"><span class="hint">${r.action === 'lockout' ? 'Units (none ticked: all)' : 'Rooms (none ticked: all)'}:</span> ${targets}</div>
+    ${targets ? `<div class="row" style="margin-bottom:8px"><span class="hint">${r.action === 'lockout' ? 'Units (none ticked: all)' : 'Rooms (none ticked: all)'}:</span> ${targets}</div>` : ''}
     <div class="fields">
       <label class="field">Repeats<select data-r="FREQ"><option value="DAILY" ${freq === 'DAILY' ? 'selected' : ''}>daily</option><option value="WEEKLY" ${freq === 'WEEKLY' ? 'selected' : ''}>weekly</option><option value="MONTHLY" ${freq === 'MONTHLY' ? 'selected' : ''}>monthly</option></select></label>
       <label class="field">Every<input type="number" min="1" data-r="INTERVAL" value="${rr.INTERVAL || 1}"></label>
@@ -559,6 +622,21 @@ async function drawPreview(refresh = false) {
   const fnIdx = Object.fromEntries(S.config.functions.map((f, i) => [f.id, i]));
   const per = 24 * 60 / pv.step_min;
   let html = `<div class="legend" style="margin:0 0 8px">${S.config.functions.map((f, i) => `<span><i style="background:${slot(i)};height:10px;width:10px"></i>${esc(f.name)}</span>`).join('')}</div>`;
+  if (S.config.airing?.enabled && pv.no_airing) {
+    // when the plan may suggest airing: the rules' and the calendar's "no airing" times
+    const evAir = (cal.events || []).filter(e => e.understood && e.effect === 'no airing suggested');
+    html += `<div style="margin-bottom:12px"><h3 style="margin:6px 0">Airing</h3><div class="legend" style="margin:0 0 6px"><span><i style="background:var(--good);opacity:.55;height:10px;width:10px"></i>may be suggested</span><span><i style="background:var(--grid);height:10px;width:10px"></i>not then</span></div><div class="heat">`;
+    for (let d = 0; d < pv.no_airing.length / per; d++) {
+      html += `<div class="heat-row"><span>${fmtDay(pv.start + d * 864e5 + 6 * H, S.tz)}</span><div class="heat-cells" style="grid-template-columns:repeat(${per},1fr)">`;
+      for (let k = d * per; k < (d + 1) * per; k++) {
+        const t = pv.start + k * pv.step_min * MIN, no = pv.no_airing[k];
+        const ev = no && evAir.some(e => e.start < t + pv.step_min * MIN && e.end > t);
+        html += `<span class="${ev ? 'ev' : ''}" style="background:${no ? 'var(--grid)' : 'color-mix(in srgb, var(--good) 55%, transparent)'}" title="${fmtTime(t, S.tz)} ${no ? 'no airing' + (ev ? ' (calendar)' : '') : 'airing may be suggested'}"></span>`;
+      }
+      html += `</div></div>`;
+    }
+    html += `<div class="heat-row"><span></span><div class="row hint" style="justify-content:space-between"><span>0:00</span><span>6:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div></div></div></div>`;
+  }
   html += `<div class="two">`;
   for (const z of L.zones) {
     const fn = pv.function[z.id];

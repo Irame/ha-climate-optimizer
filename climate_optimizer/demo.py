@@ -57,6 +57,7 @@ class World:
         self.planner = None
         self.handlers = []
         self.last_pel = 0.0
+        self.extra = {}  # states the optimizer sets itself
 
     # ---- weather and prices ----
     def tout_at(self, t: float) -> float:
@@ -93,6 +94,7 @@ class World:
             {"start": at(3, 13), "end": at(3, 16), "summary": "Schlafzimmer: aus"},
             {"start": at(5, 0), "end": at(7, 0), "summary": "Alle: Frost protection only"},
             {"start": at(2, 9), "end": at(2, 10), "summary": "Zahnarzt"},
+            {"start": at(2, 11), "end": at(2, 15), "summary": "Lüften: aus"},
         ]
 
     def forecast(self) -> list[dict]:
@@ -124,8 +126,17 @@ class World:
             self.cloud = float(np.clip(self.cloud + (self.R.random() - 0.5) * 0.9, 0, 1))
         if d.hour == 0 and d.minute == 0:
             self.level += self.R.normal() * 1.2 - (self.level - 6.0) * 0.3
+        air = self.extra.get("sensor.climate_optimizer_airing")
+        a0 = a1 = 0
+        if air and air[0] not in ("unknown", "unavailable"):  # the residents follow the suggestion
+            a0 = datetime.fromisoformat(air[0]).timestamp() * 1000
+            a1 = datetime.fromisoformat(air[1]["end"]).timestamp() * 1000
         for z in self.windows:
-            if self.windows[z]:
+            if a0 <= t < a1:
+                self.windows[z] = True
+            elif a1 <= t < a1 + MIN:
+                self.windows[z] = False
+            elif self.windows[z]:
                 if self.R.random() < 0.12:
                     self.windows[z] = False
             elif 7 <= hod < 22 and self.R.random() < 0.0015:
@@ -215,6 +226,8 @@ class World:
             cloud_coverage=int(self.cloud * 100), friendly_name="Forecast Home")
         add("sensor.zuhause_strompreis", self.price_at(self.t), unit_of_measurement="EUR/kWh", friendly_name="Zuhause Strompreis")
         add("calendar.klima", "off", friendly_name="Klima")
+        for eid, (st_, at_) in self.extra.items():
+            add(eid, st_, **at_)
         return out
 
 
@@ -274,6 +287,9 @@ class FakeHA:
 
     async def history(self, *a, **k):
         return {}
+
+    async def set_state(self, entity_id, state, attributes):
+        self.world.extra[entity_id] = (state, attributes)
 
     async def statistics(self, *a, **k):
         return {}

@@ -96,7 +96,7 @@ def default_functions() -> list[ComfortFunction]:
 class Rule:
     id: str
     name: str
-    action: str  # "comfort" | "lockout" | "offset"
+    action: str  # "comfort" | "lockout" | "offset" | "no_airing"
     zones: list[str] = field(default_factory=list)  # zone ids; empty = all (for comfort / offset)
     units: list[str] = field(default_factory=list)  # unit ids (for lockout); empty = all
     function: str | None = None  # comfort function id (action comfort)
@@ -118,7 +118,7 @@ class Rule:
         return asdict(self)
 
     def validate(self) -> None:
-        if self.action not in ("comfort", "lockout", "offset"):
+        if self.action not in ("comfort", "lockout", "offset", "no_airing"):
             raise ValueError(f"rule {self.name}: unknown action {self.action}")
         if self.action == "comfort" and not self.function:
             raise ValueError(f"rule {self.name}: which comfort function?")
@@ -159,8 +159,12 @@ def _hm(s: str) -> tuple[int, int]:
     return int(m[1]), int(m[2])
 
 
+def night_no_airing() -> Rule:
+    return Rule("night-no-airing", "No airing at night", "no_airing", start="22:00", end="07:00", priority=10)
+
+
 def default_rules() -> list[Rule]:
-    return [
+    return [night_no_airing(),
         Rule("living-night", "Living room relaxed at night", "comfort", zones=["living"], function="relaxed",
              start="23:00", end="06:30", priority=20),
         Rule("bedroom-day", "Bedroom relaxed during the day", "comfort", zones=["bedroom"], function="relaxed",
@@ -171,6 +175,7 @@ def default_rules() -> list[Rule]:
 # ---- calendar ----------------------------------------------------------------------
 OFF_WORDS = {"aus", "off", "sperre", "lock", "lockout", "gesperrt"}
 ALL_WORDS = {"alle", "all", "wohnung", "apartment"}
+AIRING_WORDS = {"lüften", "lueften", "luften", "airing", "air"}
 
 
 # Names a calendar may use for the usual rooms and functions, besides their ids and names
@@ -199,6 +204,8 @@ def parse_event(summary: str, zones: dict[str, str], units: dict[str, tuple[str,
     for k, v in functions.items():
         for name in (k, v, *FUNCTION_ALIASES.get(k, ())):
             fnorm.setdefault(name.lower(), k)
+    if who in AIRING_WORDS:  # 'Lüften: aus': no airing suggested then
+        return {"action": "no_airing"} if what in OFF_WORDS | {"nein", "no", "nicht"} else None
     everyone = who in ALL_WORDS
     zone = [] if everyone else [znorm[who]] if who in znorm else None
     if what in OFF_WORDS:
@@ -230,6 +237,7 @@ class Resolved:
     source: dict[str, list[str]]  # what decided the function, for the UI
     event_zone: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event set the zone's function or offset
     event_unit: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event keeps the unit off
+    no_airing: list[bool] = field(default_factory=list)  # no airing to be suggested
 
 
 def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[str], units: list[str],
@@ -250,6 +258,7 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
     lock = {u: [False] * N for u in units}
     ev_z = {z: [False] * N for z in zones}
     ev_u = {u: [False] * N for u in units}
+    no_air = [False] * N
     for _, _, spec, ivs in active:
         if not ivs:
             continue
@@ -273,4 +282,6 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
                     if u in lock:
                         lock[u][k] = True
                         ev_u[u][k] = ev_u[u][k] or bool(spec.get("calendar"))
-    return Resolved(function=fn, offset=off, locked=lock, source=src, event_zone=ev_z, event_unit=ev_u)
+            elif spec["action"] == "no_airing":
+                no_air[k] = True
+    return Resolved(function=fn, offset=off, locked=lock, source=src, event_zone=ev_z, event_unit=ev_u, no_airing=no_air)

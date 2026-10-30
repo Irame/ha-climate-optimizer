@@ -154,3 +154,50 @@ def test_window_open_input_cools_the_room():
     pr.window[:2, 0] = 1.0  # office window open for the first steps
     T1 = mpc.free_run(pr)
     assert T1[3, 0] < T0[3, 0] - 0.1
+
+
+def airing_for(pr, starts, per_group=None, gap_h=4.0):
+    """Ten-minute airings at the given starts (ms), grouped by day."""
+    L = pr.sys.layout
+    days = {}
+    for i, s in enumerate(starts):
+        days.setdefault(datetime.fromtimestamp(s / 1000, TZ).date(), []).append(i)
+    groups = [(idx, (per_group or {}).get(d, 1)) for d, idx in sorted(days.items())]
+    return mpc.Airing(cand=[(s, s + 10 * MIN) for s in starts], groups=groups, min_gap_ms=gap_h * 3.6e6,
+                      tref={z: pr.comfort[z] for z in L.window_zones})
+
+
+def half_hours(a, b):
+    return list(range(a, b + 1, 30 * MIN))
+
+
+def test_airing_goes_where_it_costs_least():
+    pr = problem(lambda h: 0.3)
+    tout = pr.dist[:, DIST.index("tout")]
+    mid = pr.t[:-1]
+    tout[(mid >= ms(2026, 1, 14, 15)) & (mid < ms(2026, 1, 14, 16))] = 12.0  # a mild hour today
+    starts = half_hours(ms(2026, 1, 14, 13, 30), ms(2026, 1, 14, 21, 30)) + half_hours(ms(2026, 1, 15, 7), ms(2026, 1, 15, 21, 30))
+    pr.airing = airing_for(pr, starts)
+    plan = mpc.solve(pr)
+    assert len(plan.airing) == 2  # one each day
+    today = plan.airing[0]
+    assert ms(2026, 1, 14, 15) <= today[0] and today[1] <= ms(2026, 1, 14, 16)
+    assert plan.airing_cost and plan.airing_cost > 0
+    # the units where the windows are stay off while they are open
+    for a, b in plan.airing:
+        k = int(np.searchsorted(plan.t, a, side="right")) - 1
+        for u in pr.units:
+            if u.zone in pr.sys.layout.window_zones:
+                assert plan.share[u.id][k] < 1.0
+    # and it is cheaper there than at the coldest time
+    pr.airing = airing_for(pr, [ms(2026, 1, 14, 19), ms(2026, 1, 15, 12)])
+    forced = mpc.solve(pr)
+    assert forced.airing_cost > plan.airing_cost
+
+
+def test_airing_that_cannot_fit_is_left_out():
+    pr = problem(lambda h: 0.3)
+    s = [ms(2026, 1, 14, 14), ms(2026, 1, 14, 15)]
+    pr.airing = airing_for(pr, s, per_group={datetime(2026, 1, 14).date(): 2})  # an hour apart, not four
+    plan = mpc.solve(pr)
+    assert plan.airing == [] and plan.airing_cost is None

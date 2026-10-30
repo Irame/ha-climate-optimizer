@@ -1,5 +1,7 @@
 """The service end to end against the simulated apartment."""
 
+from datetime import datetime
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -221,3 +223,75 @@ def test_preview_shows_the_calendar(client):
     assert client.get("/api/schedule/preview?days=7").json()["calendar"]["fetched"] == t
     client.put("/api/config", json={"calendar": ""})
     assert client.get("/api/schedule/preview?days=7").json()["calendar"]["events"] == []
+
+
+def test_airing_is_planned_and_published(client):
+    svc = client.svc
+    world = svc.ha.world
+    client.put("/api/config", json={"airing": {"enabled": True, "duration_min": 10, "per_day": 1}})
+    try:
+        r = client.post("/api/plan").json()
+        plan, info = r["plan"], r["info"]
+        assert info["airing"]["per_day"] == 1 and "done_today" in info["airing"]
+        assert plan["airing"], info["airing"]
+        a0, a1 = plan["airing"][0]
+        assert a1 - a0 == 10 * 60_000 and a0 % (30 * 60_000) == 0
+        # never at night, by the default rule, and the units in the window rooms stay off then
+        tz = svc.planner.tz()
+        for s, _ in plan["airing"]:
+            assert 7 <= datetime.fromtimestamp(s / 1000, tz).hour < 22
+        state, attrs = world.extra["sensor.climate_optimizer_airing"]
+        assert datetime.fromisoformat(state).timestamp() * 1000 == a0
+        assert attrs["device_class"] == "timestamp" and attrs["duration_min"] == 10
+        assert set(attrs["rooms"]) == {"Office", "Bedroom", "Living room & kitchen"}
+        assert info["airing"]["suggested"] == [a0, a1]
+        # 'Lüften: aus' in the calendar is understood
+        client.put("/api/config", json={"calendar": "calendar.klima"})
+        pv = client.get("/api/schedule/preview?days=3&refresh=true").json()
+        ev = next(e for e in pv["calendar"]["events"] if e["summary"] == "Lüften: aus")
+        assert ev["effect"] == "no airing suggested"
+        assert pv["no_airing"][(48 + 12) * 2] and pv["no_airing"][23 * 2] and not pv["no_airing"][(24 + 12) * 2]
+    finally:
+        client.put("/api/config", json={"airing": {"enabled": False}, "calendar": ""})
+    client.post("/api/plan")
+    assert world.extra["sensor.climate_optimizer_airing"][0] == "unknown"
+
+
+def test_airing_done_today_counts_the_windows(client):
+    from climate_optimizer.config import AiringConfig
+
+    svc = client.svc
+    p = svc.planner
+    tz = p.tz()
+    now = datetime.now(tz)
+    if now.hour < 2:
+        pytest.skip("needs a couple of hours of today")
+    t0 = int(now.replace(hour=0, minute=30, second=0, microsecond=0).timestamp() * 1000)
+    M = 60_000
+    cfg = p.cfg
+    old = {z: cfg.mapping["zones"][z].get("windows") for z in ("office", "bedroom", "living")}
+    for z in old:
+        cfg.mapping["zones"][z]["windows"] = [f"binary_sensor.test_window_{z}"]
+    rows = {
+        # 0:30-0:42 office and bedroom open: two of three rooms, an airing
+        "office": [[t0, "on"], [t0 + 12 * M, "off"],
+                   # 1:00-1:30 the office alone: a tilted window, not one
+                   [t0 + 30 * M, "on"], [t0 + 60 * M, "off"]],
+        "bedroom": [[t0 + 2 * M, "on"], [t0 + 10 * M, "off"]],
+        "living": [[t0 - 3600 * 1000, "off"]],
+    }
+    for z, r in rows.items():
+        svc.store.add_rows(f"binary_sensor.test_window_{z}", r)
+    old_air = cfg.airing
+    cfg.airing = AiringConfig(enabled=True, duration_min=10)
+    try:
+        done, last = p.airing_done_today(now.timestamp() * 1000, tz)
+        assert done == 1 and last == t0 + 12 * M
+        p.airing_now = (int(now.timestamp() * 1000) - M, int(now.timestamp() * 1000) + 9 * M)
+        done, last = p.airing_done_today(now.timestamp() * 1000, tz)
+        assert done == 2 and last == p.airing_now[1]  # one under way counts
+    finally:
+        for z, w in old.items():
+            cfg.mapping["zones"][z]["windows"] = w
+        cfg.airing = old_air
+        p.airing_now = None
