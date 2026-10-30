@@ -6,7 +6,9 @@ the next six hours of every zone, given what the units, the heater, the
 windows, the sun and the weather did? Electricity on the outdoor unit's
 phase is matched as well, with a robust loss so other loads on that phase
 do not drag the fit. Priors keep parameters plausible where the data says
-little, and the last days are held back to check the result.
+little, and the last days are held back to check the result. Once checked,
+the model learns once more from every day, the latest included, and that one
+plans.
 """
 
 from __future__ import annotations
@@ -27,7 +29,10 @@ from .thermal import (DIST, _ffill, build, capacity_factor, carnot_heat, electri
 
 SOLAR_AIR = 0.3  # share of the sun through a window that warms the air at once, before training
 FIT = dict(window_h=6.0, stride_h=3.0, every=3, sigma_t=0.25, sigma_p=0.3, burn_in_h=36.0, max_nfev=60,
-           huber=1.5, prior_weight=10.0, eta_measured=0.5)
+           huber=1.5, prior_weight=10.0, eta_measured=0.5,
+           # after the check, once more on every day, from the checked model; taken unless it
+           # predicts the days it learned from much worse, or a number jumps (bad recent data)
+           refit_nfev=25, refit_rmse_factor=1.15, refit_rmse_slack=0.03, refit_jump_sigma=1.5)
 
 
 def robust(r: np.ndarray, c: float) -> np.ndarray:
@@ -348,34 +353,65 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
         return np.concatenate([robust(np.nan_to_num(rt), c), robust(rp, c), rpr])
 
     calls = {"n": 0}
-    # least_squares counts at most max_nfev rounds, each one Jacobian (one
-    # evaluation per parameter) and a step: an upper bound, often not reached
-    budget = (len(plist) + 1) * FIT["max_nfev"]
 
-    def fun(theta):
-        calls["n"] += 1
-        if progress and calls["n"] % 25 == 0:
-            progress({"stage": "fit", "evaluations": calls["n"], "budget": budget})
-        return residuals(theta)
+    def fit(windows, x0, nfev, stage):
+        nonlocal k0s
+        k0s = windows
+        # least_squares counts at most nfev rounds, each one Jacobian (one
+        # evaluation per parameter) and a step: an upper bound, often not reached
+        budget = (len(plist) + 1) * nfev
+        n0 = calls["n"]
 
-    if progress:
-        progress({"stage": "fit", "evaluations": 0, "budget": budget})
+        def fun(theta):
+            calls["n"] += 1
+            if progress and (calls["n"] - n0) % 25 == 0:
+                progress({"stage": stage, "evaluations": calls["n"] - n0, "budget": budget})
+            return residuals(theta)
 
-    res = least_squares(fun, start, method="trf", loss="linear", max_nfev=FIT["max_nfev"], x_scale="jac")
-    model = from_theta(res.x, plist, base)
+        if progress:
+            progress({"stage": stage, "evaluations": 0, "budget": budget})
+        res = least_squares(fun, x0, method="trf", loss="linear", max_nfev=nfev, x_scale="jac")
+        m = from_theta(res.x, plist, base)
+        for uid, kw in heater_power(grid).items():
+            m.units[uid]["kw"] = kw
+        return res, m
+
+    res, model = fit(k0s, start, FIT["max_nfev"], "fit")
+    n_windows = len(k0s)
     if progress:
         progress({"stage": "check"})
-    for uid, kw in heater_power(grid).items():
-        model.units[uid]["kw"] = kw
     report = check(layout, model, grid, pw, train_days, val_days, per_day)
-    report.update(warnings=warnings, windows=int(len(k0s)), cost=float(res.cost), evaluations=calls["n"],
+    checked = model
+    if val_days:
+        # learn once more with the check days, the latest there are; keep it if it holds up
+        t_refit = time.time()
+        res2, model2 = fit(np.array(windows_for(grid, train_days + val_days, per_day)), res.x, FIT["refit_nfev"], "refit")
+        before = np.nanmean(report["rmse_train"]) if report["rmse_train"] else None
+        after = check(layout, model2, grid, pw, train_days, [], per_day)["rmse_train"]
+        after = np.nanmean(after) if after else None
+        jump = np.abs(res2.x - res.x) / np.array([p.sigma for p in plist])
+        worst = int(np.argmax(jump))
+        name = "/".join(map(str, plist[worst].path[1:] if plist[worst].path[0] == "zones" else plist[worst].path))
+        refit = {"days": len(train_days) + len(val_days), "rmse_before": before, "rmse_after": after,
+                 "seconds": round(time.time() - t_refit, 1), "largest_change": {"param": name, "sigma": float(jump[worst])}}
+        if before is not None and after is not None and after > before * FIT["refit_rmse_factor"] + FIT["refit_rmse_slack"]:
+            refit.update(used=False, reason=f"it predicts the days learned from worse ({after:.2f} K against {before:.2f} K)")
+        elif jump[worst] > FIT["refit_jump_sigma"]:
+            refit.update(used=False, reason=f"{name} would change by {jump[worst]:.1f} times its usual range")
+        else:
+            refit.update(used=True)
+            model = model2
+        if not refit["used"]:
+            warnings.append(f"Not learned again with the latest days: {refit['reason']}. The checked model plans; the latest days may hold odd data.")
+        report["refit"] = refit
+    report.update(warnings=warnings, windows=int(n_windows), cost=float(res.cost), evaluations=calls["n"],
                   seconds=round(time.time() - t_start, 1), trained_at=time.time(),
                   range=[float(grid.t[0]), float(grid.t[-1])],
                   days={"train": [float(grid.t[k]) for k in train_days], "val": [float(grid.t[k]) for k in val_days]},
                   zones={z.id: zone_summary(model, z.id) for z in layout.zones},
                   cop7=float(model.plant["eta"] * carnot_heat(21.0, 7.0)),
                   plant=plant_curve(layout, model, grid, pw))
-    return {"params": model, "report": report}
+    return {"params": model, "checked": checked, "report": report}
 
 
 def plant_curve(layout: Layout, params: Params, grid: Grid, pw: dict, n_points: int = 400) -> dict | None:

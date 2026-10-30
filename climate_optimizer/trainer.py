@@ -54,7 +54,7 @@ def train_job(export: dict, layout: dict, mapping: dict, initial: dict | None, p
     grid = build_grid(parse_rows(export), lay, mapping)
     res = train(lay, grid, Params.from_dict(initial) if initial else None,
                 progress=lambda d: write_progress(progress_path, d))
-    return {"params": res["params"].to_dict(), "report": _plain(res["report"])}
+    return {"params": res["params"].to_dict(), "checked": res["checked"].to_dict(), "report": _plain(res["report"])}
 
 
 class Trainer:
@@ -93,13 +93,15 @@ class Trainer:
                                              p.collector.meta, {**p.location(), "tz": str(p.tz())})
             if self._pool is None:
                 self._pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
-            initial = p.params.to_dict() if (use_current and p.params) else None
+            # start from the last checked model: the one planning has seen the days now checked
+            initial = (p.store.get("params_checked") or p.params.to_dict()) if (use_current and p.params) else None
             loop = asyncio.get_running_loop()
             res = await loop.run_in_executor(self._pool, train_job, export, cfg.layout, p.mapping(), initial, self.progress_path)
             from .model.layout import Params
             p.params = Params.from_dict(res["params"])
             p.report = {**res["report"], "finished": time.time() * 1000}
             p.store.put("params", res["params"])
+            p.store.put("params_checked", res["checked"])
             p.store.put("report", p.report)
             log.info("trained: rmse %s", res["report"].get("rmse_val"))
         except Exception as e:

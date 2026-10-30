@@ -67,6 +67,25 @@ def test_training_recovers_the_apartment(trained):
     assert all(x < y for x, y in zip(lv, lv[1:]))
     true_e = sum(synthetic.true_unit_energy(r, d, d + 864e5) for d in rep["days"]["val"])
     assert abs(rep["energy"]["sim"] - true_e) < 0.3 * true_e
+    # checked on the held-back days, then learned once more with them
+    rf = rep["refit"]
+    assert rf["used"] and rf["days"] == len(rep["days"]["train"]) + len(rep["days"]["val"])
+    assert rf["rmse_after"] < 0.35 and res["checked"] is not m
+
+
+def test_a_refit_that_does_not_hold_up_is_not_taken(trained):
+    layout, truth, grid, _, _ = trained
+    old = dict(fit.FIT)
+    fit.FIT.update(max_nfev=6, refit_nfev=4, burn_in_h=24, refit_jump_sigma=0.0)  # any change is too much
+    try:
+        res = fit.train(layout, grid)
+    finally:
+        fit.FIT.clear()
+        fit.FIT.update(old)
+    rf = res["report"]["refit"]
+    assert not rf["used"] and "would change by" in rf["reason"]
+    assert res["params"] is res["checked"]
+    assert any(w.startswith("Not learned again") for w in res["report"]["warnings"])
 
 
 def test_robust_residual_is_huber():

@@ -677,13 +677,15 @@ const STAGES = {
   grid: 'Laying it onto a 5-minute grid',
   fit: 'Fitting the model to it',
   check: 'Predicting the held-back days',
+  refit: 'Learning once more, with the held-back days',
 };
 function trainingProgress(pg) {
   // a share for the bar: the fit's evaluation budget is an upper bound, it often stops early
   const share = !pg ? 0 : pg.stage === 'export' ? 0.02 : pg.stage === 'grid' ? 0.05
-    : pg.stage === 'fit' ? 0.05 + 0.9 * Math.min(1, (pg.evaluations || 0) / (pg.budget || 1)) : 0.97;
+    : pg.stage === 'fit' ? 0.05 + 0.75 * Math.min(1, (pg.evaluations || 0) / (pg.budget || 1))
+    : pg.stage === 'refit' ? 0.82 + 0.15 * Math.min(1, (pg.evaluations || 0) / (pg.budget || 1)) : 0.8;
   const el = pg?.elapsed_s ?? 0;
-  const detail = pg?.stage === 'fit' && pg.budget ? ` · ${pg.evaluations} of at most ${pg.budget} model runs` : '';
+  const detail = (pg?.stage === 'fit' || pg?.stage === 'refit') && pg.budget ? ` · ${pg.evaluations} of at most ${pg.budget} model runs` : '';
   return `<div class="progress"><span style="width:${Math.round(share * 100)}%"></span></div>
     <p class="hint" style="margin:6px 0 0">${esc(STAGES[pg?.stage] || 'Starting')}${detail} · ${Math.floor(el / 60)}:${String(Math.floor(el % 60)).padStart(2, '0')} min</p>`;
 }
@@ -709,7 +711,7 @@ pages.model = async () => {
   } else {
     const days = rep.days || {};
     html += `<div class="stats" style="margin-bottom:14px">
-      <div class="stat"><div class="k">Trained</div><div class="v">${ago(rep.finished || rep.trained_at * 1000)}</div><div class="s">${(days.train || []).length} days to learn, ${(days.val || []).length} to check · ${num(rep.seconds, 0)} s</div></div>
+      <div class="stat"><div class="k">Trained</div><div class="v">${ago(rep.finished || rep.trained_at * 1000)}</div><div class="s">${(days.train || []).length} days to learn, ${(days.val || []).length} to check${rep.refit?.used ? `, then all ${rep.refit.days} learned` : ''} · ${num(rep.seconds, 0)} s</div></div>
       <div class="stat"><div class="k">Heat pump efficiency</div><div class="v">COP ${num(rep.cop7, 1)}</div><div class="s">at 7 °C outside, 21 °C inside</div></div>
       <div class="stat"><div class="k">Electricity on check days</div><div class="v">${num(rep.energy?.sim, 1)} kWh</div><div class="s">${rep.energy?.observed ? 'measured ' + num(rep.energy.obs, 1) + ' kWh' : 'no phase measurement'}</div></div>
     </div>`;
@@ -739,7 +741,12 @@ pages.model = async () => {
       </div><div><div id="plant-chart"></div><p class="hint" style="margin:4px 0 0">Electricity (kW) against heat (kW), at 7 °C outside and 21 °C inside.</p></div></div></div>`;
     }
     if (rep.validation?.length) {
+      const rf = rep.refit;
+      const rfNote = !rf ? '' : rf.used
+        ? `Predicted by the model learned without them. Once checked, it learned again from all ${rf.days} days, the check days included, and that model plans (error on the other days ${num(rf.rmse_before, 2)} → ${num(rf.rmse_after, 2)} K).`
+        : `Not learned again with them: ${esc(rf.reason)}. The model checked here plans.`;
       html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Check days: predicted from midnight against measured</h3><span class="spacer"></span><div class="chips" id="val-days"></div></div>
+        ${rfNote ? `<p class="hint" style="margin-top:0">${rfNote}</p>` : ''}
         <div class="toolbar"><div class="chips" id="val-zones"></div></div><div id="val-chart"></div></div>`;
     }
   }
