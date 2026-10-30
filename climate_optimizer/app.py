@@ -28,6 +28,8 @@ from .trainer import Trainer
 
 log = logging.getLogger(__name__)
 WEB = Path(__file__).parent / "web"
+# when these files were last changed: on the Settings page, to see which version runs
+BUILD = max(f.stat().st_mtime for f in Path(__file__).parent.rglob("*") if f.suffix in (".py", ".js", ".html", ".css")) * 1000
 MIN = 60_000
 
 
@@ -135,6 +137,16 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
 
     app = FastAPI(title="Climate optimizer", lifespan=lifespan)
 
+    @app.middleware("http")
+    async def fresh_ui(request: Request, call_next):
+        """The page and its scripts are revalidated on every load (a cheap 304 when
+        unchanged), so after an update the browser shows the new version at once,
+        not one it cached by guesswork."""
+        resp = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
     def svc() -> Service:
         return holder["svc"]
 
@@ -183,6 +195,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
                       "training": s.trainer.running, "progress": s.trainer.progress(), "error": s.trainer.error},
             "backfill": s.collector.backfill_status, "units": units, "zones": zones,
             "outdoor": p.live(cfg.mapping.get("outdoor")), "uptime_s": time.time() - s.started, "tz": str(p.tz()),
+            "build": BUILD,
         })
 
     @app.get("/api/plan", dependencies=[Depends(auth)])

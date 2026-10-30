@@ -83,7 +83,10 @@ def test_schedule_preview_and_history(client):
 
 def test_ui_is_served(client):
     assert "Climate optimizer" in client.get("/").text
-    assert client.get("/static/app.js").status_code == 200
+    r = client.get("/static/app.js")
+    assert r.status_code == 200 and r.headers["cache-control"] == "no-cache"
+    assert client.get("/").headers["cache-control"] == "no-cache"
+    assert "cache-control" not in client.get("/healthz").headers
 
 
 def test_fan_modes_come_from_the_proxy(client):

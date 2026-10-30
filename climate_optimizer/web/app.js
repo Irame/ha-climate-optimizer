@@ -843,7 +843,8 @@ pages.settings = async () => {
   const M = C.mapping = C.mapping || {};
   M.zones = M.zones || {}; M.units = M.units || {};
   const field = (label, path, kind) => `<label class="field">${label}${entitySelect(path, kind, get(C, path) || '')}</label>`;
-  let html = `<div class="toolbar"><h2 style="margin:0">Settings</h2><span class="spacer"></span><span id="st-msg" class="hint"></span><button class="primary" id="st-save">Save</button></div>`;
+  const build = S.status?.build ? `<span class="hint" title="when the optimizer’s files were last changed: after an update, the time of the update">version of ${fmtDay(S.status.build, S.tz)} ${fmtTime(S.status.build, S.tz)}</span>` : '';
+  let html = `<div class="toolbar"><h2 style="margin:0">Settings</h2>${build}<span class="spacer"></span><span id="st-msg" class="hint"></span><button class="primary" id="st-save">Save</button></div>`;
   html += `<div class="card"><h3>Mode</h3>
     <label class="check"><input type="checkbox" data-path="shadow" ${C.shadow ? 'checked' : ''}> Shadow mode: plan and show, but let the proxies’ own thermostats decide</label>
     <p class="hint">Set each proxy to <b>auto</b> and point its <code>optimizer_url</code> here: <code>${esc(location.origin + location.pathname.replace(/\/$/, ''))}</code>. In shadow mode the optimizer answers <code>follow: false</code>.</p>
