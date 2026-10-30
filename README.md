@@ -39,7 +39,7 @@ docker compose up -d --build
 
 Then open `http://<host>:8099`:
 
-1. **Settings:** check the Home Assistant connection. For every room, choose the thermometer and the window or door sensors, and tick where its windows face: the model then looks for sun only from there, which it learns much sooner. For every unit, choose its proxy entity and the device under it, plus the fan modes quietest first. Then set the outdoor thermometer, the weather entity, the phase the outdoor unit hangs on, and the price source. Save.
+1. **Settings:** check the Home Assistant connection. For every room, choose the thermometer and the window or door sensors, and tick where its windows face: the model then looks for sun only from there, which it learns much sooner. For every unit, choose its proxy entity and the device under it, plus the fan modes quietest first. Then set the outdoor thermometer, the weather entity, the phase the outdoor unit hangs on, and the price source. For the phases, the car and the heater, an energy meter (kWh) is better than a power sensor where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, while a power sensor's reports miss what happens between them. Save.
 2. The optimizer backfills what Home Assistant's recorder has (10 days by default) and trains on it. This takes a minute or two. The **Model** page shows how well it predicts.
 3. Point every proxy at the optimizer and set it to `auto`:
 

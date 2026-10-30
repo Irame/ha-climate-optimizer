@@ -245,6 +245,7 @@ class Planner:
         fc = inputs["forecast"]
         tout_now = self.live(mapping.get("outdoor"))
         dist = np.zeros((N, len(DIST)))
+        ghi, cloud = np.zeros(N), np.zeros(N)  # for the page: sun on the ground, cloud cover
         cloud_t = fc["t"] if len(fc["t"]) else np.array([now_ms])
         cloud_v = fc["cloud"] if len(fc["t"]) else np.array([0.6])
         for k in range(N):
@@ -252,8 +253,10 @@ class Planner:
             ts = t[k] + (np.arange(n) + 0.5) * (t[k + 1] - t[k]) / n
             to = blend_outdoor(fc["t"], fc["temp"], now_ms, tout_now, ts)
             cl = np.interp(ts, cloud_t, cloud_v)
-            sol = np.array([[(r := irradiance(x, loc["lat"], loc["lon"], c))["D"], r["E"], r["S"], r["W"]]
+            irr = np.array([[(r := irradiance(x, loc["lat"], loc["lon"], c))["D"], r["E"], r["S"], r["W"], r["ghi"]]
                             for x, c in zip(ts, cl)]).mean(axis=0)
+            sol = irr[:4]
+            ghi[k], cloud[k] = irr[4], cl.mean()
             hrs = np.array([(lambda d: d.hour + d.minute / 60)(datetime.fromtimestamp(x / 1000, tz)) for x in ts])
             dist[k] = [to.mean(), *sol, np.cos(2 * np.pi * hrs / 24).mean(), np.sin(2 * np.pi * hrs / 24).mean(), 1.0]
         if not math.isfinite(tout_now) and not len(fc["t"]):
@@ -370,13 +373,18 @@ class Planner:
                 for uid in here:
                     proxies[uid]["comfort"] = None
         pr = mpc.Problem(sysm, t, dist, win, price, x0, comfort, functions, units, st)
+        info["ghi"] = (ghi * 1000).round(0).tolist()  # W/m²
+        info["cloud"] = (cloud * 100).round(0).tolist()  # %
         info.update({"units": proxies, "schedule": {"function": res.function, "source": res.source, "offset": res.offset,
                                                     "locked": res.locked}, "x0": x0.tolist(), "trained": self.params is not None})
         return pr, info
 
     # ---- planning ----
-    async def replan(self) -> None:
-        if self.lock.locked():  # one is running: its plan will do
+    async def replan(self, fresh: bool = False) -> None:
+        """Plan now. With one already running, its plan will do, unless fresh:
+        then plan once more after it, from the state as it is now (a setting
+        changed, the calendar was read, someone asked)."""
+        if self.lock.locked() and not fresh:
             async with self.lock:
                 return
         async with self.lock:

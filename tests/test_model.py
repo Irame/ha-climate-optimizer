@@ -130,3 +130,44 @@ def test_retraining_keeps_physics_as_the_prior():
         F.FIT.update(old)
     m = res["params"]
     assert m.zones["living"]["Cw"] < 30 and m.building["Tnb"] > 17.5
+
+
+def test_power_from_an_energy_meter():
+    """A cycling load, its meter read now and then: the 5-minute means come out exact,
+    a reset leaves its step unknown."""
+    from climate_optimizer.model.dataset import counter_power
+
+    rng = np.random.default_rng(2)
+    sec = np.arange(0, 3 * 3600)  # three hours, by the second
+    p = np.where((sec // 97) % 3 == 0, 1.8, 0.05) + 0.1 * rng.random(len(sec))  # kW, cycling
+    e = np.cumsum(p) / 3600.0  # kWh
+    reports = np.sort(rng.choice(len(sec), 400, replace=False))
+    t = sec[reports] * 1000.0
+    v = e[reports].copy()
+    v[300:] -= 100.0  # the meter is reset once
+    got = counter_power(t, v, 0.0, 300_000.0, 36, 1.0)
+    true = p[: 36 * 300].reshape(36, 300).mean(1)
+    ok = np.isfinite(got)
+    assert ok[1:-1].sum() == 33  # unknown: only the step with the reset (and the ends, outside the reports)
+    # each step's ends fall between reports: interpolated there, the energy itself exact
+    assert np.abs(got[ok] - true[ok]).max() < 0.2 and abs(got[ok].mean() - true[ok].mean()) < 0.01
+
+
+def test_grid_takes_power_from_a_meter():
+    """The phase given as a kWh meter gives the same kW as its power sensor."""
+    layout = default_layout()
+    r = synthetic.run(days=2, seed=4, realism=False)
+    ex = synthetic.to_export(r)
+    rows = ex["stats_5min"]["sensor.phase_l2_leistung"]
+    kwh, acc = [], 0.0
+    for t, w in rows:  # the meter's reading at the end of each 5-minute mean
+        acc += w / 1000 / 12
+        kwh.append([t + 300_000, round(acc, 4)])
+    ex["history"]["sensor.phase_l2_energie"] = kwh
+    ex["meta"]["sensor.phase_l2_energie"] = {"unit": "kWh", "device_class": "energy"}
+    m = synthetic.mapping_for(layout)
+    p = parse_rows(json.loads(json.dumps(ex)))
+    a = build_grid(p, layout, m).phase
+    b = build_grid(p, layout, {**m, "phase": "sensor.phase_l2_energie"}).phase
+    ok = np.isfinite(a) & np.isfinite(b)
+    assert ok.mean() > 0.95 and np.abs(a[ok] - b[ok]).max() < 0.01

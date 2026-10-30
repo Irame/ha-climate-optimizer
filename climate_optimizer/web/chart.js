@@ -15,9 +15,17 @@ function niceTicks(lo, hi, n = 4) {
   const span = hi - lo || 1;
   const raw = span / n;
   const mag = 10 ** Math.floor(Math.log10(raw));
-  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || 10 * mag;
-  const out = [];
-  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(10));
+  const steps = [0.5, 1, 2, 2.5, 5, 10].map(m => m * mag);
+  const make = step => {
+    const out = [];
+    for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(10));
+    return out;
+  };
+  // the roundest step near the wanted count, but always two ticks at least
+  let i = steps.findIndex(s => s >= raw);
+  if (i < 0) i = steps.length - 1;
+  let out = make(steps[i]);
+  while (out.length < 2 && i > 0) out = make(steps[--i]);
   return out;
 }
 
@@ -47,7 +55,7 @@ export class ChartGroup {
     this.tip.hidden = true;
     container.appendChild(this.tip);
     this.width = Math.max(320, container.clientWidth || 800);
-    this.left = 46; this.right = 12;
+    this.left = 62; this.right = 12;
   }
   x(t) { return this.left + (t - this.x0) / (this.x1 - this.x0) * (this.width - this.left - this.right); }
   t(x) { return this.x0 + (x - this.left) / (this.width - this.left - this.right) * (this.x1 - this.x0); }
@@ -111,7 +119,7 @@ class Panel {
     if (!this.rows) {
       let lo = Infinity, hi = -Infinity;
       const see = v => { if (v !== null && isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); } };
-      for (const s of this.series) s.t.forEach((t, i) => { if (t >= g.x0 && t <= g.x1) see(s.y[i]); });
+      for (const s of this.series) if (!s.tipOnly) s.t.forEach((t, i) => { if (t >= g.x0 && t <= g.x1) see(s.y[i]); });
       for (const b of this.bands) b.t.forEach((t, i) => { if (t >= g.x0 && t <= g.x1) { see(b.lo[i]); see(b.hi[i]); } });
       if (!isFinite(lo)) { lo = 0; hi = 1; }
       if (this.yMin !== undefined) lo = Math.min(lo, this.yMin);
@@ -140,7 +148,7 @@ class Panel {
     }
     if (this.rows) this._drawRows(svg, top);
     for (const b of this.bands) this._drawBand(svg, b);
-    for (const s of this.series) this._drawLine(svg, s);
+    for (const s of this.series) if (!s.tipOnly) this._drawLine(svg, s);
     if (g.now > g.x0 && g.now < g.x1) {
       el('line', { x1: g.x(g.now), x2: g.x(g.now), y1: top, y2: plotB, class: 'now' }, svg);
     }
@@ -155,12 +163,12 @@ class Panel {
     hit.addEventListener('pointerdown', move);
     hit.addEventListener('pointerleave', () => g.hover(null));
     this.wrap.appendChild(svg);
-    if (this.legend && this.series.filter(s => s.name && !s.noLegend).length > 1) {
+    if (this.legend && this.series.filter(s => s.name && !s.noLegend && !s.tipOnly).length > 1) {
       const lg = document.createElement('div');
       lg.className = 'legend';
       const seen = new Set();
       for (const s of this.series) {
-        if (!s.name || s.noLegend || seen.has(s.legendKey || s.name)) continue;
+        if (!s.name || s.noLegend || s.tipOnly || seen.has(s.legendKey || s.name)) continue;
         seen.add(s.legendKey || s.name);
         lg.insertAdjacentHTML('beforeend', `<span><i style="background:${s.color}"></i>${s.legendKey || s.name}</span>`);
       }
@@ -183,6 +191,23 @@ class Panel {
     return d;
   }
   _drawLine(svg, s) {
+    if (s.fill) {
+      // the area under the line, down to the baseline, for each unbroken stretch
+      const base = this.y(Math.max(this.lo, 0));
+      const g = this.g;
+      let pts = [];
+      const flush = () => {
+        if (pts.length > 1) el('path', { d: `M${pts[0][0]},${base}` + pts.map(([x, y]) => `L${x},${y}`).join('') + `L${pts.at(-1)[0]},${base}Z`,
+          fill: s.color, opacity: s.fillOpacity ?? 0.22, stroke: 'none' }, svg);
+        pts = [];
+      };
+      s.t.forEach((t, i) => {
+        const v = s.y[i];
+        if (v === null || v === undefined || !isFinite(v)) { flush(); return; }
+        pts.push([Math.min(g.width - g.right, Math.max(g.left, g.x(t))).toFixed(1), this.y(v).toFixed(1)]);
+      });
+      flush();
+    }
     el('path', { d: this._path(s), class: 'series', stroke: s.color, 'stroke-width': s.width || 2,
       'stroke-dasharray': s.dash ? '5 4' : null, opacity: s.opacity }, svg);
   }
@@ -205,12 +230,28 @@ class Panel {
       const lb = el('text', { x: g.left - 6, y: y + 14, class: 'tick', 'text-anchor': 'end' }, svg);
       lb.textContent = r.short || r.name;
       el('line', { x1: g.left, x2: g.width - g.right, y1: y + 20, y2: y + 20, class: 'grid' }, svg);
-      for (const s of r.spans) {
-        if (s.t1 <= g.x0 || s.t0 >= g.x1 || !(s.v > 0.01)) continue;
-        const x0 = g.x(Math.max(s.t0, g.x0)), x1 = g.x(Math.min(s.t1, g.x1));
-        el('rect', { x: x0, y: y + 3, width: Math.max(1, x1 - x0 - 1), height: 14, rx: 2, fill: r.color,
-          opacity: (0.25 + 0.75 * Math.min(1, s.v)).toFixed(2) }, svg);
+      // one shape per unbroken run: its height at each step is the share of the step running
+      const base = y + 18, full = 15;
+      const spans = r.spans.filter(s => s.t1 > g.x0 && s.t0 < g.x1).sort((a, b) => a.t0 - b.t0);
+      let run = [];
+      const flush = () => {
+        if (!run.length) return;
+        const X = t => Math.min(g.width - g.right, Math.max(g.left, g.x(t))).toFixed(1);
+        let d = `M${X(run[0].t0)},${base}`;
+        for (const s of run) {
+          const h = (base - full * Math.min(1, Math.max(0.12, s.v))).toFixed(1);  // a sliver stays visible
+          d += `L${X(s.t0)},${h}L${X(s.t1)},${h}`;
+        }
+        d += `L${X(run.at(-1).t1)},${base}Z`;
+        el('path', { d, fill: r.color, opacity: 0.85, stroke: 'none' }, svg);
+        run = [];
+      };
+      for (const s of spans) {
+        const on = s.v > 0.01;
+        if (!on || (run.length && s.t0 - run.at(-1).t1 > 1000)) flush();
+        if (on) run.push(s);
       }
+      flush();
     });
   }
 
@@ -239,7 +280,8 @@ class Panel {
       if (s.step && s.tEnd && t > s.tEnd) continue;
       const v = s.y[i];
       if (v === null || v === undefined || !isFinite(v)) continue;
-      out.push({ name: s.name, color: s.color, text: this.fmt(v) + (this.unit ? ' ' + this.unit : '') });
+      const unit = s.unit ?? this.unit;
+      out.push({ name: s.name, color: s.color, text: (s.fmt || this.fmt)(v) + (unit ? ' ' + unit : '') });
     }
     return out;
   }

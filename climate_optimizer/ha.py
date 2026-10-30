@@ -174,12 +174,13 @@ class HomeAssistant:
             "minimal_response": not attributes, "no_attributes": not attributes,
         }, timeout=300)
 
-    async def statistics(self, start_iso: str, end_iso: str, ids: list[str], period: str = "5minute") -> dict:
+    async def statistics(self, start_iso: str, end_iso: str, ids: list[str], period: str = "5minute",
+                         types: tuple[str, ...] = ("mean",)) -> dict:
         if not ids:
             return {}
         return await self.call({
             "type": "recorder/statistics_during_period", "start_time": start_iso, "end_time": end_iso,
-            "statistic_ids": ids, "period": period, "types": ["mean"],
+            "statistic_ids": ids, "period": period, "types": list(types),
         }, timeout=300)
 
 

@@ -146,6 +146,36 @@ def _unit_w(meta: dict, eid: str) -> float:
     return 1.0 if u == "kw" else 1e-3
 
 
+ENERGY_UNITS = {"wh": 1e-3, "kwh": 1.0, "mwh": 1e3}  # to kWh
+
+
+def is_counter(meta: dict, eid: str) -> bool:
+    """An energy meter (kWh), as opposed to a power sensor (W)."""
+    m = meta.get(eid) or {}
+    return m.get("device_class") == "energy" or str(m.get("unit") or "").lower() in ENERGY_UNITS
+
+
+def counter_power(t, v, t0, step, K, to_kwh: float, max_kw: float = 40.0) -> np.ndarray:
+    """Mean power (kW) over each step from an energy meter: the difference of its
+    readings at the step's ends. Exact where averaging a power sensor is not:
+    whatever happens between a power sensor's reports is lost, the meter counts
+    it. A reset or a jump after an outage leaves that step unknown."""
+    t = np.asarray(t, dtype=float)
+    v = np.asarray(v, dtype=float)
+    keep = np.isfinite(v)
+    t, v = t[keep], v[keep]
+    edges = t0 + step * np.arange(K + 1)
+    if len(t) < 2:
+        return np.full(K, np.nan)
+    # the reading at each edge, between the reports around it
+    E = np.interp(edges, t, v)
+    i = np.clip(np.searchsorted(t, edges, side="right"), 1, len(t) - 1)
+    inside = (edges >= t[0]) & (edges <= t[-1]) & (t[i] - t[i - 1] <= 24 * 3600e3)
+    E = np.where(inside, E, np.nan)
+    p = np.diff(E) * to_kwh / (step / 3.6e6)
+    return np.where((p >= -1e-6) & (p <= max_kw), np.maximum(p, 0.0), np.nan)
+
+
 @dataclass
 class Grid:
     t: np.ndarray  # step starts, ms
@@ -165,6 +195,8 @@ class Grid:
     price: list  # [(t_ms, price)] as recorded
     tz: str = "UTC"
     notes: list = field(default_factory=list)  # problems with the data worth telling
+    ghi: np.ndarray | None = None  # (K,) sun on the ground after clouds, kW/m²
+    cloud: np.ndarray | None = None  # (K,) cloud cover 0..1 as recorded, NaN unknown
 
     @property
     def K(self) -> int:
@@ -226,12 +258,24 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
     loc = parsed.location or {"lat": 51.0, "lon": 10.0}
     tzname = (parsed.location or {}).get("tz") or "UTC"
     sol = np.zeros((K, 4))
+    ghi = np.zeros(K)
     for k in range(K):
         r = irradiance(t[k] + step / 2, loc["lat"], loc["lon"], cloud[k] if np.isfinite(cloud[k]) else None)
         sol[k] = (r["D"], r["E"], r["S"], r["W"])
+        ghi[k] = r["ghi"]
     tz = ZoneInfo(tzname)
     hours = np.array([(lambda d: d.hour + d.minute / 60)(datetime.fromtimestamp((x + step / 2) / 1000, tz)) for x in t])
     hc, hs = np.cos(2 * np.pi * hours / 24), np.sin(2 * np.pi * hours / 24)
+
+    def kw(eid):
+        """kW over each step, from an energy meter's readings or a power sensor's mean."""
+        if not eid or eid not in parsed.num:
+            return np.full(K, np.nan)
+        if is_counter(parsed.meta, eid):
+            pt, pv = parsed.num[eid]
+            unit = str((parsed.meta.get(eid) or {}).get("unit") or "kWh").lower()
+            return counter_power(pt, pv, t0, step, K, ENERGY_UNITS.get(unit, 1.0))
+        return resample(parsed, eid, t0, step, K, 1e18) * _unit_w(parsed.meta, eid)
 
     units = mapping.get("units", {})
     ac_frac, heater_kw = {}, {}
@@ -242,22 +286,14 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
         else:
             pw = cfg.get("power")
             if pw and pw in parsed.num:
-                heater_kw[u.id] = np.nan_to_num(resample(parsed, pw, t0, step, K, 1e18) * _unit_w(parsed.meta, pw))
+                heater_kw[u.id] = np.nan_to_num(kw(pw))
             elif cfg.get("source") in parsed.binary:
                 bt, bv = parsed.binary[cfg["source"]]
                 heater_kw[u.id] = np.nan_to_num(step_means(bt, bv, t0, step, K, 1e18)) * float(cfg.get("rated_kw", 2.0))
             else:
                 heater_kw[u.id] = np.zeros(K)
 
-    def kw(eid):
-        return resample(parsed, eid, t0, step, K, 1e18) * _unit_w(parsed.meta, eid) if eid else np.full(K, np.nan)
 
-    power_ids = [mapping.get("phase"), mapping.get("car"), *(mapping.get("phases_other") or []),
-                 *[(units.get(u.id) or {}).get("power") for u in layout.heaters]]
-    for eid in filter(None, power_ids):
-        meta = parsed.meta.get(eid) or {}
-        if meta.get("device_class") == "energy" or str(meta.get("unit") or "").lower() in ("kwh", "wh", "mwh"):
-            notes.append(f"{eid} is an energy meter ({meta.get('unit')}); it needs to be a power sensor (W or kW).")
 
     phase = kw(mapping.get("phase", ""))
     others = [kw(e) for e in mapping.get("phases_other", []) if e and e != mapping.get("phase")]
@@ -272,7 +308,8 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
         if stuck[i] > 0.02:
             notes.append(f"The {z} thermometer stood still for {stuck[i] * 100:.0f} % of the time; those stretches count as missing.")
     return Grid(t=t, step_min=step_min, T=T, tout=tout, open=opn, sol=sol, hc=hc, hs=hs, ac_frac=ac_frac,
-                heater_kw=heater_kw, phase=phase, others=others, car=car, valid=valid, price=price, tz=tzname, notes=notes)
+                heater_kw=heater_kw, phase=phase, others=others, car=car, valid=valid, price=price, tz=tzname, notes=notes,
+                ghi=ghi, cloud=cloud)
 
 
 def mask_stuck(T: np.ndarray, step_min: int, keep_h: float = 1.0, min_h: float = 3.0) -> tuple[np.ndarray, np.ndarray]:

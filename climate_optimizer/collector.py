@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 
 from .ha import HomeAssistant
+from .model.dataset import is_counter
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -207,10 +208,14 @@ class Collector:
     async def _numeric(self, items: list[tuple[str, int]], now: int) -> None:
         start = min(s for _, s in items)
         ids = [e for e, _ in items]
-        stats = await self.ha.statistics(_iso(start), _iso(now), ids, "5minute")
+        stats = await self.ha.statistics(_iso(start), _iso(now), ids, "5minute", ("mean", "state"))
         missing = []
         for eid, s0 in items:
-            rows = [[_ms(r["start"]), r.get("mean")] for r in stats.get(eid, []) if r.get("mean") is not None]
+            if is_counter(self.meta, eid):  # a meter: its reading at the end of each five minutes
+                rows = [[_ms(r.get("end") or (_ms(r["start"]) + 5 * MIN)), r.get("state")] for r in stats.get(eid, [])
+                        if r.get("state") is not None]
+            else:
+                rows = [[_ms(r["start"]), r.get("mean")] for r in stats.get(eid, []) if r.get("mean") is not None]
             rows = [r for r in rows if r[0] >= s0]
             if rows:
                 self.store.add_rows(eid, rows)

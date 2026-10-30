@@ -111,7 +111,7 @@ class Service:
                 self.store.put("meta", self.collector.meta)
                 asyncio.create_task(self.collector.backfill(new.history_days))
         if self.ha.connected.is_set():
-            asyncio.create_task(self.planner.replan())
+            asyncio.create_task(self.planner.replan(fresh=True))
 
 
 async def _sleep_until(stop: asyncio.Event, period: float, offset: float = 0.0) -> None:
@@ -197,7 +197,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
 
     @app.post("/api/plan", dependencies=[Depends(auth)])
     async def replan():
-        await svc().planner.replan()
+        await svc().planner.replan(fresh=True)
         return await plan()
 
     @app.get("/api/history", dependencies=[Depends(auth)])
@@ -220,6 +220,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
                 "t": g.t.astype(np.int64).tolist(),
                 "temp": {z: _r(g.T[:, i], 2) for i, z in enumerate(layout.zone_ids)},
                 "tout": _r(g.tout, 2),
+                "ghi": _r(g.ghi * 1000, 0), "cloud": _r(g.cloud * 100, 0),
                 "units": {u: {"heat": _r(f[:, 0].sum(1), 2), "cool": _r(f[:, 1].sum(1), 2),
                               "level": _r((f.sum(1) * np.arange(f.shape[2])).sum(1) / np.maximum(1e-9, f.sum((1, 2))), 2)}
                           for u, f in g.ac_frac.items()},
@@ -305,7 +306,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         specs, listing = s.planner.event_specs(inside)
         res = resolve(starts, ends, layout.zone_ids, [u.id for u in layout.units], cfg.defaults, cfg.rule_objs(), specs)
         if refresh and s.ha.connected.is_set():
-            asyncio.create_task(s.planner.replan())  # the plan sees the calendar as it is now
+            asyncio.create_task(s.planner.replan(fresh=True))  # the plan sees the calendar as it is now
         return _json({"start": int(t0.timestamp() * 1000), "step_min": step_min, "function": res.function,
                       "offset": res.offset, "locked": res.locked, "source": res.source,
                       "event_zone": res.event_zone, "event_unit": res.event_unit,

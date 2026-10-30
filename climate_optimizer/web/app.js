@@ -32,8 +32,9 @@ async function api(path, opts = {}) {
 // which entities fit a field: its domains, and the ones that most likely are meant listed first
 const KINDS = {
   temp: { domains: ['sensor'], likely: e => e.device_class === 'temperature' || /°/.test(e.unit || '') },
-  // power (W, kW), not energy (kWh): energy meters are listed last and flagged when picked
-  power: { domains: ['sensor'], likely: e => e.device_class === 'power' || /^[kM]?W$/.test(e.unit || ''), wrong: e => isEnergy(e) },
+  // an energy meter (kWh) or a power sensor (W): the meter first, its readings give the more exact power
+  power: { domains: ['sensor'], groups: [['Energy meters (kWh), the more exact', e => isEnergy(e)],
+    ['Power sensors (W)', e => e.device_class === 'power' || /^[kM]?W$/.test(e.unit || '')]] },
   opening: { domains: ['binary_sensor'], likely: e => ['door', 'window', 'opening', 'garage_door'].includes(e.device_class) },
   climate: { domains: ['climate'] },
   switch: { domains: ['switch', 'input_boolean'] },
@@ -49,21 +50,26 @@ function entityOptions(kind, value, none = '— none —') {
   const opt = e => `<option value="${esc(e.id)}" ${e.id === value ? 'selected' : ''}>${esc(e.name ? `${e.name} (${e.id})` : e.id)}</option>`;
   let html = none === null ? '' : `<option value="">${none}</option>`;
   if (value && !all.some(e => e.id === value)) html += `<option value="${esc(value)}" selected>${esc(value)} (not in Home Assistant)</option>`;
-  const likely = k.likely ? all.filter(k.likely) : all;
-  const wrong = k.wrong ? all.filter(e => !k.likely?.(e) && k.wrong(e)) : [];
-  const other = k.likely ? all.filter(e => !k.likely(e) && !wrong.includes(e)) : [];
-  if ((other.length || wrong.length) && likely.length) {
-    html += `<optgroup label="Likely">${likely.map(opt).join('')}</optgroup>`;
+  const groups = k.groups || (k.likely ? [['Likely', k.likely]] : []);
+  const placed = new Set();
+  const parts = groups.map(([label, pred]) => {
+    const hit = all.filter(e => !placed.has(e) && pred(e));
+    hit.forEach(e => placed.add(e));
+    return [label, hit];
+  }).filter(([, hit]) => hit.length);
+  const other = all.filter(e => !placed.has(e));
+  if (parts.length && (other.length || parts.length > 1)) {
+    for (const [label, hit] of parts) html += `<optgroup label="${esc(label)}">${hit.map(opt).join('')}</optgroup>`;
     if (other.length) html += `<optgroup label="Other">${other.map(opt).join('')}</optgroup>`;
-    if (wrong.length) html += `<optgroup label="Energy meters (kWh): not what is asked for">${wrong.map(opt).join('')}</optgroup>`;
   } else html += all.map(opt).join('');
   return html;
 }
-// a hint under power fields when an energy meter is picked
+// under power fields: what the optimizer makes of the entity picked
 function powerCheck(sel) {
   const hint = sel.parentElement.querySelector('.kind-hint') || sel.insertAdjacentElement('afterend', Object.assign(document.createElement('div'), { className: 'hint kind-hint' }));
   const e = (S.entities || []).find(x => x.id === sel.value);
-  hint.innerHTML = e && isEnergy(e) ? `<span class="badge warn">${esc(e.unit || 'energy')}</span> This is an energy meter; this needs the power (W or kW).` : '';
+  hint.textContent = !e ? '' : isEnergy(e) ? 'energy meter: the power comes from its readings'
+    : 'power sensor: works; the same device’s energy meter, if it has one, is more exact';
 }
 const entitySelect = (path, kind, value) => `<select data-path="${path}" data-kind="${kind}" style="width:100%">${entityOptions(kind, value)}</select>`;
 const entityMulti = (path, kind, values) => `<div class="multi" data-path="${path}" data-kind="${kind}" data-multi="${esc(JSON.stringify(values || []))}"></div>`;
@@ -277,7 +283,7 @@ function drawTimeline(box, P, info, hist) {
     P.share[u.id].forEach((v, k) => spans.push({ t0: P.t[k], t1: P.t[k + 1], v, label: v > 0.01 ? `${num(Math.abs(P.heat[u.id][k]), 2)} kW${v < 0.99 ? ', ' + Math.round(v * 100) + ' % of the step' : ''}` : 'off' }));
     return { name: u.name, short: u.name.split(' ')[0], color: zoneColor(u.zone), spans };
   });
-  g.add({ title: 'Units: recorded, then planned (lighter = part of the step)' }).gantt(rows);
+  g.add({ title: 'Units: recorded, then planned (height: share of each step running)' }).gantt(rows);
   // price
   const pp = g.add({ title: 'Electricity price (ct/kWh)', unit: 'ct', height: 120, fmt: v => v.toFixed(0) });
   const prices = (info.prices || []).filter(p => p[1] > x0).sort((a, b) => a[0] - b[0]);
@@ -288,8 +294,26 @@ function drawTimeline(box, P, info, hist) {
   // outdoor
   const op = g.add({ title: 'Outdoor temperature (°C): measured, then forecast', unit: '°C', height: 110 });
   if (hist?.tout) op.line({ name: 'Outdoor', color: slot(0), t: hist.t, y: hist.tout });
-  if (info.tout) op.line({ name: 'Outdoor (forecast)', legendKey: 'Outdoor', color: slot(0), t: P.t.slice(0, -1).map((t, i) => (t + P.t[i + 1]) / 2), y: info.tout, dash: true, noLegend: true });
+  const mids = P.t.slice(0, -1).map((t, i) => (t + P.t[i + 1]) / 2);
+  if (info.tout) op.line({ name: 'Outdoor (forecast)', legendKey: 'Outdoor', color: slot(0), t: mids, y: info.tout, dash: true, noLegend: true });
+  sunPanel(g, hist, info.ghi ? { t: mids, ghi: info.ghi, cloud: info.cloud } : null);
   g.panels.forEach(p => p.draw());
+}
+
+// Sun on the ground after the clouds, the way the model sees it; cloud cover in the tooltip.
+// Its own panel: a second scale on the temperature chart would invent a relation.
+function sunPanel(g, hist, plan) {
+  const sp = g.add({ title: 'Sun (W/m², after clouds)' + (plan ? ': recorded weather, then forecast' : ''), unit: 'W/m²', height: 90, yMin: 0, fmt: v => v.toFixed(0) });
+  const sun = slot(3);
+  if (hist?.ghi) {
+    sp.line({ name: 'Sun', color: sun, t: hist.t, y: hist.ghi, fill: true, width: 1.5 });
+    if (hist.cloud) sp.line({ name: 'Clouds', color: css('--muted'), t: hist.t, y: hist.cloud, tipOnly: true, unit: '%' });
+  }
+  if (plan) {
+    sp.line({ name: 'Sun (forecast)', color: sun, t: plan.t, y: plan.ghi, fill: true, dash: true, width: 1.5, noLegend: true });
+    if (plan.cloud) sp.line({ name: 'Clouds (forecast)', color: css('--muted'), t: plan.t, y: plan.cloud, tipOnly: true, unit: '%' });
+  }
+  return sp;
 }
 
 // ---- history ------------------------------------------------------------------
@@ -326,11 +350,12 @@ pages.history = async (redraw) => {
     });
     return { name: u.name, short: u.name.split(' ')[0], color: zoneColor(u.zone), spans };
   });
-  g.add({ title: 'Units running' }).gantt(rows);
+  g.add({ title: 'Units running (height: share of each 5 minutes)' }).gantt(rows);
   if (h.phase?.some(v => v !== null)) g.add({ title: 'Outdoor unit phase (kW)', unit: 'kW', height: 110, fmt: v => v.toFixed(1) }).line({ name: 'Phase', color: slot(6), t: h.t, y: h.phase });
   const pr = h.prices || [];
   if (pr.length) g.add({ title: 'Electricity price (ct/kWh)', unit: 'ct', height: 110, fmt: v => v.toFixed(0) }).line({ name: 'Price', color: slot(6), t: pr.map(p => p[0]), y: pr.map(p => p[2] * 100), step: true, tEnd: pr.at(-1)[1] });
   g.add({ title: 'Outdoor temperature (°C)', unit: '°C', height: 100 }).line({ name: 'Outdoor', color: slot(0), t: h.t, y: h.tout });
+  sunPanel(g, h, null);
   g.panels.forEach(p => p.draw());
 
   // energy: phase-based where recorded, priced with the recorded prices
@@ -739,7 +764,7 @@ pages.settings = async () => {
       <td><input data-alias="${z.id}" value="${esc((z.aliases || []).join(', '))}" placeholder="${esc({ office: 'Büro', bedroom: 'Schlafzimmer', living: 'Wohnzimmer, Küche', bath: 'Bad', hall: 'Flur' }[z.id] || 'more names')}" style="width:100%;min-width:120px"></td></tr>`;
   }
   html += `</table></div><p class="hint">Windows face: where each room gets its sun from. Ticked, the model only looks for direct sun from those sides (north gets none), which it learns much faster; none ticked, it looks everywhere. Retrain after changing it.</p></div>`;
-  html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Proxy (what the optimizer answers)</th><th>Device under the proxy</th><th>${L.units.some(u => u.kind === 'heater') ? 'Heater power (W or kW, not kWh)' : ''}</th></tr>`;
+  html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Proxy (what the optimizer answers)</th><th>Device under the proxy</th><th>${L.units.some(u => u.kind === 'heater') ? 'Heater energy (kWh) or power (W)' : ''}</th></tr>`;
   for (const u of L.units) {
     M.units[u.id] = M.units[u.id] || {};
     html += `<tr><td>${esc(u.name)}<div class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</div></td>
@@ -753,13 +778,13 @@ pages.settings = async () => {
   html += `<div class="card"><h3>Outside, power and prices</h3><div class="fields wide">
     ${field('Outdoor thermometer', 'mapping.outdoor', 'temp')}
     ${field('Weather (forecast)', 'mapping.weather', 'weather')}
-    ${field('Power on the phase with the outdoor unit (W or kW)', 'mapping.phase', 'power')}
-    <label class="field">Power on the other phases (W or kW)${entityMulti('mapping.phases_other', 'power', M.phases_other)}</label>
-    ${field('Car charger power (W or kW, optional)', 'mapping.car', 'power')}
+    ${field('Phase with the outdoor unit: energy (kWh) or power (W)', 'mapping.phase', 'power')}
+    <label class="field">Other phases: energy (kWh) or power (W)${entityMulti('mapping.phases_other', 'power', M.phases_other)}</label>
+    ${field('Car charger: energy (kWh) or power (W), optional', 'mapping.car', 'power')}
     <label class="field">Prices from<select data-path="prices.source"><option value="tibber_prices" ${C.prices.source === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${C.prices.source === 'attributes' ? 'selected' : ''}>a sensor's attributes</option></select></label>
     <label class="field">tibber_prices entry id (if several)<input data-path="prices.entry_id" value="${esc(C.prices.entry_id || '')}"></label>
     ${field('Price sensor', 'prices.sensor', 'price')}
-    </div><p class="hint">Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
+    </div><p class="hint">For the phases, the car and the heater an energy meter (kWh) is the better choice where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, where a power sensor's reports miss what happens between them. Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
   html += `<div class="card"><h3>Optimizer</h3><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
     <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
     <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents. On/off is decided as such for the first quarter hour; after that the plan counts what share of each step a unit runs.</p></div>`;
