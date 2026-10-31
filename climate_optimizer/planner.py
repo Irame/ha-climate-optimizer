@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from . import mpc
-from .comfort import parse_event, resolve
+from .comfort import OVERRIDE_FUNCTIONS, ComfortFunction, parse_event, resolve
 from .config import Config
 from .dispatch import FanDispatcher
 from .inputs import blend_outdoor, fetch_events, fetch_forecast, fetch_prices
@@ -22,6 +22,7 @@ from .model.dataset import build_grid, parse_rows
 from .model.layout import Layout, Params, default_params
 from .model.solar import irradiance
 from .model.thermal import DIST, build, estimate_hidden
+from .overrides import Overrides
 
 log = logging.getLogger(__name__)
 MIN = 60_000
@@ -82,6 +83,9 @@ class Planner:
         self.collector = collector
         self.ha = ha
         self.airing_now: tuple[int, int] | None = None  # the airing the sensor suggests
+        self.overrides = Overrides(store)
+        self._published: dict[str, str] = {}  # override sensors as last set in Home Assistant
+        self._wake: asyncio.Task | None = None
         self._airing_sent = False
         self.state = PlanState()
         self.dispatcher = FanDispatcher()
@@ -197,6 +201,8 @@ class Planner:
             item = {"start": int(ev["start"].timestamp() * 1000), "end": int(ev["end"].timestamp() * 1000),
                     "summary": ev["summary"], "understood": spec is not None}
             if spec:
+                if spec["action"] == "target":  # the rooms' units may run then, whatever the rules say
+                    spec["units"] = [u.id for u in layout.units if not spec["zones"] or u.zone in spec["zones"]]
                 specs.append({**spec, "start": ev["start"], "end": ev["end"], "name": ev["summary"]})
                 every = "every room" if spec["action"] != "lockout" else "every unit"
                 if spec["action"] == "comfort":
@@ -205,6 +211,8 @@ class Planner:
                     item["effect"] = f"comfort {spec['offset']:+g} K in " + (", ".join(zones[z] for z in spec["zones"]) or every)
                 elif spec["action"] == "no_airing":
                     item["effect"] = "no airing suggested"
+                elif spec["action"] == "target":
+                    item["effect"] = f"{spec['target']:g} °C in " + (", ".join(zones[z] for z in spec["zones"]) or every)
                 else:
                     item["effect"] = "off: " + (", ".join(units[u][0] for u in spec["units"]) or every)
             listing.append(item)
@@ -304,10 +312,16 @@ class Planner:
         for item in listing:
             if not item["understood"]:
                 info["notes"].append(f"calendar event not understood: {item['summary']}")
-        res = resolve(step_starts, step_ends, zids, [u.id for u in layout.units], cfg.defaults, cfg.rule_objs(), events)
+        # overrides: what was reached or is over goes; the rest beats rules and calendar
+        temps = {z: self.live(zmap.get(z, {}).get("thermometer")) for z in zids}
+        for o, why in self.overrides.tick(now_ms, temps):
+            log.info("override over: %s %s (%s)", o.kind, o.zone or o.unit, why)
+        res = resolve(step_starts, step_ends, zids, [u.id for u in layout.units], cfg.defaults, cfg.rule_objs(),
+                      events + self.overrides.specs(now_ms, layout, tz))
 
-        # comfort temperatures: the proxy's target, else the configured one
+        # comfort temperatures: the proxy's target, else the configured one; an override's where it holds
         comfort, functions, proxies = {}, {}, {}
+        none = ComfortFunction("none", "No comfort temperature")
         for z in zids:
             base = cfg.shadow_comfort.get(z, math.nan) if cfg.shadow else math.nan
             for u in layout.units:
@@ -321,10 +335,20 @@ class Planner:
                             break
             if not math.isfinite(base):
                 base = cfg.comfort.get(z, math.nan)
-            if not math.isfinite(base):
+            tg = np.array(res.target.get(z, [math.nan] * N), float)
+            over = np.isfinite(tg)
+            if not math.isfinite(base) and not over.any():
                 continue
-            comfort[z] = base + np.array(res.offset[z])
-            functions[z] = [fns.get(f) or next(iter(fns.values())) for f in res.function[z]]
+            normal = base + np.array(res.offset[z])
+            comfort[z] = np.where(over, tg, normal if math.isfinite(base) else np.nanmax(tg))  # no cost there without a base
+            fl = []
+            for k, f in enumerate(res.function[z]):
+                if over[k]:  # a calendar target goes up or down from what the room would have
+                    f = f if f in OVERRIDE_FUNCTIONS else "override-up" if not math.isfinite(normal[k]) or tg[k] >= normal[k] else "override-down"
+                    fl.append(OVERRIDE_FUNCTIONS[f])
+                else:
+                    fl.append(none if not math.isfinite(base) else fns.get(f) or next(iter(fns.values())))
+            functions[z] = fl
 
         units = []
         uncontrolled = set()  # units the optimizer cannot run at all: off, unknown, or run by their own thermostat
@@ -365,8 +389,11 @@ class Planner:
                     since = (now_ms - datetime.fromisoformat(str(last).replace("Z", "+00:00")).timestamp() * 1000) / MIN
                 except ValueError:
                     pass
+            forced = None if u.id in uncontrolled else self.overrides.forced(u.id, t)
+            if u.id in uncontrolled and self.overrides.run_for(u.id, now_ms):
+                info["notes"].append(f"{u.name} is asked to run, but {note}")
             units.append(mpc.UnitSpec(u.id, u.kind, u.zone, levels=(lo, hi), allowed=allowed, on=running,
-                                      since_min=max(0.0, since), modes=modes))
+                                      since_min=max(0.0, since), modes=modes, forced=forced))
             proxies[u.id] = {"proxy": m.get("proxy"), "state": mode_now, "note": note, "levels": [lo, hi], "anyway": anyway,
                              "running": running, "comfort": comfort.get(u.zone, [None])[0] if u.zone in comfort else None}
 
@@ -376,6 +403,9 @@ class Planner:
         for z in list(comfort):
             here = [u.id for u in layout.units if u.zone == z]
             if here and all(uid in uncontrolled for uid in here):
+                if np.isfinite(res.target.get(z, [math.nan])).any():
+                    info["notes"].append(f"override in {layout.zones[layout.zone_index(z)].name}: "
+                                         f"{proxies[here[0]]['note']}, so nothing there can heat it")
                 del comfort[z], functions[z]
                 info.setdefault("no_comfort", {})[z] = proxies[here[0]]["note"]
                 for uid in here:
@@ -384,9 +414,11 @@ class Planner:
         if cfg.airing.enabled and layout.window_zones:
             airing, info["airing"] = self.airing_spec(now_ms, t, comfort, x0, layout, tz, events)
         pr = mpc.Problem(sysm, t, dist, win, price, x0, comfort, functions, units, st, airing)
+        info["overrides"] = self.overrides.list()
         info["ghi"] = (ghi * 1000).round(0).tolist()  # W/m²
         info["cloud"] = (cloud * 100).round(0).tolist()  # %
         info.update({"units": proxies, "schedule": {"function": res.function, "source": res.source, "offset": res.offset,
+                                                    "target": {z: [None if not math.isfinite(v) else v for v in a] for z, a in res.target.items()},
                                                     "locked": res.locked}, "x0": x0.tolist(), "trained": self.params is not None})
         return pr, info
 
@@ -528,6 +560,8 @@ class Planner:
             info["prices"] = inputs["prices"]
             self.state = PlanState(plan=plan, created=now, error=None, info=info)
             await self.publish_airing(plan, info)
+            await self.publish_overrides()
+            self._arm()
             self.store.put("plan", {"plan": plan.to_dict(), "info": info, "created": now})
             k1 = min(len(plan.t) - 1, int(np.searchsorted(plan.t, now + 2 * 3.6e6)))
             self.store.add_plan(int(now), {
@@ -536,6 +570,123 @@ class Planner:
                 "on": {u: bool(a[0]) for u, a in plan.on.items()},
             })
             log.info("plan: %s, %.2f € over %.0f h, %.1f s", plan.mode, plan.cost["total"], (plan.t[-1] - plan.t[0]) / 3.6e6, plan.seconds)
+
+    # ---- overrides ----
+    def _run_answer(self, uid: str, run, body: dict, now_ms: float, valid: str) -> dict:
+        """A unit asked to run: on, whatever the plan says, and past the proxy's own
+        minimum cycle (force), until the run is over."""
+        layout, params = self.model()
+        unit = next(u for u in layout.units if u.id == uid)
+        plan, k = self.state.plan, None
+        if plan is not None and now_ms - self.state.created <= 15 * MIN:
+            k = plan.step_at(now_ms)
+        modes = [m for m in body.get("modes", ["heat", "cool"]) if m in ("heat", "cool")] or ["heat"]
+        mode = "heat" if unit.kind == "heater" else plan.mode if plan is not None and plan.mode in modes else modes[0]
+        until = datetime.fromtimestamp(run.end / 1000, self.tz()).strftime("%H:%M")
+        answer = {"hvac_mode": mode, "valid_until": valid, "force": True, "reason": f"asked to run until {until}"}
+        decision = {"on": True, "mode": mode, "run": True}
+        if unit.kind == "ac":
+            info = self.state.info.get("units", {}).get(uid, {})
+            lo, hi = info.get("levels", [0, unit.levels - 1])
+            level = lo
+            if k is not None and plan.share[uid][k] >= 0.5:  # the plan knows the run: its heat, as a level
+                tl = self.state.info.get("tout", [5.0])
+                target = abs(float(plan.heat[uid][k])) / max(float(plan.share[uid][k]), 1e-6)
+                level = self.dispatcher.level(params, uid, mode, target, float(tl[min(k, len(tl) - 1)]), (lo, hi), now_ms)
+            answer["fan_level"] = decision["level"] = level
+        if self.cfg.shadow:
+            answer = {"follow": False, "reason": "shadow: would run until " + until}
+        decision["follow"] = answer.get("follow", True)
+        self.store.add_decision(int(now_ms // MIN * MIN), uid, decision)
+        return answer
+
+    async def poke(self, unit_ids) -> None:
+        """Have the units' proxies ask now rather than at their next tick
+        (homeassistant.update_entity; a proxy too old for it asks at its tick)."""
+        umap = self.cfg.mapping.get("units") or {}
+        ids = [p for u in unit_ids if (p := (umap.get(u) or {}).get("proxy"))]
+        if not ids or not self.ha.connected.is_set():
+            return
+        try:
+            await self.ha.service("homeassistant", "update_entity", target={"entity_id": ids})
+        except Exception as e:
+            log.warning("could not refresh %s: %s", ", ".join(ids), e)
+
+    async def add_override(self, kind: str, now_ms: float, **kw):
+        """A new override: planned at once, and the proxies told."""
+        layout = self.cfg.layout_obj()
+        if kind == "run":
+            o = self.overrides.add_run(kw["unit"], kw["minutes"], now_ms, kw.get("source", "ui"))
+            await self.poke([o.unit])  # the answer is 'on' already; the plan follows
+            asyncio.create_task(self._after_change([]))
+        else:
+            zm = (self.cfg.mapping.get("zones") or {}).get(kw["zone"]) or {}
+            o = self.overrides.add_target(kw["zone"], kw["target"], now_ms, self.live(zm.get("thermometer")),
+                                          kw.get("ready_at"), kw.get("hold_min", 0.0), kw.get("until"), kw.get("source", "ui"))
+            asyncio.create_task(self._after_change([u.id for u in layout.units if u.zone == o.zone]))
+        return o
+
+    async def cancel_override(self, **kw) -> list:
+        gone = self.overrides.cancel(**kw)
+        if gone:
+            layout = self.cfg.layout_obj()
+            units = {o.unit for o in gone if o.unit} | {u.id for o in gone if o.zone for u in layout.units if u.zone == o.zone}
+            asyncio.create_task(self._after_change(sorted(units)))
+        return gone
+
+    async def _after_change(self, units: list[str]) -> None:
+        await self.replan(fresh=True)
+        await self.poke(units)
+
+    def _arm(self) -> None:
+        """Wake when an override ends by the clock, so its proxies hear at once."""
+        nxt = self.overrides.next_change(time.time() * 1000)
+        if self._wake is not None and not self._wake.done():
+            self._wake.cancel()
+        if nxt is None:
+            return
+
+        async def wake():
+            await asyncio.sleep(max(0.0, (nxt - time.time() * 1000) / 1000) + 0.5)
+            before = {o.unit or o.zone for o in self.overrides.items}
+            layout = self.cfg.layout_obj()
+            await self.replan(fresh=True)  # ticks the overrides: the one ending goes
+            after = {o.unit or o.zone for o in self.overrides.items}
+            ended = before - after
+            await self.poke([u.id for u in layout.units if u.id in ended or u.zone in ended])
+
+        self._wake = asyncio.create_task(wake())
+
+    async def publish_overrides(self) -> None:
+        """A sensor per room and unit with an override, in Home Assistant: the target
+        (or on) while it holds, off after. Set when it changes."""
+        if not hasattr(self.ha, "set_state") or not self.ha.connected.is_set():
+            return
+        layout = self.cfg.layout_obj()
+        iso = lambda ms: datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat() if ms else None
+        want = {}
+        for z in layout.zones:
+            o = next((x for x in self.overrides.items if x.kind == "target" and x.zone == z.id), None)
+            attrs = {"friendly_name": f"Climate optimizer: override {z.name}", "unit_of_measurement": "°C", "icon": "mdi:thermometer-chevron-up"}
+            if o:
+                attrs.update(ready_at=iso(o.ready_at), until=iso(o.ends_at()), reached=iso(o.reached), source=o.source)
+            want[f"sensor.climate_optimizer_override_{z.id}"] = (f"{o.target:g}" if o else "off", attrs)
+        for u in layout.units:
+            o = next((x for x in self.overrides.items if x.kind == "run" and x.unit == u.id), None)
+            attrs = {"friendly_name": f"Climate optimizer: run {u.name}", "icon": "mdi:timer-play-outline"}
+            if o:
+                attrs.update(until=iso(o.end), source=o.source)
+            want[f"sensor.climate_optimizer_run_{u.id}"] = ("on" if o else "off", attrs)
+        for eid, (state, attrs) in want.items():
+            key = json.dumps([state, attrs], sort_keys=True)
+            if self._published.get(eid) == key:
+                continue
+            try:
+                await self.ha.set_state(eid, state, attrs)
+                self._published[eid] = key
+            except Exception as e:
+                log.warning("override sensor %s: %s", eid, e)
+                return
 
     # ---- answering the proxies ----
     def command(self, body: dict, now_ms: float | None = None) -> dict:
@@ -551,6 +702,9 @@ class Planner:
         valid = datetime.fromtimestamp((now_ms + 3 * MIN) / 1000, timezone.utc).isoformat()
         if uid is None:
             return {"follow": False, "reason": "not a unit of the optimizer"}
+        run = self.overrides.run_for(uid, now_ms)
+        if run is not None:
+            return self._run_answer(uid, run, body, now_ms, valid)
         plan = self.state.plan
         if plan is None or now_ms - self.state.created > 15 * MIN:
             return {"follow": False, "reason": "no current plan" + (f": {self.state.error}" if self.state.error else "")}

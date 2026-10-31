@@ -83,6 +83,7 @@ class UnitSpec:
     on: bool = False  # running now
     since_min: float = 1e9  # minutes in the current on/off state
     modes: tuple[str, ...] = ("heat", "cool")
+    forced: np.ndarray | None = None  # (N,) share of each step it must run (a run override), whatever else holds
 
 
 @dataclass
@@ -388,6 +389,10 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
             on_lb[keep] = 1.0
         if not u.on and u.since_min < s.min_off_min:
             on_ub[starts < s.min_off_min - u.since_min] = 0.0
+        if u.forced is not None:  # asked to run: over lockouts, windows and the pause after a stop
+            f = np.asarray(u.forced, float)
+            on_ub = np.where(f > 0, 1.0, on_ub)
+            on_lb = np.maximum(on_lb, np.where(fine, (f >= 0.5).astype(float), f))
         if fix_on is not None and u.id in fix_on:
             on_lb[fine] = on_ub[fine] = np.round(np.asarray(fix_on[u.id])[fine])
         on = np.concatenate([V.add(int(fine.sum()), lb=on_lb[fine], ub=on_ub[fine], integer=True),

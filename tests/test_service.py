@@ -298,3 +298,100 @@ def test_airing_done_today_counts_the_windows(client):
             cfg.mapping["zones"][z]["windows"] = w
         cfg.airing = old_air
         p.airing_now = None
+
+
+def _see(svc):
+    for s in svc.ha.world.states():
+        svc.collector.states[s["entity_id"]] = s
+
+
+def test_room_override_until_reached(client):
+    svc = client.svc
+    world = svc.ha.world
+    zi = svc.planner.cfg.layout_obj().zone_index("living")
+    world.x[zi] = 20.0
+    _see(svc)
+    o = client.post("/api/overrides", json={"zone": "Wohnzimmer", "target": 23}).json()
+    assert o["zone"] == "living" and o["direction"] == "up" and o["ends_at"] is None
+    assert [x["id"] for x in client.get("/api/overrides").json()] == [o["id"]]
+    r = client.post("/api/plan").json()
+    assert r["plan"]["comfort"]["living"][0] == 23.0
+    assert r["info"]["schedule"]["function"]["living"][0] == "override-up"
+    t = r["plan"]["t"]
+    soon = [v for x, v in zip(t, r["plan"]["share"]["living"]) if x < t[0] + 15 * 60_000]
+    assert max(soon) > 0.5  # heats at once (after the compressor's pause), whatever the price
+    assert world.extra["sensor.climate_optimizer_override_living"][0] == "23"
+    # reached: back to the plan as it was
+    world.x[zi] = 23.0
+    _see(svc)
+    r = client.post("/api/plan").json()
+    assert client.get("/api/overrides").json() == []
+    assert r["plan"]["comfort"]["living"][0] != 23.0 or r["info"]["schedule"]["function"]["living"][0] != "override-up"
+    assert world.extra["sensor.climate_optimizer_override_living"][0] == "off"
+
+
+def test_room_override_by_a_time_and_held(client):
+    import time as _t
+
+    svc = client.svc
+    now = _t.time() * 1000
+    at = now + 3 * 3.6e6
+    o = client.post("/api/overrides", json={"zone": "office", "target": 22.5, "at": int(at), "hold_min": 60}).json()
+    assert o["ready_at"] == int(at)
+    r = client.post("/api/plan").json()
+    t = r["plan"]["t"]
+    k = next(i for i, x in enumerate(t) if x >= at + 15 * 60_000)
+    assert r["plan"]["comfort"]["office"][0] != 22.5 and r["plan"]["comfort"]["office"][k] == 22.5
+    # reached and held: it stays an hour, then goes
+    ov = svc.planner.overrides.items[0]
+    ov.ready_at, ov.reached = int(now - 2 * 3.6e6), int(now - 30 * 60_000)
+    assert svc.planner.overrides.tick(now, {}) == []
+    ov.reached = int(now - 61 * 60_000)
+    assert [why for _, why in svc.planner.overrides.tick(now, {})] == ["held as long as asked"]
+    client.delete("/api/overrides?zone=office")
+
+
+def test_run_override_starts_the_heater_at_once(client):
+    svc = client.svc
+    world = svc.ha.world
+    world.units["bath"]["on"] = False
+    world.pokes.clear()
+    o = client.post("/api/overrides", json={"unit": "climate.bath_proxy", "run_min": 15, "toggle": True}).json()
+    assert o["unit"] == "bath" and o["end"] - o["created"] == 15 * 60_000
+    assert ["climate.bath_proxy"] in world.pokes  # told to ask now ...
+    assert world.units["bath"]["on"] and world.units["bath"]["answer"]["force"]  # ... and running
+    a = client.post("/api/v1/command", json=world.request("bath")).json()
+    assert a["hvac_mode"] == "heat" and a["force"] and a["reason"].startswith("asked to run until")
+    r = client.post("/api/plan").json()
+    assert r["plan"]["share"]["bath"][0] > 0.99
+    assert world.extra["sensor.climate_optimizer_run_bath"][0] == "on"
+    # pressed again: over
+    assert client.post("/api/overrides", json={"unit": "bath", "toggle": True}).json() == {"cancelled": True, "unit": "bath"}
+    assert svc.planner.overrides.run_for("bath", o["created"] + 60_000) is None
+    # a run that is over goes by itself
+    o = client.post("/api/overrides", json={"unit": "bath", "run_min": 15}).json()
+    svc.planner.overrides.items[-1].end = o["created"] - 1
+    client.post("/api/plan")
+    assert client.get("/api/overrides").json() == []
+    assert world.extra["sensor.climate_optimizer_run_bath"][0] == "off"
+
+
+def test_override_validation(client):
+    assert client.post("/api/overrides", json={"zone": "Keller", "target": 22}).status_code == 422
+    assert client.post("/api/overrides", json={"zone": "living", "target": 40}).status_code == 422
+    assert client.post("/api/overrides", json={"zone": "living"}).status_code == 422
+    assert client.post("/api/overrides", json={"unit": "nothing", "run_min": 15}).status_code == 422
+    assert client.post("/api/overrides", json={"unit": "bath", "run_min": 999}).status_code == 422
+
+
+def test_calendar_temperature_event(client):
+    client.put("/api/config", json={"calendar": "calendar.klima"})
+    try:
+        pv = client.get("/api/schedule/preview?days=7&refresh=true").json()
+        ev = next(e for e in pv["calendar"]["events"] if e["summary"] == "Büro: 22,5 °C")
+        assert ev["effect"] == "22.5 °C in Office"
+        k = (4 * 24 + 8) * 2
+        assert pv["target"]["office"][k] == 22.5 and pv["event_zone"]["office"][k]
+        assert pv["target"]["office"][k - 4] is None
+    finally:
+        client.put("/api/config", json={"calendar": ""})

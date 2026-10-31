@@ -201,3 +201,26 @@ def test_airing_that_cannot_fit_is_left_out():
     pr.airing = airing_for(pr, s, per_group={datetime(2026, 1, 14).date(): 2})  # an hour apart, not four
     plan = mpc.solve(pr)
     assert plan.airing == [] and plan.airing_cost is None
+
+
+def test_a_run_keeps_the_heater_on_whatever_the_room():
+    """Asked to run for 15 minutes: on, though the bathroom is warm, electricity dear,
+    and the heater only just stopped (its minimum pause)."""
+    L = default_layout()
+    base = problem(lambda h: 0.9, Ta=(20.5, 19.0, 20.5, 24.5, 19.5))
+    N = base.N
+    units = []
+    for u in L.units:
+        spec = mpc.UnitSpec(u.id, u.kind, u.zone, levels=(0, u.levels - 1))
+        if u.id == "bath":
+            spec.since_min = 2.0  # stopped two minutes ago
+            f = np.clip((np.minimum(base.t[1:], base.t[0] + 15 * MIN) - base.t[:-1]) / np.diff(base.t), 0, 1)
+            spec.forced = f
+        units.append(spec)
+    free = mpc.solve(base)
+    assert free.share["bath"][0] < 0.5  # warm and dear: left off
+    base.units = units
+    plan = mpc.solve(base)
+    first = (base.t[:-1] - base.t[0]) < 14 * MIN
+    assert np.all(plan.share["bath"][first] > 0.99)
+    assert plan.heat["bath"][0] > 0

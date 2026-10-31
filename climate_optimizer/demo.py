@@ -58,6 +58,7 @@ class World:
         self.handlers = []
         self.last_pel = 0.0
         self.extra = {}  # states the optimizer sets itself
+        self.pokes = []  # proxies told to ask now
 
     # ---- weather and prices ----
     def tout_at(self, t: float) -> float:
@@ -95,6 +96,7 @@ class World:
             {"start": at(5, 0), "end": at(7, 0), "summary": "Alle: Frost protection only"},
             {"start": at(2, 9), "end": at(2, 10), "summary": "Zahnarzt"},
             {"start": at(2, 11), "end": at(2, 15), "summary": "Lüften: aus"},
+            {"start": at(4, 7), "end": at(4, 9), "summary": "Büro: 22,5 °C"},
         ]
 
     def forecast(self) -> list[dict]:
@@ -116,6 +118,21 @@ class World:
             body.update({"source_fan_modes": synthetic.FAN_MODES, "source_fan_mode": synthetic.FAN_MODES[st["level"]],
                          "fan_mode": "normal", "fan_mode_offset": 0, "fan_modes": ["quiet", "normal", "boost"], "idle_action": "turn_off"})
         return body
+
+    def poke(self, entity_ids) -> None:
+        """homeassistant.update_entity on proxies: they ask the optimizer now and do what it says."""
+        self.pokes.append(list(entity_ids))
+        for u in self.layout.units:
+            st = self.units[u.id]
+            if f"climate.{u.id}_proxy" not in entity_ids or not self.planner or st["proxy_mode"] != "auto":
+                continue
+            ans = self.planner.command(self.request(u.id), max(self.t, time.time() * 1000))
+            st["answer"] = ans
+            if ans.get("follow", True) and "hvac_mode" in ans:
+                on = ans["hvac_mode"] != "off"
+                if on != st["on"]:
+                    st["since"] = self.t
+                st.update(on=on, level=int(ans.get("fan_level", st["level"])), mode=ans["hvac_mode"] if on else st["mode"])
 
     def step(self) -> None:
         """One minute: ask the optimizer, run the units, move the temperatures."""
@@ -283,6 +300,8 @@ class FakeHA:
             return {target["entity_id"]: {"forecast": self.world.forecast()}}
         if (domain, service) == ("calendar", "get_events"):
             return {target["entity_id"]: {"events": self.world.calendar_events()}}
+        if (domain, service) == ("homeassistant", "update_entity"):
+            self.world.poke(target["entity_id"])
         return {}
 
     async def history(self, *a, **k):

@@ -95,7 +95,7 @@ function zoneColor(zid) {
 }
 function zoneName(zid) { return (S.config?.layout?.zones || []).find(z => z.id === zid)?.name || zid; }
 function unitOf(uid) { return (S.config?.layout?.units || []).find(u => u.id === uid); }
-function fnName(id) { return (S.config?.functions || []).find(f => f.id === id)?.name || id; }
+function fnName(id) { return String(id).startsWith('override') ? 'Override' : (S.config?.functions || []).find(f => f.id === id)?.name || id; }
 function ago(ms) {
   if (!ms) return 'never';
   const s = (Date.now() - ms) / 1000;
@@ -195,13 +195,21 @@ pages.dashboard = async (redraw) => {
     if (ui.anyway && st.shadow) notes.push('<span class="badge">planned anyway</span>');
     if ((z.windows_open || []).length) notes.push('<span class="badge warn">window open</span>');
     const opt = us.proxy_attrs?.optimizer;
+    const ovs = st.overrides || [];
+    const zo = ovs.find(o => o.kind === 'target' && o.zone === u.zone);
+    const ru = ovs.find(o => o.kind === 'run' && o.unit === u.id);
+    const ovLine = [zo ? `<span class="badge on">${esc(overrideText(zo))}<button class="x" data-ov-cancel="${zo.id}" title="Cancel">×</button></span>` : '',
+      ru ? `<span class="badge on">running until ${fmtTime(ru.end, S.tz)}<button class="x" data-ov-cancel="${ru.id}" title="Stop">×</button></span>` : ''].join(' ');
     html += `<div class="card unit-card">
       <div class="top"><span class="name"><i style="background:${zoneColor(u.zone)}"></i>${esc(u.name)}</span>${state}</div>
       <div class="temp">${num(z.temperature, 1)} °C<small>${comfort !== undefined ? `comfort ${num(comfort, 1)} °C` : 'no comfort cost'}</small></div>
-      <div class="line">${comfort !== undefined && fnId ? esc(fnName(fnId)) + (info.schedule.source?.[u.zone]?.[0] && info.schedule.source[u.zone][0] !== 'default' ? ' · ' + esc(info.schedule.source[u.zone][0]) : '')
+      <div class="line">${comfort !== undefined && fnId ? (String(fnId).startsWith('override') ? esc(info.schedule.source?.[u.zone]?.[0] || 'Override')
+        : esc(fnName(fnId)) + (info.schedule.source?.[u.zone]?.[0] && info.schedule.source[u.zone][0] !== 'default' ? ' · ' + esc(info.schedule.source[u.zone][0]) : ''))
         + (P?.comfort_cost?.[u.zone] >= 0.005 ? ` · ${num(P.comfort_cost[u.zone], 2)} € off comfort` : '')
         : info.no_comfort?.[u.zone] ? 'not the plan’s to heat while the unit is off' : 'no comfort temperature'}${next ? ' · ' + next : ''}</div>
       <div class="line">${esc(us.proxy || 'no proxy')}${us.proxy_state ? ' · ' + esc(us.proxy_state) : ''}${opt ? ' · ' + esc(opt) : ''} ${notes.join(' ')}</div>
+      ${ovLine.trim() ? `<div class="line">${ovLine}</div>` : ''}
+      <div class="row card-actions"><button data-ov-zone="${u.zone}" data-ov-unit="${u.id}">Override…</button><button data-run-unit="${u.id}">Run…</button></div>
     </div>`;
   }
   html += '</div>';
@@ -225,6 +233,13 @@ pages.dashboard = async (redraw) => {
   }
   html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Next hours</h3><span class="spacer"></span><div class="chips" id="zone-chips"></div></div><div id="dash-chart"></div></div>`;
   root.innerHTML = html;
+  root.querySelectorAll('[data-ov-zone]').forEach(b => b.onclick = () => overrideDialog(b.dataset.ovZone, b.dataset.ovUnit));
+  root.querySelectorAll('[data-run-unit]').forEach(b => b.onclick = () => runDialog(b.dataset.runUnit));
+  root.querySelectorAll('[data-ov-cancel]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    await api('overrides?id=' + encodeURIComponent(b.dataset.ovCancel), { method: 'DELETE' }).catch(() => null);
+    afterOverride();
+  });
   if (!P) { $('#dash-chart').innerHTML = '<p class="hint">No plan yet.</p>'; return; }
   zoneChips($('#zone-chips'), () => pages.dashboard(true));
   drawTimeline($('#dash-chart'), P, info, S.history);
@@ -254,6 +269,77 @@ function airTile(P, info) {
   if (later.length) sub += ` · then ${later.map(a => (fmtDay(a[0], S.tz) !== fmtDay(now, S.tz) ? fmtDay(a[0], S.tz).split(',')[0] + ' ' : '') + fmtTime(a[0], S.tz)).join(', ')}`;
   sub += ai.done_today >= ai.per_day ? ' · done for today' : ai.done_today ? ` · ${ai.done_today} of ${ai.per_day} done today` : '';
   return `<div class="stat"><div class="k">Airing</div><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div></div>`;
+}
+
+// ---- overrides: a room to a temperature, a unit to run a while -------------------
+function overrideText(o) {
+  const t = `→ ${num(o.target, 1)} °C`;
+  if (o.reached) return `${t} · reached, held until ${fmtTime(o.ends_at, S.tz)}`;
+  const by = o.ready_at ? ` by ${fmtTime(o.ready_at, S.tz)}` : '';
+  const then = o.until ? `, held until ${fmtTime(o.until, S.tz)}` : o.hold_min ? `, then held ${o.hold_min >= 60 ? num(o.hold_min / 60, 1) + ' h' : num(o.hold_min, 0) + ' min'}` : ', then back to the plan';
+  return t + by + then;
+}
+function afterOverride() {
+  // the plan follows in a moment: show the override now, the plan when it is there
+  api('status').then(st => { S.status = st; pills(); if (current === 'dashboard') pages.dashboard(true); }).catch(() => { });
+  setTimeout(() => { if (current === 'dashboard') pages.dashboard(); }, 2500);
+}
+function dialog(html) {
+  const d = document.createElement('dialog');
+  d.className = 'ov-dialog';
+  d.innerHTML = html;
+  document.body.appendChild(d);  // outside the page, so a redraw of the page leaves it alone
+  d.addEventListener('close', () => d.remove());
+  d.querySelector('[data-close]')?.addEventListener('click', () => d.close());
+  d.showModal();
+  return d;
+}
+function overrideDialog(zone, unit) {
+  const z = S.config.layout.zones.find(x => x.id === zone);
+  const cur = S.status.zones?.[zone]?.temperature;
+  const comfort = S.plan?.plan?.comfort?.[zone]?.[0];
+  const start = Math.round(((Number.isFinite(comfort) ? comfort : Number.isFinite(cur) ? cur : 21) + 1) * 2) / 2;
+  const d = dialog(`<form method="dialog"><h3 style="margin-top:0">Bring ${esc(z?.name || zone)} to</h3>
+    <div class="fields">
+      <label class="field">Temperature (°C)<input type="number" name="target" step="0.5" min="5" max="30" value="${start}" required></label>
+      <label class="field">Ready<select name="when"><option value="now">as soon as it can</option><option value="at">by …</option></select></label>
+      <label class="field" data-show="at" hidden>By<input type="time" name="at"></label>
+      <label class="field">Then<select name="hold"><option value="0">back to the plan once reached</option><option value="30">hold 30 min</option><option value="60">hold 1 h</option><option value="120">hold 2 h</option><option value="240">hold 4 h</option><option value="until">hold until …</option></select></label>
+      <label class="field" data-show="until" hidden>Until<input type="time" name="until"></label>
+    </div>
+    <p class="hint">${Number.isFinite(cur) ? `Now ${num(cur, 1)} °C. ` : ''}The plan reaches it whatever electricity costs, and keeps rules and calendar lockouts from stopping the units here; with a time it heats ahead when that is cheapest.</p>
+    <div class="row" style="justify-content:flex-end;gap:8px"><span class="hint" data-msg></span><button type="button" data-close>Cancel</button><button class="primary" value="ok">Start</button></div></form>`);
+  const f = d.querySelector('form');
+  const show = () => {
+    f.querySelector('[data-show=at]').hidden = f.when.value !== 'at';
+    f.querySelector('[data-show=until]').hidden = f.hold.value !== 'until';
+  };
+  f.when.onchange = f.hold.onchange = show;
+  f.onsubmit = async e => {
+    e.preventDefault();
+    const body = { zone, target: +f.target.value, source: 'ui' };
+    if (f.when.value === 'at') body.at = f.at.value;
+    if (f.hold.value === 'until') body.until = f.until.value; else body.hold_min = +f.hold.value;
+    try {
+      await api('overrides', { method: 'POST', body: JSON.stringify(body) });
+      d.close();
+      afterOverride();
+    } catch (err) { d.querySelector('[data-msg]').textContent = err.message; }
+  };
+}
+function runDialog(unit) {
+  const u = S.config.layout.units.find(x => x.id === unit);
+  const d = dialog(`<h3 style="margin-top:0">Run ${esc(u?.name || unit)}</h3>
+    <p class="hint">On at once and for this long, whatever the temperature; then back to the plan.</p>
+    <div class="row" style="gap:8px;flex-wrap:wrap">${[10, 15, 30, 60].map(m => `<button class="${m === 15 ? 'primary' : ''}" data-min="${m}">${m} min</button>`).join('')}</div>
+    <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px"><span class="hint" data-msg></span><button data-close>Cancel</button></div>`);
+  d.querySelectorAll('[data-min]').forEach(b => b.onclick = async () => {
+    try {
+      await api('overrides', { method: 'POST', body: JSON.stringify({ unit, run_min: +b.dataset.min, source: 'ui' }) });
+      d.close();
+      afterOverride();
+    } catch (err) { d.querySelector('[data-msg]').textContent = err.message; }
+  });
 }
 
 function zoneChips(box, redraw) {
@@ -446,7 +532,7 @@ pages.comfort = async (redraw) => {
     <p class="hint">A rule switches a room to another comfort function, moves its comfort temperature, keeps units off, or keeps airing from being suggested, at recurring times. Where rules overlap, the higher priority wins. "Every other week, Monday to Thursday evenings": weekly, every 2 weeks, those four days, 18:00–23:00, starting on a Monday of an "on" week.</p>
     <div id="rule-list"></div></div>`;
   html += `<div class="card"><h3>Calendar</h3><div class="fields"><label class="field">Calendar entity<select id="cal">${entityOptions('calendar', D.calendar, '— no calendar —')}</select></label></div>
-    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K, <code>Lüften: aus</code> suggests no airing then. Rooms match by their name, id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or the names given in Settings; functions by name or id, and Normal, Entspannt, Streng, Frostschutz.</p></div>`;
+    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K, <code>Wohnzimmer: 23 °C</code> has the room at 23 °C from the event's start to its end (heated ahead), <code>Lüften: aus</code> suggests no airing then. Rooms match by their name, id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or the names given in Settings; functions by name or id, and Normal, Entspannt, Streng, Frostschutz.</p></div>`;
   const A = D.airing, windowRooms = L.zones.filter(z => z.windows && (S.config.mapping?.zones?.[z.id]?.windows || []).length);
   const airRule = D.rules.some(r => r.action === 'no_airing' && r.enabled);
   html += `<div class="card"><h3>Airing</h3>
@@ -621,7 +707,7 @@ async function drawPreview(refresh = false) {
   const L = S.config.layout;
   const fnIdx = Object.fromEntries(S.config.functions.map((f, i) => [f.id, i]));
   const per = 24 * 60 / pv.step_min;
-  let html = `<div class="legend" style="margin:0 0 8px">${S.config.functions.map((f, i) => `<span><i style="background:${slot(i)};height:10px;width:10px"></i>${esc(f.name)}</span>`).join('')}</div>`;
+  let html = `<div class="legend" style="margin:0 0 8px">${S.config.functions.map((f, i) => `<span><i style="background:${slot(i)};height:10px;width:10px"></i>${esc(f.name)}</span>`).join('')}<span><i style="background:var(--ink-2);height:10px;width:10px"></i>a set temperature (calendar)</span></div>`;
   if (S.config.airing?.enabled && pv.no_airing) {
     // when the plan may suggest airing: the rules' and the calendar's "no airing" times
     const evAir = (cal.events || []).filter(e => e.understood && e.effect === 'no airing suggested');
@@ -651,8 +737,9 @@ async function drawPreview(refresh = false) {
         const locked = lockUnits.some(l => l?.[k]);
         const fromEvent = pv.event_zone?.[z.id]?.[k] || L.units.some(u => u.zone === z.id && pv.event_unit?.[u.id]?.[k]);
         const off = pv.offset[z.id][k];
+        const tg = pv.target?.[z.id]?.[k];
         const t = pv.start + k * pv.step_min * MIN;
-        html += `<span class="${locked ? 'locked' : ''} ${fromEvent ? 'ev' : ''}" style="background:${slot(fnIdx[fn[k]] ?? 0)}" title="${fmtTime(t, S.tz)} ${esc(fnName(fn[k]))}${off ? ' ' + (off > 0 ? '+' : '') + off + ' K' : ''}${locked ? ' · units off' : ''} (${esc(pv.source[z.id][k])})"></span>`;
+        html += `<span class="${locked ? 'locked' : ''} ${fromEvent ? 'ev' : ''}" style="background:${tg !== null && tg !== undefined ? 'var(--ink-2)' : slot(fnIdx[fn[k]] ?? 0)}" title="${fmtTime(t, S.tz)} ${tg !== null && tg !== undefined ? num(tg, 1) + ' °C' : esc(fnName(fn[k]))}${off ? ' ' + (off > 0 ? '+' : '') + off + ' K' : ''}${locked ? ' · units off' : ''} (${esc(pv.source[z.id][k])})"></span>`;
       }
       html += `</div></div>`;
     }

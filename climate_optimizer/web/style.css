@@ -92,6 +92,13 @@ h3 { font-size: 14px; margin: 0 0 10px; font-weight: 650; }
 .badge.on { background: color-mix(in srgb, var(--s2) 18%, transparent); color: var(--ink); }
 .badge.cool { background: color-mix(in srgb, var(--s1) 18%, transparent); color: var(--ink); }
 .badge.warn { background: color-mix(in srgb, var(--warning) 25%, transparent); color: var(--ink); }
+[hidden] { display: none !important; }
+.badge .x { background: none; border: 0; padding: 0 0 0 6px; font-size: 13px; line-height: 1; color: inherit; }
+.unit-card .card-actions { gap: 6px; margin-top: 8px; }
+.unit-card .card-actions button { padding: 3px 9px; font-size: 12.5px; }
+.ov-dialog { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--ink);
+  padding: 16px 18px; max-width: min(520px, calc(100vw - 32px)); box-shadow: 0 10px 40px rgba(0, 0, 0, 0.18); }
+.ov-dialog::backdrop { background: rgba(0, 0, 0, 0.25); }
 
 .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
 .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }

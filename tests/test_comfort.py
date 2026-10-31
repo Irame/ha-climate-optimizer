@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -138,3 +139,30 @@ def test_parse_event_german_and_aliases():
     assert parse_event("Schlafzimmer: aus", zones, units, fns) == {"action": "lockout", "units": ["bedroom"]}
     assert parse_event("Kinderzimmer: aus", zones, units, fns) is None
     assert parse_event("Kinderzimmer: aus", zones, {**units, "office": ("Office", "office")}, fns, {"office": ["Kinderzimmer"]}) == {"action": "lockout", "units": ["office"]}
+
+
+def test_parse_event_temperature_is_a_target():
+    zones = {"living": "Living room & kitchen", "bedroom": "Bedroom", "bath": "Bathroom"}
+    units = {"living": ("Living room", "living")}
+    fns = {f.id: f.name for f in default_functions()}
+    assert parse_event("Wohnzimmer: 23 °C", zones, units, fns) == {"action": "target", "zones": ["living"], "target": 23.0}
+    assert parse_event("Bad: 22,5", zones, units, fns) == {"action": "target", "zones": ["bath"], "target": 22.5}
+    assert parse_event("Alle: 21°", zones, units, fns) == {"action": "target", "zones": [], "target": 21.0}
+    assert parse_event("Wohnzimmer: +1", zones, units, fns)["action"] == "offset"  # a sign: still a move
+    assert parse_event("Wohnzimmer: 80", zones, units, fns) is None  # not a room temperature
+
+
+def test_resolve_target_beats_lockouts_and_calendar():
+    t0 = datetime(2026, 1, 12, 0, tzinfo=TZ)
+    starts, ends = _steps(t0, 48)
+    rules = [Rule("c", "no AC at night", "lockout", units=["living"], start="00:00", end="06:00")]
+    events = [{"start": t0 + timedelta(hours=2), "end": t0 + timedelta(hours=4), "action": "comfort",
+               "zones": ["living"], "function": "frost", "name": "away"},
+              {"start": t0 + timedelta(hours=3), "end": t0 + timedelta(hours=5), "action": "target", "zones": ["living"],
+               "target": 23.0, "function": "override-up", "units": ["living"], "name": "Override 23 °C", "priority": 20_000,
+               "calendar": False}]
+    r = resolve(starts, ends, ["living", "bedroom"], ["living", "bedroom"], {}, rules, events)
+    assert r.function["living"][4] == "frost" and r.locked["living"][4] and math.isnan(r.target["living"][4])
+    assert r.target["living"][6] == 23.0 and r.function["living"][6] == "override-up" and not r.locked["living"][6]
+    assert r.source["living"][6] == "Override 23 °C" and not r.event_zone["living"][6]
+    assert math.isnan(r.target["bedroom"][6]) and r.locked["living"][11] and math.isnan(r.target["living"][10])

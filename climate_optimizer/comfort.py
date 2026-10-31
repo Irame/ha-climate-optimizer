@@ -15,6 +15,7 @@ Events in a Home Assistant calendar override the rules for single occasions.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -90,6 +91,18 @@ def default_functions() -> list[ComfortFunction]:
         ComfortFunction("frost", "Frost protection only", below=Side(deadband=5.0, linear=0.05, limit=8.0),
                         above=Side(deadband=3.0, linear=0.02)),
     ]
+
+
+# An override's target has its way: a kelvin under it costs more an hour than the
+# electricity to make it up, at any price, so the plan only gets to choose when it
+# heats (or cools) towards it. No limit: the way there is not the plan's to avoid,
+# and a limit would only price it as if it were.
+OVERRIDE_FUNCTIONS = {
+    "override-up": ComfortFunction("override-up", "Override", below=Side(deadband=0.2, linear=1.0, quadratic=0.5),
+                                   above=Side(deadband=1.5, linear=0.05, quadratic=0.0)),
+    "override-down": ComfortFunction("override-down", "Override", below=Side(deadband=1.5, linear=0.05, quadratic=0.0),
+                                     above=Side(deadband=0.2, linear=1.0, quadratic=0.5)),
+}
 
 
 @dataclass
@@ -185,20 +198,27 @@ FUNCTION_ALIASES = {"standard": ("Normal",), "relaxed": ("Entspannt", "Locker"),
                     "frost": ("Frostschutz",)}
 
 
+def zone_lookup(zones: dict[str, str], zone_aliases: dict[str, list[str]] | None = None) -> dict[str, str]:
+    """Every name a room goes by, lower case -> zone id: id, display name, the usual
+    German names, and the aliases set per room."""
+    out = {}
+    for k, v in zones.items():
+        for name in (k, v, *ZONE_ALIASES.get(k, ()), *((zone_aliases or {}).get(k) or ())):
+            out.setdefault(str(name).strip().lower(), k)
+    return out
+
+
 def parse_event(summary: str, zones: dict[str, str], units: dict[str, tuple[str, str]],
                 functions: dict[str, str], zone_aliases: dict[str, list[str]] | None = None) -> dict | None:
     """A calendar event's title as a rule: 'Wohnzimmer: Relaxed' picks a comfort
     function, 'Schlafzimmer: aus' locks the units there, 'Alle: +1' moves the
-    comfort temperature. Names match case-insensitively on id, display name or
+    comfort temperature, 'Wohnzimmer: 23 °C' has the room at 23 °C for the event. Names match case-insensitively on id, display name or
     alias. zones: id -> name; units: id -> (name, zone id); functions: id -> name;
     zone_aliases: id -> more names (the usual German ones are always known)."""
     if ":" not in summary:
         return None
     who, what = (" ".join(x.split()).lower() for x in summary.split(":", 1))
-    znorm = {}
-    for k, v in zones.items():
-        for name in (k, v, *ZONE_ALIASES.get(k, ()), *((zone_aliases or {}).get(k) or ())):
-            znorm.setdefault(str(name).strip().lower(), k)
+    znorm = zone_lookup(zones, zone_aliases)
     unorm = {**{k.lower(): k for k in units}, **{v[0].lower(): k for k, v in units.items()}}
     fnorm = {}
     for k, v in functions.items():
@@ -222,6 +242,9 @@ def parse_event(summary: str, zones: dict[str, str], units: dict[str, tuple[str,
     m = re.fullmatch(r"([+-]\d+(?:[.,]\d+)?)\s*(k|°|°c)?", what)
     if m:
         return {"action": "offset", "zones": zone, "offset": float(m[1].replace(",", "."))}
+    m = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*(°|°c|c|grad)?", what)  # no sign: a temperature to have
+    if m and 5.0 <= float(m[1].replace(",", ".")) <= 30.0:
+        return {"action": "target", "zones": zone, "target": float(m[1].replace(",", "."))}
     if what in fnorm:
         return {"action": "comfort", "zones": zone, "function": fnorm[what]}
     return None
@@ -238,6 +261,7 @@ class Resolved:
     event_zone: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event set the zone's function or offset
     event_unit: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event keeps the unit off
     no_airing: list[bool] = field(default_factory=list)  # no airing to be suggested
+    target: dict[str, list[float]] = field(default_factory=dict)  # an override's temperature, nan where none
 
 
 def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[str], units: list[str],
@@ -250,7 +274,9 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
         if r.enabled:
             active.append((r.priority, i, r.to_dict(), r.intervals(t0, t1)))
     for j, ev in enumerate(events or []):
-        active.append((10_000, j, dict(ev, name=ev.get("name", "calendar"), calendar=True), [(ev["start"], ev["end"])]))
+        # calendar events beat every rule; overrides (priority 20 000) beat the calendar
+        active.append((ev.get("priority", 10_000), j, dict(ev, name=ev.get("name", "calendar"), calendar=ev.get("calendar", True)),
+                       [(ev["start"], ev["end"])]))
     active.sort(key=lambda a: (a[0], a[1]))  # later in the list wins on equal priority
     fn = {z: [defaults.get(z, "standard")] * N for z in zones}
     src = {z: ["default"] * N for z in zones}
@@ -259,6 +285,7 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
     ev_z = {z: [False] * N for z in zones}
     ev_u = {u: [False] * N for u in units}
     no_air = [False] * N
+    tgt = {z: [math.nan] * N for z in zones}
     for _, _, spec, ivs in active:
         if not ivs:
             continue
@@ -284,4 +311,17 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
                         ev_u[u][k] = ev_u[u][k] or bool(spec.get("calendar"))
             elif spec["action"] == "no_airing":
                 no_air[k] = True
-    return Resolved(function=fn, offset=off, locked=lock, source=src, event_zone=ev_z, event_unit=ev_u, no_airing=no_air)
+            elif spec["action"] == "target":
+                for z in (spec.get("zones") or zones):
+                    if z in tgt:
+                        tgt[z][k] = spec["target"]
+                        fn[z][k] = spec.get("function") or "override"  # up or down: the planner sees which
+                        off[z][k] = 0.0
+                        src[z][k] = spec.get("name", "")
+                        ev_z[z][k] = bool(spec.get("calendar"))  # it decides the room alone now
+                for u in spec.get("units") or []:  # the room's units run even where a lockout says no
+                    if u in lock:
+                        lock[u][k] = False
+                        ev_u[u][k] = False
+    return Resolved(function=fn, offset=off, locked=lock, source=src, event_zone=ev_z, event_unit=ev_u, no_airing=no_air,
+                    target=tgt)

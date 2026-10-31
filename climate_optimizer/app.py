@@ -195,8 +195,72 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
                       "training": s.trainer.running, "progress": s.trainer.progress(), "error": s.trainer.error},
             "backfill": s.collector.backfill_status, "units": units, "zones": zones,
             "outdoor": p.live(cfg.mapping.get("outdoor")), "uptime_s": time.time() - s.started, "tz": str(p.tz()),
-            "build": BUILD,
+            "build": BUILD, "overrides": p.overrides.list(),
         })
+
+    # ---- overrides: a room to a temperature, a unit to run a while ----
+    @app.get("/api/overrides", dependencies=[Depends(auth)])
+    async def overrides():
+        return _json(svc().planner.overrides.list())
+
+    @app.post("/api/overrides", dependencies=[Depends(auth)])
+    async def add_override(body: dict):
+        """{zone, target, at?, hold_min?, until?}: the room at target °C, now or by 'at',
+        held hold_min after or until 'until'. {unit, run_min, toggle?}: the unit runs
+        that long whatever the temperature; with toggle, a run going on is ended instead.
+        Rooms and units by id, name, German name, alias, or one of their entities."""
+        from .overrides import find_unit, find_zone, parse_time
+        s = svc()
+        p = s.planner
+        cfg = s.cfgs.config
+        layout = cfg.layout_obj()
+        now = time.time() * 1000
+        tz = p.tz()
+        try:
+            if body.get("unit") is not None:
+                uid = find_unit(layout, cfg.mapping, body["unit"])
+                if uid is None:
+                    raise ValueError(f"no unit {body['unit']!r}")
+                if body.get("toggle") and p.overrides.run_for(uid, now):
+                    await p.cancel_override(unit=uid)
+                    return {"cancelled": True, "unit": uid}
+                minutes = float(body.get("run_min") or 15)
+                if not 1 <= minutes <= 240:
+                    raise ValueError("run_min: 1 to 240 minutes")
+                o = await p.add_override("run", now, unit=uid, minutes=minutes, source=body.get("source", "api"))
+            else:
+                zid = find_zone(layout, cfg.mapping, body.get("zone"))
+                if zid is None:
+                    raise ValueError(f"no room {body.get('zone')!r}")
+                target = float(body["target"])
+                if not 5 <= target <= 30:
+                    raise ValueError("target: 5 to 30 °C")
+                ready = parse_time(body.get("at"), now, tz)
+                until = parse_time(body.get("until"), now, tz)
+                hold = float(body.get("hold_min") or 0)
+                if until is not None and until <= max(now, ready or 0):
+                    raise ValueError("until must come after now and after 'at'")
+                if not 0 <= hold <= 24 * 60:
+                    raise ValueError("hold_min: 0 to 1440")
+                o = await p.add_override("target", now, zone=zid, target=target, ready_at=ready, hold_min=hold,
+                                         until=until, source=body.get("source", "api"))
+        except (KeyError, TypeError, ValueError) as e:
+            raise HTTPException(422, str(e) if not isinstance(e, KeyError) else f"missing {e}")
+        return _json(o.to_dict())
+
+    @app.delete("/api/overrides", dependencies=[Depends(auth)])
+    async def cancel_overrides(zone: str | None = None, unit: str | None = None, id: str | None = None):
+        from .overrides import find_unit, find_zone
+        s = svc()
+        cfg = s.cfgs.config
+        layout = cfg.layout_obj()
+        kw = {"id": id}
+        if zone is not None:
+            kw["zone"] = find_zone(layout, cfg.mapping, zone) or "?"
+        if unit is not None:
+            kw["unit"] = find_unit(layout, cfg.mapping, unit) or "?"
+        gone = await s.planner.cancel_override(**kw)
+        return _json({"cancelled": [o.to_dict() for o in gone]})
 
     @app.get("/api/plan", dependencies=[Depends(auth)])
     async def plan():
@@ -323,6 +387,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         return _json({"start": int(t0.timestamp() * 1000), "step_min": step_min, "function": res.function,
                       "offset": res.offset, "locked": res.locked, "source": res.source,
                       "event_zone": res.event_zone, "event_unit": res.event_unit, "no_airing": res.no_airing,
+                      "target": {z: [None if v != v else v for v in a] for z, a in res.target.items()},
                       "calendar": {"entity": cal["calendar"], "fetched": cal["fetched"], "error": cal["error"],
                                    "events": sorted(listing, key=lambda e: e["start"])}})
 

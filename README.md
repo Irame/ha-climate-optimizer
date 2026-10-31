@@ -24,6 +24,7 @@ subject to the model, each unit's lowest and highest fan level, the outdoor unit
 | `Schlafzimmer: aus` | the bedroom's units stay off |
 | `Alle: +1` | every comfort temperature 1 K higher |
 | `Lüften: aus` | no airing suggested then |
+| `Wohnzimmer: 23 °C` | the living room at 23 °C from the event's start to its end, heated ahead |
 
 Rooms match by their name, their id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or names given per room in Settings; functions by name, id, or Normal, Entspannt, Streng, Frostschutz. The comfort page shows the next two weeks with the calendar's events in them, lists each event with what was made of it, and reloads the calendar on request.
 
@@ -40,6 +41,45 @@ actions:
 ```
 
 The sensor lives until Home Assistant restarts; the next plan, at most five minutes later, sets it again. Setting it takes a token of an administrator. Only the next day with an airing is decided exactly; later ones are a preview, planned again on their day.
+
+**Overrides.** Two kinds, from the dashboard (Override… and Run… on each card), from Home Assistant, or for a room also from the calendar (`Wohnzimmer: 23 °C`):
+
+- *A room to a temperature*: as soon as it can, or by a time ("warm by 18:00", heated ahead when that is cheapest). Then back to the plan once reached, or held for a while or until a time. The target has its way: being under it costs more than electricity, at any price, and rule and calendar lockouts don't keep the room's units off meanwhile (an open window and a proxy that is off still do). One not reached in 12 hours is dropped.
+- *A unit to run*: on at once for some minutes, whatever the temperature, then back to the plan, like a bathroom heater on a button for a quarter of an hour. The plan knows it is running, counts its heat and electricity, and has the rooms around it take that into account.
+
+Overrides are kept across restarts of the optimizer and of Home Assistant. The optimizer has the proxies concerned ask again at once (`homeassistant.update_entity`), so a run starts within a second; a proxy older than that asks at its next tick. Home Assistant sees each as a sensor: `sensor.climate_optimizer_override_<room>` (the target, or `off`) and `sensor.climate_optimizer_run_<unit>` (`on` or `off`, with `until`).
+
+From Home Assistant, with `rest_command` (rooms and units by id, name, German name, or one of their entities, such as the proxy or the switch under it):
+
+```yaml
+rest_command:
+  climate_run:  # a unit on for a while; pressed again, it stops
+    url: http://<host>:8099/api/overrides
+    method: POST
+    content_type: application/json
+    payload: '{"unit": "{{ unit }}", "run_min": {{ minutes | default(15) }}, "toggle": true}'
+  climate_override:  # a room to a temperature; at: "18:00" for warm by then, hold_min: kept that long after
+    url: http://<host>:8099/api/overrides
+    method: POST
+    content_type: application/json
+    payload: '{"zone": "{{ zone }}", "target": {{ target }}, "at": "{{ at | default("") }}", "hold_min": {{ hold_min | default(0) }}}'
+  climate_override_cancel:
+    url: "http://<host>:8099/api/overrides?zone={{ zone }}"
+    method: DELETE
+```
+
+With an API token set, add `headers: {Authorization: !secret climate_optimizer_auth}` with `Bearer <token>` in the secret. A button in the bathroom, here a Shelly's button event, then needs only:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: event.bad_h_t_button  # or the device trigger of the button
+actions:
+  - action: rest_command.climate_run
+    data: {unit: bath, minutes: 15}
+```
+
+The proxy stays in `auto` throughout; no need to switch it off and the heater on by hand, and no timer that a restart could lose.
 
 **Fan levels.** The plan gives each unit a heat output for the current five minutes. A fan level delivers fixed heat, so a target between two levels is met by alternating between them minute by minute.
 
@@ -104,7 +144,7 @@ The proxy sends its state (see the proxy's README). The answer:
 {"hvac_mode": "heat", "fan_level": 2, "valid_until": "2026-10-27T10:05:00+00:00", "reason": "heat 2.1 kW · 24.3 ct/kWh"}
 ```
 
-`hvac_mode` is `heat`, `cool` or `off`, and `fan_level` indexes the proxy's `source_fan_modes`. The answer is valid for three minutes; after that the proxy falls back to its own thermostat. In shadow mode, and for proxies the optimizer doesn't know, the answer is `{"follow": false}`.
+`hvac_mode` is `heat`, `cool` or `off`, and `fan_level` indexes the proxy's `source_fan_modes`. The answer is valid for three minutes; after that the proxy falls back to its own thermostat. During a run override the answer also has `"force": true`: start now, past the proxy's own minimum cycle. In shadow mode, and for proxies the optimizer doesn't know, the answer is `{"follow": false}`.
 
 The proxy's fan mode offset limits the levels: an offset of −1 caps the top level one lower, and +1 raises the lowest level by one.
 
