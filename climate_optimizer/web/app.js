@@ -160,7 +160,7 @@ pages.dashboard = async (redraw) => {
   const root = $('#page-dashboard');
   if (!redraw || !S.plan) {
     await loadBase();
-    [S.plan, S.history] = await Promise.all([api('plan'), api('history?hours=12')]);
+    [S.plan, S.history, S.energyToday] = await Promise.all([api('plan'), api('history?hours=12'), api('energy/days?days=1').catch(() => null)]);
   }
   const st = S.status, P = S.plan?.plan, info = S.plan?.info || {};
   let html = '';
@@ -226,8 +226,9 @@ pages.dashboard = async (redraw) => {
         const top = Object.entries(P.comfort_cost || {}).filter(([, v]) => v >= 0.01).sort((a, b) => b[1] - a[1]).slice(0, 2);
         return top.length ? 'mostly ' + top.map(([z, v]) => `${esc(zoneName(z))} ${num(v, 2)} €`).join(', ') : 'deviations, as priced';
       })()}</div></div>
-      <div class="stat"><div class="k">Starts</div><div class="v">${num(c.starts, 2)} €</div><div class="s">compressor and heater</div></div>
+      <div class="stat"><div class="k">Starts</div><div class="v">${num(c.starts, 2)} €</div><div class="s">compressor wear</div></div>
       ${airTile(P, info)}
+      ${todayTile(P)}
       <div class="stat"><div class="k">Heat missing at the end</div><div class="v">${num(c.terminal, 2)} €</div><div class="s">solved in ${num(P.seconds, 1)} s · ${esc(P.status)}</div></div>
     </div>`;
   }
@@ -411,11 +412,12 @@ function drawTimeline(box, P, info, hist) {
     if (spans.length || S.config.airing?.enabled) rows.push({ name: 'Windows', short: 'Windows', color: css('--muted'), spans });
   }
   g.add({ title: 'Units: recorded, then planned (height: share of each step running)' }).gantt(rows);
-  // price
-  const pp = g.add({ title: 'Electricity price (ct/kWh)', unit: 'ct', height: 120, fmt: v => v.toFixed(0) });
+  // electricity, then its price, on the same time axis (two panels: one scale each)
   const prices = (info.prices || []).filter(p => p[1] > x0).sort((a, b) => a[0] - b[0]);
   const past = (hist?.prices || []).filter(p => p[0] < (prices[0]?.[0] ?? Infinity));
   const all = [...past, ...prices];
+  elecPanel(g, hist, P, all, now);
+  const pp = g.add({ title: 'Electricity price (ct/kWh)', unit: 'ct', height: 120, fmt: v => v.toFixed(0) });
   if (all.length) pp.line({ name: 'Price', color: slot(6), t: all.map(p => p[0]), y: all.map(p => p[2] * 100), step: true, tEnd: all.at(-1)[1] });
   pp.fmt = v => v.toFixed(v < 10 ? 1 : 0);
   // outdoor
@@ -425,6 +427,51 @@ function drawTimeline(box, P, info, hist) {
   if (info.tout) op.line({ name: 'Outdoor (forecast)', legendKey: 'Outdoor', color: slot(0), t: mids, y: info.tout, dash: true, noLegend: true });
   sunPanel(g, hist, info.ghi ? { t: mids, ghi: info.ghi, cloud: info.cloud } : null);
   g.panels.forEach(p => p.draw());
+}
+
+// What the units draw: the phase and the heaters' plugs as measured, then the plan; what it
+// costs an hour at the price of the moment, in the tooltip.
+function elecPanel(g, hist, P, prices, now) {
+  const ep = g.add({ title: 'Electricity (kW): measured on the phase and plugs, then planned', unit: 'kW', height: 110, yMin: 0, fmt: v => v.toFixed(1) });
+  const priceAt = t => { const p = prices.find(p => p[0] <= t && t < p[1]); return p ? p[2] : null; };
+  const color = slot(7);
+  const ct = (t, v) => { const p = priceAt(t); return v === null || p === null ? null : v * p * 100; };
+  if (hist?.t && hist.phase) {
+    const heat = Object.values(hist.heater || {});
+    const t = [], y = [];
+    hist.t.forEach((x, i) => {
+      if (x >= now) return;
+      const v = hist.phase[i];
+      t.push(x);
+      y.push(v === null || v === undefined ? null : v + heat.reduce((a, arr) => a + (arr[i] || 0), 0));
+    });
+    ep.line({ name: 'Electricity', color, t, y, step: true, fill: true, width: 1.5 });
+    ep.line({ name: 'Cost', color: css('--muted'), t, y: t.map((x, i) => ct(x, y[i])), tipOnly: true, unit: 'ct/h', fmt: v => v.toFixed(0) });
+  }
+  if (P?.electric) {
+    const y = [...P.electric, P.electric.at(-1)];
+    ep.line({ name: 'Electricity (plan)', legendKey: 'Electricity', color, t: P.t, y, step: true, dash: true, fill: true, width: 1.5, noLegend: true });
+    ep.line({ name: 'Cost (plan)', color: css('--muted'), t: P.t, y: P.t.map((x, i) => ct(x, y[i])), tipOnly: true, unit: 'ct/h', fmt: v => v.toFixed(0) });
+  }
+  return ep;
+}
+
+// The day so far: measured against what its first plan expected for those hours; what is left, as planned now.
+function todayTile(P) {
+  const d = S.energyToday?.[0];
+  if (!d) return '';
+  const now = Date.now();
+  const done = d.hours.filter(r => r[0] + H <= now);
+  const meas = done.reduce((a, r) => a + (r[2] || 0), 0);
+  const both = done.filter(r => r[1] !== null && r[2] !== null);
+  const plannedThen = both.reduce((a, r) => a + r[1], 0), measThen = both.reduce((a, r) => a + r[2], 0);
+  let rest = 0;
+  if (P) {
+    const midnight = d.start + 24 * H;
+    P.electric.forEach((v, k) => { const a = P.t[k], b = Math.min(P.t[k + 1], midnight); if (b > a) rest += v * (b - a) / H; });
+  }
+  const sub = both.length ? `the day's first plan (${fmtTime(d.forecast_made, S.tz)}) expected ${num(plannedThen, 1)} kWh for those hours (${num(measThen, 1)} measured)` : 'no plan from the start of the day';
+  return `<div class="stat"><div class="k">Today</div><div class="v">${num(meas, 1)} kWh</div><div class="s">so far · ${sub} · ${num(rest, 1)} kWh more planned</div></div>`;
 }
 
 // Sun on the ground after the clouds, the way the model sees it; cloud cover in the tooltip.
@@ -457,7 +504,8 @@ pages.history = async (redraw) => {
     <div class="chips" id="hist-zones"></div></div>
     ${h.error ? `<div class="msg err">${esc(h.error)}</div>` : ''}
     <div class="card"><div id="hist-chart"></div></div>
-    <div class="card"><h3>Energy and cost</h3><div id="hist-sum"></div></div>`;
+    <div class="card"><h3>Energy and cost</h3><div id="hist-sum"></div></div>
+    <div class="card"><h3>Electricity per day: expected and measured</h3><div id="energy-days"><p class="hint">Loading…</p></div></div>`;
   root.querySelectorAll('#hist-range button').forEach(b => b.onclick = () => { S.histHours = +b.dataset.h; S.histLong = null; pages.history(); });
   zoneChips($('#hist-zones'), () => pages.history(true));
   if (!h.t) return;
@@ -490,11 +538,41 @@ pages.history = async (redraw) => {
   const priceAt = t => { const p = pr.find(p => p[0] <= t && t < p[1]); return p ? p[2] : null; };
   if (h.phase) h.t.forEach((t, i) => { const v = h.phase[i]; if (v !== null) { kwh += v / 12; const p = priceAt(t); if (p !== null) eur += v / 12 * p; } });
   const heaterKwh = Object.values(h.heater || {}).reduce((a, arr) => a + arr.reduce((b, v) => b + (v || 0) / 12, 0), 0);
+  api('energy/days?days=14').then(drawEnergyDays).catch(e => { const b = $('#energy-days'); if (b) b.innerHTML = `<p class="hint">${esc(e.message)}</p>`; });
   $('#hist-sum').innerHTML = `<div class="stats">
     <div class="stat"><div class="k">Outdoor unit phase</div><div class="v">${num(kwh, 1)} kWh</div><div class="s">${num(eur, 2)} € at the recorded prices · includes other loads on that phase</div></div>
     <div class="stat"><div class="k">Heaters</div><div class="v">${num(heaterKwh, 1)} kWh</div><div class="s">from their plugs</div></div>
   </div>`;
 };
+
+// Per day: what the day's first plan expected the units to draw, against what they drew, over
+// the same hours; the bars side by side, the numbers beside them (a table, readable without color).
+function drawEnergyDays(days) {
+  const box = $('#energy-days');
+  if (!box) return;
+  const rows = days.slice().reverse();
+  const max = Math.max(0.1, ...rows.map(d => Math.max(d.planned_kwh || 0, d.measured_kwh ?? d.measured_day_kwh ?? 0)));
+  // the bars compare like with like: the hours both have, else the day as measured
+  const bar = (v, color, dash) => v === null || v === undefined ? '' : `<span class="ebar" style="width:${Math.max(1, 100 * v / max).toFixed(1)}%;background:${dash ? 'transparent' : color};border-color:${color}"></span>`;
+  const c = slot(7);
+  let html = `<div class="legend" style="margin:0 0 8px"><span><i style="border:1.5px solid ${c};background:transparent;height:10px;width:10px;box-sizing:border-box"></i>expected by the day's first plan</span><span><i style="background:${c};height:10px;width:10px"></i>measured</span></div>
+    <div class="table-wrap"><table class="energy-days"><tr><th>Day</th><th style="width:38%"></th><th class="num">Expected</th><th class="num">Measured</th><th class="num">Difference</th><th class="num">Whole day</th><th class="num">Cost</th></tr>`;
+  for (const d of rows) {
+    const diff = d.planned_kwh && d.measured_kwh !== null ? (d.measured_kwh - d.planned_kwh) / d.planned_kwh * 100 : null;
+    const hrs = d.compared_hours;
+    const part = d.measured_hours < d.hours.length ? ` (${d.measured_hours} h)` : '';
+    html += `<tr><td>${fmtDay(d.start + 12 * H, S.tz)}</td>
+      <td><div class="ebars">${bar(d.planned_kwh, c, true)}${bar(d.measured_kwh ?? d.measured_day_kwh, c, false)}</div></td>
+      <td class="num" title="${d.forecast_made ? `plan of ${fmtTime(d.forecast_made, S.tz)}, ${hrs} h compared, ${num(d.planned_day_kwh, 1)} kWh for the whole day` : ''}">${d.planned_kwh !== null ? num(d.planned_kwh, 1) + ' kWh' : '–'}${d.planned_kwh !== null && hrs < d.hours.length ? `<div class="hint">${hrs} h</div>` : ''}</td>
+      <td class="num">${d.measured_kwh !== null ? num(d.measured_kwh, 1) + ' kWh' : '–'}</td>
+      <td class="num">${diff !== null ? (diff > 0 ? '+' : '') + num(diff, 0) + ' %' : ''}</td>
+      <td class="num">${d.measured_day_kwh !== null ? num(d.measured_day_kwh, 1) + ' kWh' + part : '–'}</td>
+      <td class="num">${d.measured_eur !== null ? (d.planned_eur !== null ? num(d.planned_eur, 2) + ' → ' : '') + num(d.measured_eur, 2) + ' €' : '–'}</td></tr>`;
+  }
+  const other = rows.reduce((a, d) => a + (d.other_kwh || 0), 0) / Math.max(1, rows.length);
+  html += `</table></div><p class="hint">Expected: what the day's first plan reckoned the units would draw, for the hours it reached and that were measured. Measured: the outdoor unit's phase less what it draws with every unit off (other loads there, about ${num(other, 1)} kWh a day), plus the heaters' plugs. Kept from now on; days before the update show measured only.</p>`;
+  box.innerHTML = html;
+}
 
 // ---- comfort and schedules ----------------------------------------------------
 const DAYS = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
@@ -823,8 +901,9 @@ pages.model = async () => {
           <div class="stat"><div class="k">Base while running</div><div class="v">${num(pl.base ?? pl.standby, 2)} kW</div></div>
           <div class="stat"><div class="k">Electric limit</div><div class="v">${pl.Pmax ? num(pl.Pmax, 2) + ' kW' : '–'}</div><div class="s">${pc.hours_at_limit > 0.5 ? `reached for ${num(pc.hours_at_limit, 1)} h` : 'not reached yet: at least this'}</div></div>
           <div class="stat"><div class="k">Extra at high load</div><div class="v">${num((pl.kq || 0) * 1000, 1)} W/kW²</div></div>
+          <div class="stat"><div class="k">Each start</div><div class="v">${num((pl.Estart || 0) * 1000, 0)} Wh</div><div class="s">${pc.starts_per_day !== undefined ? `${num(pc.starts_per_day, 1)} starts a day` : 'beyond running'}</div></div>
         </div>
-        <p class="hint">What all units together draw on the phase, against the heat they deliver: a base whenever the outdoor unit runs at all, the heat over the efficiency, and an extra that grows with the square of the total, up to the limit. Little heat is dear by the base, a lot by the extra; the plan bundles heating where it can and keeps clear of full load. The dots are five-minute steps the phase measured, with heat as the model reckons it (it is not measured).</p>
+        <p class="hint">What all units together draw on the phase, against the heat they deliver: a base whenever the outdoor unit runs at all, the heat over the efficiency, and an extra that grows with the square of the total, up to the limit; and a little energy for each start (the spike when it comes on), which has the plan run it fewer, longer times. Little heat is dear by the base, a lot by the extra; the plan bundles heating where it can and keeps clear of full load. The dots are five-minute steps the phase measured, with heat as the model reckons it (it is not measured).</p>
       </div><div><div id="plant-chart"></div><p class="hint" style="margin:4px 0 0">Electricity (kW) against heat (kW), at 7 °C outside and 21 °C inside.</p></div></div></div>`;
     }
     if (rep.validation?.length) {
@@ -913,8 +992,9 @@ pages.model = async () => {
 // ---- settings ---------------------------------------------------------------------
 const SETTING_FIELDS = [
   ['horizon_min_h', 'Plan at least (h)', 1], ['horizon_max_h', 'Plan at most (h)', 1],
-  ['min_run_min', 'Minimum run (min)', 1], ['min_off_min', 'Minimum pause (min)', 1],
-  ['start_cost', 'Cost of a compressor start (€)', 0.01], ['heater_start_cost', 'Cost of a heater start (€)', 0.001],
+  ['min_run_min', 'Compressor: minimum run (min)', 1], ['min_off_min', 'Compressor: minimum pause (min)', 1],
+  ['start_cost', 'Compressor: wear per start (€)', 0.01],
+  ['heater_min_run_min', 'Heaters: minimum run (min)', 1], ['heater_min_off_min', 'Heaters: minimum pause (min)', 1],
   ['terminal_quantile', 'Value heat left at the end at this price quantile', 0.05],
   ['window_assume_open_min', 'An open window closes after (min)', 1],
   ['heat_below_outdoor', 'Heat only if colder outside than (°C)', 0.5], ['cool_above_outdoor', 'Cool only if warmer outside than (°C)', 0.5],
@@ -983,7 +1063,7 @@ pages.settings = async () => {
     </div><p class="hint">For the phases, the car and the heater an energy meter (kWh) is the better choice where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, where a power sensor's reports miss what happens between them. Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
   html += `<div class="card"><h3>Optimizer</h3><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
     <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
-    <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents. On/off is decided as such for the first quarter hour; after that the plan counts what share of each step a unit runs.</p></div>`;
+    <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents (its electricity, the spike when it comes on, is learned with the model). Heaters have no compressor to spare: no cost to a start, and their own, short minimum run and pause. On/off is decided as such for the first quarter hour; after that the plan counts what share of each step a unit runs.</p></div>`;
   html += `<div class="card"><h3>Training</h3><div class="fields">
     <label class="field">Retrain every night at (hour)<input type="number" min="0" max="23" data-path="retrain_hour" value="${C.retrain_hour}"></label>
     <label class="field">History kept and trained on (days)<input type="number" min="3" max="365" data-path="history_days" value="${C.history_days}"></label></div>

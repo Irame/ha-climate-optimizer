@@ -58,6 +58,8 @@ def matching_params(params: Params | None, layout: Layout) -> Params:
         base.plant["base"] = params.plant.get("standby", 0.03)
         base.plant.pop("kq", None)
         base.plant.pop("Pmax", None)
+    if "Estart" not in params.plant:  # trained before a start had an energy of its own
+        base.plant["Estart"] = 0.0
     base.building.update(params.building)
     return base
 
@@ -562,6 +564,7 @@ class Planner:
             await self.publish_airing(plan, info)
             await self.publish_overrides()
             self._arm()
+            self.record_forecast(plan, now)
             self.store.put("plan", {"plan": plan.to_dict(), "info": info, "created": now})
             k1 = min(len(plan.t) - 1, int(np.searchsorted(plan.t, now + 2 * 3.6e6)))
             self.store.add_plan(int(now), {
@@ -687,6 +690,28 @@ class Planner:
             except Exception as e:
                 log.warning("override sensor %s: %s", eid, e)
                 return
+
+    def record_forecast(self, plan: mpc.Plan, now_ms: float) -> None:
+        """The day's first plan, kept: what it expected the units to draw, hour by hour
+        and as far as it reached. Set against what they drew, on the History page."""
+        tz = self.tz()
+        day = datetime.fromtimestamp(now_ms / 1000, tz).date()
+        fc = self.store.get("forecasts") or {}
+        if day.isoformat() in fc:
+            return
+        hours, eur = {}, 0.0
+        dts = np.diff(plan.t) / 3.6e6
+        for k, dt in enumerate(dts):
+            a = datetime.fromtimestamp(plan.t[k] / 1000, tz)
+            if a.date() != day:
+                continue
+            h = str(int(a.replace(minute=0, second=0, microsecond=0).timestamp() * 1000))
+            hours[h] = hours.get(h, 0.0) + float(plan.electric[k]) * dt
+            eur += float(plan.electric[k]) * dt * float(plan.price[k])
+        old = (day - timedelta(days=90)).isoformat()
+        fc = {d: v for d, v in fc.items() if d >= old}
+        fc[day.isoformat()] = {"made": int(now_ms), "hours": {h: round(v, 4) for h, v in hours.items()}, "eur": round(eur, 4)}
+        self.store.put("forecasts", fc)
 
     # ---- answering the proxies ----
     def command(self, body: dict, now_ms: float | None = None) -> dict:

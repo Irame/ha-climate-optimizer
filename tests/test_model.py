@@ -190,3 +190,17 @@ def test_grid_takes_power_from_a_meter():
     b = build_grid(p, layout, {**m, "phase": "sensor.phase_l2_energie"}).phase
     ok = np.isfinite(a) & np.isfinite(b)
     assert ok.mean() > 0.95 and np.abs(a[ok] - b[ok]).max() < 0.01
+
+
+def test_start_energy_shows_at_the_starts(trained):
+    layout, truth, grid, _, _ = trained
+    p = default_params(layout)
+    p.plant["Estart"] = 0.0
+    _, a = fit.simulate_windows(layout, p, grid, np.array([0]), grid.K - 1)
+    p.plant["Estart"] = 0.05
+    _, b = fit.simulate_windows(layout, p, grid, np.array([0]), grid.K - 1)
+    ac = [u.id for u in layout.ac_units]
+    run = np.max([grid.unit_running(u) for u in ac], axis=0)
+    starts = np.clip(run[1:] - run[:-1], 0, 1) * (run[:-1] < 0.5)
+    extra = (b - a)[0].sum() * grid.dt_h
+    assert starts.sum() > 3 and extra == pytest.approx(0.05 * starts[: grid.K - 2].sum(), rel=0.05)

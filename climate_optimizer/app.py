@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
 import gzip
 import json
@@ -93,9 +94,7 @@ class Service:
             await _sleep_until(self.stop, 600, offset=30)
             cfg = self.cfgs.config
             rep = self.planner.report or {}
-            done = (rep.get("finished") or 0) / 1000
-            hour = datetime.now(self.planner.tz()).hour
-            if self.ha.connected.is_set() and hour == cfg.retrain_hour and time.time() - done > 20 * 3600:
+            if self.ha.connected.is_set() and retrain_due((rep.get("finished") or 0) / 1000, datetime.now(self.planner.tz()), cfg.retrain_hour):
                 await self.trainer.run()
 
     async def config_changed(self, old, new) -> None:
@@ -322,6 +321,12 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         out["predicted_1h"] = pred
         return _json(out)
 
+    @app.get("/api/energy/days", dependencies=[Depends(auth)])
+    async def energy(days: int = 14):
+        s = svc()
+        days = max(1, min(days, 60))
+        return _json(await asyncio.to_thread(energy_days, s, days))
+
     @app.get("/api/config", dependencies=[Depends(auth)])
     async def get_config():
         return svc().cfgs.config.public()
@@ -454,6 +459,95 @@ def _to_ms(v):
 def _r(a, d=2):
     a = np.asarray(a, dtype=float)
     return [None if not np.isfinite(x) else round(float(x), d) for x in a]
+
+
+def retrain_due(done_s: float, now: datetime, hour: int) -> bool:
+    """In the retrain hour, unless trained since it began (a training by hand in the
+    evening does not skip the night's: that one has the evening's data too)."""
+    if now.hour != hour:
+        return False
+    return done_s < now.replace(minute=0, second=0, microsecond=0).timestamp()
+
+
+def energy_days(s, days: int) -> list[dict]:
+    """Per day: the units' electricity as the day's first plan expected it, and as
+    measured (the outdoor unit's phase, less what it draws with every unit off, plus
+    the heaters' plugs), hour by hour."""
+    cfg = s.cfgs.config
+    p = s.planner
+    tz = p.tz()
+    layout, _ = p.model()
+    now = datetime.now(tz)
+    day0 = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    start, end = int(day0.timestamp() * 1000), int(now.timestamp() * 1000)
+    fc = s.store.get("forecasts") or {}
+    ph = s.store.get("price_history") or {}
+    prices = sorted((int(k), v[0], v[1]) for k, v in ph.items())
+    # measured, from the 5-minute grid; other loads on the phase from all-off times, by hour of day
+    meas, other_h = {}, {}
+    try:
+        ex = s.store.export(tracked_entities(cfg.mapping), int(start - 7 * 864e5), end, s.collector.meta, {**p.location(), "tz": str(tz)})
+        g = build_grid(parse_rows(ex), layout, p.mapping(), min_hours=1)
+    except ValueError:
+        g = None
+    if g is not None:
+        ac = [u.id for u in layout.ac_units]
+        anyon = np.max([g.unit_running(u) for u in ac], axis=0) if ac else np.zeros(g.K)
+        heat = sum(g.heater_kw.values()) if g.heater_kw else np.zeros(g.K)
+        hod = np.array([datetime.fromtimestamp(t / 1000, tz).hour for t in g.t])
+        off = (anyon < 0.01) & np.isfinite(g.phase)
+        overall = float(np.nanmean(g.phase[off])) if off.any() else 0.0
+        prof = np.array([float(np.nanmean(g.phase[off & (hod == h)])) if (off & (hod == h)).sum() >= 12 else overall for h in range(24)])
+        for k in range(g.K):
+            if g.t[k] < start or not np.isfinite(g.phase[k]):
+                continue
+            a = datetime.fromtimestamp(g.t[k] / 1000, tz)
+            h = int(a.replace(minute=0, second=0, microsecond=0).timestamp() * 1000)
+            m = meas.setdefault(h, [0.0, 0.0, 0.0, 0])  # phase, heaters, other loads (kWh), steps
+            m[0] += float(g.phase[k]) * g.dt_h
+            m[1] += float(np.nan_to_num(heat[k])) * g.dt_h
+            m[2] += prof[hod[k]] * g.dt_h
+            m[3] += 1
+        other_h = {h: v[2] for h, v in meas.items()}
+
+    p_starts = [a for a, _, _ in prices]
+
+    def price_at(t):
+        i = bisect.bisect_right(p_starts, t) - 1
+        return prices[i][2] if i >= 0 and prices[i][0] <= t < prices[i][1] else None
+
+    out = []
+    for i in range(days):
+        d = (day0 + timedelta(days=i)).date()
+        f = fc.get(d.isoformat())
+        rows = []
+        midnight = datetime.combine(d, datetime.min.time(), tz).timestamp()
+        for hh in range(25):  # 23 to 25 hours, as the clocks go
+            t = datetime.fromtimestamp(midnight + hh * 3600, tz)
+            if t.date() != d:
+                break
+            h = int(t.timestamp() * 1000)
+            m = meas.get(h)
+            whole = m is not None and m[3] >= 0.8 * 3600 / (g.dt_h * 3600) and h + 3_600_000 <= end  # a finished, recorded hour
+            units = max(0.0, m[0] - m[2]) + m[1] if whole else None
+            planned = (f or {}).get("hours", {}).get(str(h))
+            rows.append([h, planned, None if units is None else round(units, 4), price_at(h)])
+        covered = [r for r in rows if r[1] is not None and r[2] is not None]
+        measured = [r for r in rows if r[2] is not None]
+        out.append({
+            "date": d.isoformat(), "start": rows[0][0] if rows else None,
+            "forecast_made": (f or {}).get("made"),
+            "planned_kwh": round(sum(r[1] for r in covered), 3) if covered else None,  # the hours both have
+            "measured_kwh": round(sum(r[2] for r in covered), 3) if covered else None,
+            "planned_day_kwh": round(sum((f or {}).get("hours", {}).values()), 3) if f else None,
+            "measured_day_kwh": round(sum(r[2] for r in measured), 3) if measured else None,
+            "measured_hours": len(measured), "compared_hours": len(covered),
+            "planned_eur": round(sum(r[1] * r[3] for r in covered if r[3] is not None), 3) if covered else None,
+            "measured_eur": round(sum(r[2] * r[3] for r in measured if r[3] is not None), 3) if measured else None,
+            "other_kwh": round(sum(other_h.get(r[0], 0.0) for r in rows), 3),
+            "hours": rows,
+        })
+    return out
 
 
 def _json(obj):

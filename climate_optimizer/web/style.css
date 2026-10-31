@@ -197,3 +197,6 @@ button:disabled { opacity: 0.5; cursor: default; }
 .multi .x { border: none; background: none; padding: 0 4px; font-size: 14px; line-height: 1; color: var(--ink-2); cursor: pointer; }
 .multi .x:hover { color: var(--critical); }
 .multi select { flex: 1; min-width: 140px; }
+
+.ebars { display: flex; flex-direction: column; gap: 2px; min-width: 80px; }
+.ebar { display: block; height: 6px; border-radius: 0 3px 3px 0; border: 1.5px solid; box-sizing: border-box; }

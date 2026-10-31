@@ -221,6 +221,40 @@ def test_a_run_keeps_the_heater_on_whatever_the_room():
     assert free.share["bath"][0] < 0.5  # warm and dear: left off
     base.units = units
     plan = mpc.solve(base)
-    first = (base.t[:-1] - base.t[0]) < 14 * MIN
-    assert np.all(plan.share["bath"][first] > 0.99)
+    inside = base.t[1:] <= base.t[0] + 15 * MIN  # the steps the run covers whole
+    assert inside.sum() >= 3 and np.all(plan.share["bath"][inside] > 0.99)
     assert plan.heat["bath"][0] > 0
+
+
+def test_heaters_have_their_own_short_cycle_times():
+    """A heater may switch back on a minute after it stopped; an AC unit waits its pause."""
+    L = default_layout()
+    base = problem(lambda h: 0.3, Ta=(18.0, 17.0, 18.0, 19.0, 18.0))
+    units = []
+    for u in L.units:
+        spec = mpc.UnitSpec(u.id, u.kind, u.zone, levels=(0, u.levels - 1), since_min=2.0)  # both stopped 2 min ago
+        units.append(spec)
+    base.units = units
+    plan = mpc.solve(base)
+    assert plan.share["bath"][0] > 0.99  # cold, and a heater need not wait
+    assert all(plan.share[u.id][0] < 0.01 for u in L.ac_units)  # the compressor waits its 10 minutes
+    assert plan.cost["starts"] == pytest.approx(sum(base.settings.start_cost * float(plan.share[u.id][k] > 0.5 and (k == 0 or plan.share[u.id][k - 1] < 0.5))
+                                                    for u in L.ac_units for k in range(base.N)), abs=0.05)
+
+
+def test_start_energy_counts_and_bundles():
+    """A start of the outdoor unit costs energy of its own: dear starts mean fewer of them."""
+    cheap = problem(lambda h: 0.3)
+    p = cheap.sys.params
+    p.plant["Estart"] = 0.0
+    a = mpc.solve(cheap)
+    dear = problem(lambda h: 0.3)
+    dear.sys.params.plant["Estart"] = 0.5  # half a kWh per start: absurd, to see it
+    b = mpc.solve(dear)
+
+    def starts(plan):
+        on = np.max([plan.share[u] for u in ("office", "bedroom", "living")], axis=0) > 0.5
+        return int(np.sum(on[1:] & ~on[:-1]) + on[0])
+
+    assert starts(b) <= starts(a)
+    assert b.cost["energy"] > a.cost["energy"] or starts(b) < starts(a)

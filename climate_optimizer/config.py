@@ -123,6 +123,7 @@ class Config(BaseModel):
         d["ha"]["token"] = "********" if self.ha.token else ""
         d["api_token"] = "********" if self.api_token else ""
         d["env"] = {"ha_url": bool(os.environ.get("HA_URL")), "ha_token": bool(os.environ.get("HA_TOKEN"))}
+        d["settings"] = self.settings_obj().__dict__  # every setting, the ones added since saved included
         return d
 
 

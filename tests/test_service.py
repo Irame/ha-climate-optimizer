@@ -395,3 +395,40 @@ def test_calendar_temperature_event(client):
         assert pv["target"]["office"][k - 4] is None
     finally:
         client.put("/api/config", json={"calendar": ""})
+
+
+def test_energy_per_day_planned_and_measured(client):
+    svc = client.svc
+    svc.store.put("forecasts", {})
+    client.post("/api/plan")
+    fc = svc.store.get("forecasts")
+    assert len(fc) == 1
+    (day, f), = fc.items()
+    assert f["hours"] and all(v >= 0 for v in f["hours"].values())
+    client.post("/api/plan")  # the day's first plan stays the one kept
+    assert svc.store.get("forecasts")[day]["made"] == f["made"]
+    days = client.get("/api/energy/days?days=3").json()
+    assert [d["date"] for d in days][-1] == day and len(days) == 3
+    today = days[-1]
+    assert today["forecast_made"] == f["made"] and today["planned_day_kwh"] > 0
+    assert today["compared_hours"] == 0 and today["planned_kwh"] is None  # the plan's hours have not come yet
+    assert 23 <= len(today["hours"]) <= 25
+    assert days[0]["planned_kwh"] is None and days[0]["measured_day_kwh"] > 0  # the demo's history: measured only
+    # an hour that has come and gone, planned and measured, is compared
+    t = days[0]["hours"][5][0]
+    svc.store.put("forecasts", {**svc.store.get("forecasts"), days[0]["date"]: {"made": t - 1, "hours": {str(t): 0.5}, "eur": 0.1}})
+    d0 = client.get("/api/energy/days?days=3").json()[0]
+    assert d0["compared_hours"] == 1 and d0["planned_kwh"] == 0.5 and d0["measured_kwh"] is not None
+
+
+def test_retrain_due():
+    from zoneinfo import ZoneInfo
+
+    from climate_optimizer.app import retrain_due
+
+    tz = ZoneInfo("Europe/Berlin")
+    at3 = datetime(2026, 10, 31, 3, 5, tzinfo=tz)
+    evening = datetime(2026, 10, 30, 21, 28, tzinfo=tz).timestamp()
+    assert retrain_due(evening, at3, 3)  # a training by hand in the evening does not skip the night's
+    assert not retrain_due(datetime(2026, 10, 31, 3, 1, tzinfo=tz).timestamp(), at3, 3)  # done this hour already
+    assert not retrain_due(evening, at3.replace(hour=4), 3)

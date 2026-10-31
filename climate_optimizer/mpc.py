@@ -54,10 +54,11 @@ class Settings:
     fine_h: float = 2.0  # 5-minute steps up to here
     binary_h: float = 0.25  # on/off decided as such up to here, as a share of each step after
     mid_h: float = 6.0  # 15-minute steps up to here, 30 after
-    start_cost: float = 0.03  # € per compressor start
-    heater_start_cost: float = 0.002  # € per heater switch-on
-    min_run_min: float = 15.0
+    start_cost: float = 0.03  # € per compressor start (wear; its electricity is the model's)
+    min_run_min: float = 15.0  # the AC units (the compressor)
     min_off_min: float = 10.0
+    heater_min_run_min: float = 1.0  # heaters: no compressor to spare, no cost to a start
+    heater_min_off_min: float = 1.0
     terminal_quantile: float = 0.25  # missing heat at the end is valued at this price quantile
     window_assume_open_min: float = 10.0  # an open window is assumed closed after this
     season: str = "auto"  # auto | heat | cool
@@ -381,14 +382,15 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         on_ub = allowed.astype(float)
         on_lb = np.zeros(N)
         starts = (pr.t[:-1] - pr.t[0]) / MIN  # minutes from now to each step's start
-        if u.on and u.since_min < s.min_run_min:
-            keep = starts < s.min_run_min - u.since_min
+        min_run, min_off = (s.min_run_min, s.min_off_min) if u.kind == "ac" else (s.heater_min_run_min, s.heater_min_off_min)
+        if u.on and u.since_min < min_run:
+            keep = starts < min_run - u.since_min
             blocked = np.flatnonzero(~allowed)
             if len(blocked):
                 keep[blocked[0]:] = False  # a lockout ends the minimum run early
             on_lb[keep] = 1.0
-        if not u.on and u.since_min < s.min_off_min:
-            on_ub[starts < s.min_off_min - u.since_min] = 0.0
+        if not u.on and u.since_min < min_off:
+            on_ub[starts < min_off - u.since_min] = 0.0
         if u.forced is not None:  # asked to run: over lockouts, windows and the pause after a stop
             f = np.asarray(u.forced, float)
             on_ub = np.where(f > 0, 1.0, on_ub)
@@ -397,7 +399,7 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
             on_lb[fine] = on_ub[fine] = np.round(np.asarray(fix_on[u.id])[fine])
         on = np.concatenate([V.add(int(fine.sum()), lb=on_lb[fine], ub=on_ub[fine], integer=True),
                              V.add(int((~fine).sum()), lb=on_lb[~fine], ub=on_ub[~fine])])
-        st = V.add(N, lb=0.0, ub=1.0, c=s.start_cost if u.kind == "ac" else s.heater_start_cost)
+        st = V.add(N, lb=0.0, ub=1.0, c=s.start_cost if u.kind == "ac" else 0.0)
         for k in range(N):
             R.add([q[k], on[k]], [1.0, -hi[k]], hi=0.0)
             R.add([q[k], on[k]], [1.0, -lo[k]], lo=0.0)
@@ -408,14 +410,14 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                 R.add([st[k], on[k], prev], [1.0, -1.0, 1.0], lo=0.0)
             # minimum run and off time after a switch at k
             for j in range(k + 1, N):
-                if starts[j] - starts[k] >= s.min_run_min:
+                if starts[j] - starts[k] >= min_run:
                     break
                 if prev is None:
                     R.add([on[j], on[k]], [1.0, -1.0], lo=-float(u.on))
                 else:
                     R.add([on[j], on[k], prev], [1.0, -1.0, 1.0], lo=0.0)
             for j in range(k + 1, N):
-                if starts[j] - starts[k] >= s.min_off_min:
+                if starts[j] - starts[k] >= min_off:
                     break
                 if prev is None:
                     R.add([on[k], on[j]], [-1.0, 1.0], hi=1.0 - float(u.on))
@@ -431,7 +433,7 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
     # an extra that grows with the square of the total heat (convex, so exact in
     # pieces), and an electric limit for all of it.
     ac = [j for j, u in enumerate(U) if u.kind == "ac"]
-    extra_vars, extra_slope = [], None
+    extra_vars, extra_slope, ostart = [], None, None
     if ac:
         qmax = params.plant.get("Qmax", 7.0)
         cap = qmax * (capacity_factor(params, tout) if mode == "heat" else np.full(N, 0.9))
@@ -439,10 +441,19 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         kq = params.plant.get("kq", 0.0)
         pmax = params.plant.get("Pmax")
         anyon = V.add(N, lb=0.0, ub=1.0, c=base_kw * pr.price * dts)
+        # a start of the outdoor unit draws a little energy of its own (the spike when it comes on)
+        e_start = params.plant.get("Estart", 0.0)
+        ostart = V.add(N, lb=0.0, ub=1.0, c=e_start * pr.price) if e_start > 0 else None
+        running_now = float(any(u.on for u in U if u.kind == "ac"))
         if kq > 0:
             edges = np.array(EXTRA_EDGES)
             extra_slope = kq * (edges[1:] ** 2 - edges[:-1] ** 2) / np.diff(edges)  # kW of electricity per kW of heat
         for k in range(N):
+            if ostart is not None:
+                if k == 0:
+                    R.add([ostart[0], anyon[0]], [1.0, -1.0], lo=-running_now)
+                else:
+                    R.add([ostart[k], anyon[k], anyon[k - 1]], [1.0, -1.0, 1.0], lo=0.0)
             R.add([Q[j][k] for j in ac], [1.0] * len(ac), hi=float(cap[k]))
             for j in ac:
                 R.add([anyon[k], ON[j][k]], [1.0, -1.0], lo=0.0)
@@ -582,6 +593,8 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         sb = plant_base(params) * np.max([share[U[j].id] for j in ac], axis=0)
         if extra_vars:
             sb = sb + np.array([float(np.dot(x[seg], extra_slope)) for seg in extra_vars])
+        if ostart is not None:  # a start's energy, as power over its step
+            sb = sb + params.plant["Estart"] * np.clip(x[ostart], 0.0, 1.0) / dts
         electric += sb
         energy += float(np.sum(sb * pr.price * dts))
     starts_cost = float(sum(np.dot(x[ST[j]], V.c[ST[j][0]:ST[j][-1] + 1]) for j in range(nu)))

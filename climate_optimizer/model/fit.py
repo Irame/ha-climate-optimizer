@@ -75,6 +75,8 @@ def param_list(layout: Layout, params: Params) -> list[P]:
             # the outdoor unit: its base shows in the power at low load, its limit where the power stops rising
             P(("plant", "base"), "log", 0.8, 0.02, measured=0.5), P(("plant", "kq"), "log", 1.0, 1e-4),
             P(("plant", "Pmax"), "log", 0.3, 0.3, measured=1.0),
+            # what a start draws beyond running: the spike on the phase when the outdoor unit comes on
+            P(("plant", "Estart"), "log", 1.0, 1e-3, measured=0.5),
             P(("building", "Tnb"), "lin", 2.0)]
     if any(z.solar for z in layout.zones):
         out.append(P(("building", "solar_air"), "unit", 1.0))
@@ -282,6 +284,12 @@ def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray
     ac_zone = [layout.zone_index(layout.units[j].zone) for j in ac_idx]
     win_zone = [layout.zone_index(z) for z in layout.window_zones]
     running = np.max([grid.unit_running(layout.units[i].id) for i in ac_idx], axis=0) if ac_idx else None
+    # the outdoor unit's starts: running from (nearly) off, as energy over the step it starts in
+    e_start = params.plant.get("Estart", 0.0)
+    started = np.zeros(grid.K)
+    if ac_idx and e_start > 0:
+        started[1:] = np.clip(running[1:] - running[:-1], 0.0, 1.0) * (running[:-1] < 0.5)
+    p_start = e_start * started / grid.dt_h
     for j in range(L):
         ks = k0s + j
         q = unit_heat(params, layout, grid, ks)  # (nw, nu), as asked
@@ -291,6 +299,7 @@ def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray
         if ac_idx:
             qd, pe = outdoor_unit(params, q[:, ac_idx], X[:, ac_zone], grid.tout[ks], running[ks])
             q[:, ac_idx] = qd  # what the outdoor unit could deliver
+            pe = pe + p_start[ks]
         else:
             pe = np.zeros(nw)
         V = np.concatenate([q, dist, wv], axis=1)
@@ -472,7 +481,9 @@ def plant_curve(layout: Layout, params: Params, grid: Grid, pw: dict, n_points: 
     return {"q": curve_q, "p": curve_p, "pmax": params.plant.get("Pmax"), "base": plant_base(params),
             "points": [[round(float(qd[k].sum()), 3), round(float(pw["obs"][k]), 3)] for k in idx],
             "hours_at_limit": round(float(at_limit.sum()) * grid.dt_h, 1),
-            "tout_points": [round(float(grid.tout[k]), 1) for k in idx]}
+            "tout_points": [round(float(grid.tout[k]), 1) for k in idx],
+            "start_kwh": params.plant.get("Estart", 0.0),
+            "starts_per_day": round(float(((share[1:] > 0.5) & (share[:-1] < 0.5)).sum()) / max(grid.K * grid.dt_h / 24, 1e-9), 1)}
 
 
 def check(layout: Layout, params: Params, grid: Grid, pw: dict, train_days, val_days, per_day) -> dict:
