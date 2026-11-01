@@ -87,6 +87,7 @@ class Planner:
         self.airing_now: tuple[int, int] | None = None  # the airing the sensor suggests
         self.overrides = Overrides(store)
         self._published: dict[str, str] = {}  # override sensors as last set in Home Assistant
+        self._run_over: dict[str, float] = {}  # unit -> when its run ended (by hand or by the clock)
         self._wake: asyncio.Task | None = None
         self._airing_sent = False
         self.state = PlanState()
@@ -633,7 +634,12 @@ class Planner:
         gone = self.overrides.cancel(**kw)
         if gone:
             layout = self.cfg.layout_obj()
-            units = {o.unit for o in gone if o.unit} | {u.id for o in gone if o.zone for u in layout.units if u.zone == o.zone}
+            runs = [o.unit for o in gone if o.kind == "run"]
+            for u in runs:
+                self._run_over[u] = time.time() * 1000
+            units = set(runs) | {u.id for o in gone if o.zone for u in layout.units if u.zone == o.zone}
+            # plan without it, then the proxies hear it: off if that is the plan, without first
+            # switching off what the plan would have on again a few seconds later
             asyncio.create_task(self._after_change(sorted(units)))
         return gone
 
@@ -651,6 +657,10 @@ class Planner:
 
         async def wake():
             await asyncio.sleep(max(0.0, (nxt - time.time() * 1000) / 1000) + 0.5)
+            done = [o.unit for o in self.overrides.items if o.kind == "run" and (o.end or 0) <= time.time() * 1000]
+            for u in done:
+                self._run_over[u] = time.time() * 1000
+            await self.poke(done)  # the plan already has what comes after the run's end
             before = {o.unit or o.zone for o in self.overrides.items}
             layout = self.cfg.layout_obj()
             await self.replan(fresh=True)  # ticks the overrides: the one ending goes
@@ -761,6 +771,9 @@ class Planner:
                 decision["level"] = level
             decision["target_kw"] = round(target, 2)
             answer["reason"] = f"{'heat' if mode == 'heat' else 'cool'} {target:.1f} kW · {price:.1f} ct/kWh"
+        over = self._run_over.get(uid)
+        if over is not None and now_ms - over < 3 * MIN:
+            answer["force"] = True  # just after a run: stop now if the plan says so, past the proxy's minimum cycle
         if self.cfg.shadow:
             answer = {"follow": False, "reason": "shadow: would " + answer.get("reason", "")}
         decision["follow"] = answer.get("follow", True)

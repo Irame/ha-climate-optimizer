@@ -471,7 +471,7 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                 R.add(cols, vals, hi=float(pmax))
 
     # airing: which candidates, how many a day, apart enough; the window zones' units stay off meanwhile
-    AIR, air_open = [], {}  # air_open: step -> [(candidate, share of the step open)]
+    AIR, air_open, air_soft = [], {}, {}  # step -> [(candidate, share of the step open)]; step -> [candidates aired or just after]
     if pr.airing is not None and sys.nw and pr.airing.cand:
         A = pr.airing
         AIR = V.add(len(A.cand), lb=0.0, ub=1.0)
@@ -491,6 +491,8 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                 ov = (min(b, pr.t[k + 1]) - max(a, pr.t[k])) / (pr.t[k + 1] - pr.t[k])
                 if ov > 1e-6:
                     air_open.setdefault(k, []).append((c, ov))
+                if pr.t[k + 1] > a and pr.t[k + 1] <= b + 30 * MIN:  # its end of step falls in it, or soon after
+                    air_soft.setdefault(k, []).append(c)
         win_units = [j for j, u in enumerate(U) if u.zone in layout.window_zones]
         for k, opens in air_open.items():
             for c, ov in opens:
@@ -538,6 +540,10 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                     seg_vars.append(v)
                     seg_zone.setdefault(z, []).append(v)
                 # below: Ta + sum >= Tc ; above: -Ta + sum >= -Tc
+                if sgn > 0 and z in layout.window_zones:  # aired and the half hour after: too cold is the point
+                    for c in air_soft.get(k, []):
+                        cols.append(AIR[c])
+                        vals.append(10.0)
                 R.add(cols, vals, lo=float(sgn * Tc[k]))
 
     # heat missing at the end, valued at a cheap price
@@ -687,9 +693,41 @@ def solve(pr: Problem) -> Plan:
     if best is None:
         raise RuntimeError("no feasible plan")
     best.alternatives = {m: o for m, o in objs.items() if m != best.mode}
+    best = start_now_or_later(pr, best, best_obj)
     if pr.airing is not None and best.airing:
         best.airing_cost = airing_cost(pr, best)
     return best
+
+
+def start_now_or_later(pr: Problem, plan: Plan, obj: float) -> Plan:
+    """A plan that has a unit off now but on right after the on/off steps may only be putting
+    off a start: after them a step is a share, and a start there is counted by its share, so
+    a start a little later always looks cheaper than one now, plan after plan. Weigh starting
+    now, with the later start counted whole, and take the cheaper."""
+    s = pr.settings
+    fine = (pr.t[:-1] - pr.t[0]) < s.binary_h * 3.6e6
+    nf = int(fine.sum())
+    soon = (pr.t[:-1] - pr.t[0]) < s.binary_h * 3.6e6 + 15 * MIN
+    e_start = pr.sys.params.plant.get("Estart", 0.0)
+    for u in pr.units:
+        sh = plan.share[u.id]
+        if u.kind != "ac" or u.forced is not None or sh[:nf].max() > 0.5 or nf >= pr.N:
+            continue
+        later = [k for k in np.flatnonzero(soon & ~fine) if sh[k] > 0.05]
+        if not later or sh[later[0]] > 0.99:
+            continue
+        allowed = np.ones(pr.N, bool) if u.allowed is None else np.asarray(u.allowed, bool)
+        if not allowed[:nf].all() or (not u.on and u.since_min < s.min_off_min) or plan.mode not in u.modes:
+            continue
+        k = later[0]
+        discount = (1.0 - sh[k]) * (s.start_cost + e_start * float(pr.price[k]))  # the part of the start not counted
+        now = dataclasses.replace(u, forced=np.where(fine, 1.0, 0.0))
+        alt = dataclasses.replace(pr, units=[now if x.id == u.id else x for x in pr.units])
+        p2, o2 = solve_mode(alt, plan.mode)
+        if p2 is not None and o2 < obj + discount:
+            p2.alternatives = plan.alternatives
+            plan, obj = p2, o2
+    return plan
 
 
 def comfort_cost_of(temp: np.ndarray, Tc: np.ndarray, fns: list[ComfortFunction], dts: np.ndarray) -> float:

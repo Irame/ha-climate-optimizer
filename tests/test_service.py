@@ -432,3 +432,25 @@ def test_retrain_due():
     assert retrain_due(evening, at3, 3)  # a training by hand in the evening does not skip the night's
     assert not retrain_due(datetime(2026, 10, 31, 3, 1, tzinfo=tz).timestamp(), at3, 3)  # done this hour already
     assert not retrain_due(evening, at3.replace(hour=4), 3)
+
+
+def test_a_run_stopped_by_hand_goes_off_at_once(client):
+    """Stopped: plan without it, then tell the proxy, which stops past its own minimum cycle."""
+    import time as _t
+
+    svc = client.svc
+    world = svc.ha.world
+    zi = svc.planner.cfg.layout_obj().zone_index("bath")
+    world.x[zi] = 25.0  # warm: once the run is over, the plan has the heater off
+    _see(svc)
+    client.post("/api/overrides", json={"unit": "bath", "run_min": 15})
+    assert world.units["bath"]["on"]
+    world.pokes.clear()
+    assert client.post("/api/overrides", json={"unit": "bath", "toggle": True}).json()["cancelled"]
+    for _ in range(100):  # the plan and the poke come in the background
+        if world.pokes:
+            break
+        _t.sleep(0.1)
+    assert ["climate.bath_proxy"] in world.pokes
+    ans = world.units["bath"]["answer"]
+    assert ans["hvac_mode"] == "off" and ans["force"] and not world.units["bath"]["on"]

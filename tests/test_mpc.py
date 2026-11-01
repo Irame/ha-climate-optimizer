@@ -258,3 +258,57 @@ def test_start_energy_counts_and_bundles():
 
     assert starts(b) <= starts(a)
     assert b.cost["energy"] > a.cost["energy"] or starts(b) < starts(a)
+
+
+def test_no_heating_up_just_to_air_it_out():
+    """What an airing lets out goes with the room's temperature: heating a room up just
+    before it is aired is no way to soften the dip."""
+    free = problem(lambda h: 0.3, Ta=(21.0, 19.0, 21.5, 22.0, 20.0))
+    a0 = free.t[0] + 60 * MIN
+    a0 = int(a0 // (30 * MIN) * 30 * MIN + 30 * MIN)
+    aired = problem(lambda h: 0.3, Ta=(21.0, 19.0, 21.5, 22.0, 20.0))
+    aired.airing = airing_for(aired, [a0])
+    p0, p1 = mpc.solve(free), mpc.solve(aired)
+    assert p1.airing == [(a0, a0 + 10 * MIN)]
+    before = (p0.t[1:] <= a0)
+    dts = np.diff(p0.t) / 3.6e6
+    heat = lambda p: sum(float(np.sum(np.abs(p.heat[u.id])[before] * dts[before]))
+                         for u in aired.units if u.zone in aired.sys.layout.window_zones)
+    assert heat(p1) <= heat(p0) + 0.15  # kWh: no stocking up before the windows open
+
+
+def _start_slips(steps=14):
+    """Replan every five minutes, do what each first step says: how often is a start that a
+    plan put just ahead put off again by the next?"""
+    st = mpc.Settings(horizon_max_h=12)
+    t0 = ms(2026, 1, 14, 22, 30)
+    x = problem(lambda h: 0.43, Ta=(20.4, 19.0, 20.0, 21.5, 19.8), settings=st, t0=t0).x0.copy()
+    S = default_layout()
+    on, since, last, slips = {}, {}, None, 0
+    for i in range(steps):
+        t = t0 + i * 5 * MIN
+        p = problem(lambda h: 0.43, settings=st, t0=t)
+        p.x0 = x.copy()
+        for u in p.units:
+            u.on, u.since_min = on.get(u.id, False), since.get(u.id, 1e9)
+        plan = mpc.solve(p)
+        sh = plan.share["living"]
+        start = next((plan.t[j] for j in range(len(sh)) if sh[j] > 0.3), None)
+        if sh[0] < 0.5 and start is not None and last is not None and start > last + MIN:
+            slips += 1
+        last = start if sh[0] < 0.5 else None
+        Ad, Bd = p.sys.discretize(5 / 60)
+        heat = np.zeros(len(S.units))
+        for j, u in enumerate(S.units):
+            now_on = plan.share[u.id][0] > 0.5
+            since[u.id] = 5.0 if now_on != on.get(u.id, False) else since.get(u.id, 1e9) + 5
+            on[u.id] = now_on
+            heat[j] = plan.heat[u.id][0] if now_on else 0.0
+        x = Ad @ x + Bd @ np.concatenate([heat, p.dist[0], np.zeros(p.sys.nw)])
+    return slips
+
+
+def test_a_promised_start_is_not_put_off_plan_after_plan():
+    """Later steps are shares, and a start there counted by its share looks cheaper than one
+    now: without weighing a start now, each plan put it off by a step (3 times here)."""
+    assert _start_slips() <= 1
