@@ -214,6 +214,8 @@ class Planner:
                     item["effect"] = f"comfort {spec['offset']:+g} K in " + (", ".join(zones[z] for z in spec["zones"]) or every)
                 elif spec["action"] == "no_airing":
                     item["effect"] = "no airing suggested"
+                elif spec["action"] == "max_level":
+                    item["effect"] = f"fan level at most {spec['level']}: " + (", ".join(units[u][0] for u in spec["units"]) or "every unit")
                 elif spec["action"] == "target":
                     item["effect"] = f"{spec['target']:g} °C in " + (", ".join(zones[z] for z in spec["zones"]) or every)
                 else:
@@ -395,8 +397,10 @@ class Planner:
             forced = None if u.id in uncontrolled else self.overrides.forced(u.id, t)
             if u.id in uncontrolled and self.overrides.run_for(u.id, now_ms):
                 info["notes"].append(f"{u.name} is asked to run, but {note}")
+            caps = np.array([np.nan if c is None else float(c) for c in res.max_level.get(u.id, [None] * N)])
             units.append(mpc.UnitSpec(u.id, u.kind, u.zone, levels=(lo, hi), allowed=allowed, on=running,
-                                      since_min=max(0.0, since), modes=modes, forced=forced))
+                                      since_min=max(0.0, since), modes=modes, forced=forced,
+                                      max_level=caps if u.kind == "ac" and np.isfinite(caps).any() else None))
             proxies[u.id] = {"proxy": m.get("proxy"), "state": mode_now, "note": note, "levels": [lo, hi], "anyway": anyway,
                              "running": running, "comfort": comfort.get(u.zone, [None])[0] if u.zone in comfort else None}
 
@@ -422,6 +426,7 @@ class Planner:
         info["cloud"] = (cloud * 100).round(0).tolist()  # %
         info.update({"units": proxies, "schedule": {"function": res.function, "source": res.source, "offset": res.offset,
                                                     "target": {z: [None if not math.isfinite(v) else v for v in a] for z, a in res.target.items()},
+                                                    "max_level": res.max_level,
                                                     "locked": res.locked}, "x0": x0.tolist(), "trained": self.params is not None})
         return pr, info
 
@@ -576,6 +581,15 @@ class Planner:
             log.info("plan: %s, %.2f € over %.0f h, %.1f s", plan.mode, plan.cost["total"], (plan.t[-1] - plan.t[0]) / 3.6e6, plan.seconds)
 
     # ---- overrides ----
+    def _levels_now(self, uid: str, unit, k: int | None) -> tuple[int, int]:
+        """The fan levels allowed now: the proxy's, and no higher than a quiet-time rule says."""
+        lo, hi = self.state.info.get("units", {}).get(uid, {}).get("levels", [0, unit.levels - 1])
+        caps = (self.state.info.get("schedule") or {}).get("max_level", {}).get(uid) or []
+        if k is not None and k < len(caps) and caps[k] is not None:
+            hi = min(hi, int(caps[k]))
+            lo = min(lo, hi)
+        return lo, hi
+
     def _run_answer(self, uid: str, run, body: dict, now_ms: float, valid: str) -> dict:
         """A unit asked to run: on, whatever the plan says, and past the proxy's own
         minimum cycle (force), until the run is over."""
@@ -590,8 +604,7 @@ class Planner:
         answer = {"hvac_mode": mode, "valid_until": valid, "force": True, "reason": f"asked to run until {until}"}
         decision = {"on": True, "mode": mode, "run": True}
         if unit.kind == "ac":
-            info = self.state.info.get("units", {}).get(uid, {})
-            lo, hi = info.get("levels", [0, unit.levels - 1])
+            lo, hi = self._levels_now(uid, unit, k)
             level = lo
             if k is not None and plan.share[uid][k] >= 0.5:  # the plan knows the run: its heat, as a level
                 tl = self.state.info.get("tout", [5.0])
@@ -763,8 +776,7 @@ class Planner:
             target = abs(float(plan.heat[uid][k])) / max(share, 1e-6)
             answer = {"hvac_mode": mode, "valid_until": valid}
             if unit.kind == "ac":
-                info = self.state.info.get("units", {}).get(uid, {})
-                lo, hi = info.get("levels", [0, unit.levels - 1])
+                lo, hi = self._levels_now(uid, unit, k)
                 tout = float(self.state.info.get("tout", [5.0])[min(k, len(self.state.info.get("tout", [5.0])) - 1)])
                 level = self.dispatcher.level(params, uid, mode, target, tout, (lo, hi), now_ms)
                 answer["fan_level"] = level

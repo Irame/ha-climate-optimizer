@@ -454,3 +454,24 @@ def test_a_run_stopped_by_hand_goes_off_at_once(client):
     assert ["climate.bath_proxy"] in world.pokes
     ans = world.units["bath"]["answer"]
     assert ans["hvac_mode"] == "off" and ans["force"] and not world.units["bath"]["on"]
+
+
+def test_quiet_rule_caps_the_answer(client):
+    svc = client.svc
+    world = svc.ha.world
+    rules = client.get("/api/config").json()["rules"]
+    quiet = {"id": "quiet", "name": "quiet", "action": "max_level", "units": ["living"], "level": 0, "start": "00:00", "end": "24:00"}
+    client.put("/api/config", json={"rules": rules + [quiet]})
+    zi = svc.planner.cfg.layout_obj().zone_index("living")
+    world.x[zi] = 17.0  # cold: it would run high
+    _see(svc)
+    try:
+        r = client.post("/api/plan").json()
+        assert all(c == 0 for c in r["info"]["schedule"]["max_level"]["living"])
+        a = client.post("/api/v1/command", json=world.request("living")).json()
+        if a.get("hvac_mode") not in (None, "off"):
+            assert a["fan_level"] == 0
+        pv = client.get("/api/schedule/preview?days=1").json()
+        assert pv["max_level"]["living"][0] == 0 and pv["max_level"]["office"][0] is None
+    finally:
+        client.put("/api/config", json={"rules": rules})

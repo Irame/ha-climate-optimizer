@@ -109,11 +109,12 @@ OVERRIDE_FUNCTIONS = {
 class Rule:
     id: str
     name: str
-    action: str  # "comfort" | "lockout" | "offset" | "no_airing"
+    action: str  # "comfort" | "lockout" | "offset" | "no_airing" | "max_level"
     zones: list[str] = field(default_factory=list)  # zone ids; empty = all (for comfort / offset)
-    units: list[str] = field(default_factory=list)  # unit ids (for lockout); empty = all
+    units: list[str] = field(default_factory=list)  # unit ids (for lockout / max_level); empty = all
     function: str | None = None  # comfort function id (action comfort)
     offset: float = 0.0  # K added to the comfort temperature (action offset)
+    level: int = 0  # highest fan level allowed, 0 the quietest (action max_level)
     rrule: str = "FREQ=DAILY"
     dtstart: str = "2026-01-05"  # first day the recurrence counts from (matters for INTERVAL>1)
     start: str = "00:00"
@@ -131,10 +132,12 @@ class Rule:
         return asdict(self)
 
     def validate(self) -> None:
-        if self.action not in ("comfort", "lockout", "offset", "no_airing"):
+        if self.action not in ("comfort", "lockout", "offset", "no_airing", "max_level"):
             raise ValueError(f"rule {self.name}: unknown action {self.action}")
         if self.action == "comfort" and not self.function:
             raise ValueError(f"rule {self.name}: which comfort function?")
+        if self.action == "max_level" and not (isinstance(self.level, int) and self.level >= 0):
+            raise ValueError(f"rule {self.name}: the highest fan level is a whole number from 0")
         _hm(self.start)
         _hm(self.end)
         date.fromisoformat(self.dtstart)
@@ -189,6 +192,7 @@ def default_rules() -> list[Rule]:
 OFF_WORDS = {"aus", "off", "sperre", "lock", "lockout", "gesperrt"}
 ALL_WORDS = {"alle", "all", "wohnung", "apartment"}
 AIRING_WORDS = {"lüften", "lueften", "luften", "airing", "air"}
+QUIET_WORDS = {"leise", "quiet", "silent"}  # the quietest fan level only
 
 
 # Names a calendar may use for the usual rooms and functions, besides their ids and names
@@ -237,6 +241,17 @@ def parse_event(summary: str, zones: dict[str, str], units: dict[str, tuple[str,
             hit = [u for u, (_, z) in units.items() if z == zone[0]]
             return {"action": "lockout", "units": hit} if hit else None
         return None
+    m = re.fullmatch(r"(?:stufe|max|level|lüfter|luefter|fan)\s*(\d)", what)  # 'Schlafzimmer: Stufe 1': quiet
+    if m or what in QUIET_WORDS:
+        level = int(m[1]) if m else 0
+        if everyone:
+            return {"action": "max_level", "units": [], "level": level}
+        if who in unorm:
+            return {"action": "max_level", "units": [unorm[who]], "level": level}
+        if zone:
+            hit = [u for u, (_, z) in units.items() if z == zone[0]]
+            return {"action": "max_level", "units": hit, "level": level} if hit else None
+        return None
     if zone is None:
         return None
     m = re.fullmatch(r"([+-]\d+(?:[.,]\d+)?)\s*(k|°|°c)?", what)
@@ -262,6 +277,7 @@ class Resolved:
     event_unit: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event keeps the unit off
     no_airing: list[bool] = field(default_factory=list)  # no airing to be suggested
     target: dict[str, list[float]] = field(default_factory=dict)  # an override's temperature, nan where none
+    max_level: dict[str, list[int | None]] = field(default_factory=dict)  # highest fan level allowed, None: any
 
 
 def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[str], units: list[str],
@@ -286,6 +302,7 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
     ev_u = {u: [False] * N for u in units}
     no_air = [False] * N
     tgt = {z: [math.nan] * N for z in zones}
+    cap: dict[str, list[int | None]] = {u: [None] * N for u in units}
     for _, _, spec, ivs in active:
         if not ivs:
             continue
@@ -311,6 +328,11 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
                         ev_u[u][k] = ev_u[u][k] or bool(spec.get("calendar"))
             elif spec["action"] == "no_airing":
                 no_air[k] = True
+            elif spec["action"] == "max_level":  # the strictest of those that apply (quiet beats everything)
+                for u in (spec.get("units") or units):
+                    if u in cap:
+                        lv = int(spec.get("level", 0))
+                        cap[u][k] = lv if cap[u][k] is None else min(cap[u][k], lv)
             elif spec["action"] == "target":
                 for z in (spec.get("zones") or zones):
                     if z in tgt:
@@ -324,4 +346,4 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
                         lock[u][k] = False
                         ev_u[u][k] = False
     return Resolved(function=fn, offset=off, locked=lock, source=src, event_zone=ev_z, event_unit=ev_u, no_airing=no_air,
-                    target=tgt)
+                    target=tgt, max_level=cap)

@@ -392,6 +392,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         return _json({"start": int(t0.timestamp() * 1000), "step_min": step_min, "function": res.function,
                       "offset": res.offset, "locked": res.locked, "source": res.source,
                       "event_zone": res.event_zone, "event_unit": res.event_unit, "no_airing": res.no_airing,
+                      "max_level": res.max_level,
                       "target": {z: [None if v != v else v for v in a] for z, a in res.target.items()},
                       "calendar": {"entity": cal["calendar"], "fetched": cal["fetched"], "error": cal["error"],
                                    "events": sorted(listing, key=lambda e: e["start"])}})

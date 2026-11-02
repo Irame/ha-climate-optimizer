@@ -16,7 +16,7 @@ subject to the model, each unit's lowest and highest fan level, the outdoor unit
 
 **Comfort costs.** Being off the comfort temperature costs money, per kelvin and hour, separately for too cold and too warm: a deadband that costs nothing, a linear and a quadratic part, and a limit that is not crossed unless it can't be helped. Four functions come predefined (standard, relaxed, strict, frost protection); any number can be added. The comfort temperature itself is the proxy's target temperature.
 
-**Schedules.** Rules switch a room to another function, move its comfort temperature, keep units off, or keep airing from being suggested, at times that recur by an iCalendar rule. "Every other week, Monday to Thursday, 18:00 to 23:00" is weekly, every 2 weeks, those days, from 18:00 to 23:00. Rules have priorities. Events in a Home Assistant calendar override them for single occasions, by their title:
+**Schedules.** Rules switch a room to another function, move its comfort temperature, keep units off, limit their fan level (at most 1: only the two quietest levels, for quiet nights), or keep airing from being suggested, at times that recur by an iCalendar rule. "Every other week, Monday to Thursday, 18:00 to 23:00" is weekly, every 2 weeks, those days, from 18:00 to 23:00. Rules have priorities. Events in a Home Assistant calendar override them for single occasions, by their title:
 
 | Title | Effect |
 |---|---|
@@ -25,6 +25,7 @@ subject to the model, each unit's lowest and highest fan level, the outdoor unit
 | `Alle: +1` | every comfort temperature 1 K higher |
 | `Lüften: aus` | no airing suggested then |
 | `Wohnzimmer: 23 °C` | the living room at 23 °C from the event's start to its end, heated ahead |
+| `Schlafzimmer: Stufe 1` | the bedroom's unit at fan level 1 at most (`leise`: the quietest only) |
 
 Rooms match by their name, their id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or names given per room in Settings; functions by name, id, or Normal, Entspannt, Streng, Frostschutz. The comfort page shows the next two weeks with the calendar's events in them, lists each event with what was made of it, and reloads the calendar on request.
 

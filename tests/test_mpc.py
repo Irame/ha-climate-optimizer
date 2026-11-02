@@ -312,3 +312,18 @@ def test_a_promised_start_is_not_put_off_plan_after_plan():
     """Later steps are shares, and a start there counted by its share looks cheaper than one
     now: without weighing a start now, each plan put it off by a step (3 times here)."""
     assert _start_slips() <= 1
+
+
+def test_fan_level_limit_caps_the_heat():
+    L = default_layout()
+    pr = problem(lambda h: 0.3, Ta=(18.0, 17.0, 17.0, 19.0, 18.0))
+    cap = np.full(pr.N, np.nan)
+    cap[: pr.N // 2] = 0  # the quietest level only, the first half of the plan
+    pr.units = [mpc.UnitSpec(u.id, u.kind, u.zone, levels=(0, u.levels - 1), max_level=cap if u.id == "living" else None)
+                for u in L.units]
+    plan = mpc.solve(pr)
+    from climate_optimizer.model.thermal import level_heat
+    lowest = np.abs(level_heat(pr.sys.params, "living", 0, 1, pr.dist[:, DIST.index("tout")]))
+    first = np.arange(pr.N) < pr.N // 2
+    assert np.all(np.abs(plan.heat["living"][first]) <= lowest[first] + 1e-6)
+    assert np.abs(plan.heat["living"]).max() > lowest.max() + 0.1  # cold: more once allowed

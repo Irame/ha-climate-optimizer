@@ -166,3 +166,21 @@ def test_resolve_target_beats_lockouts_and_calendar():
     assert r.target["living"][6] == 23.0 and r.function["living"][6] == "override-up" and not r.locked["living"][6]
     assert r.source["living"][6] == "Override 23 °C" and not r.event_zone["living"][6]
     assert math.isnan(r.target["bedroom"][6]) and r.locked["living"][11] and math.isnan(r.target["living"][10])
+
+
+def test_fan_level_limit_rules_and_calendar():
+    t0 = datetime(2026, 1, 12, 0, tzinfo=TZ)
+    starts, ends = _steps(t0, 48)
+    rules = [Rule("q", "quiet nights", "max_level", units=["bedroom"], level=1, start="22:00", end="07:00"),
+             Rule("q2", "very quiet", "max_level", units=[], level=0, start="02:00", end="03:00")]
+    r = resolve(starts, ends, ["bedroom"], ["bedroom", "living"], {}, rules)
+    assert r.max_level["bedroom"][0] == 1 and r.max_level["bedroom"][4] == 0  # the stricter wins
+    assert r.max_level["living"][4] == 0 and r.max_level["living"][0] is None
+    assert r.max_level["bedroom"][20] is None and not any(r.locked["bedroom"])
+    with pytest.raises(ValueError):
+        Rule.from_dict({"id": "x", "name": "x", "action": "max_level", "level": -1})
+    zones = {"bedroom": "Bedroom", "living": "Living room & kitchen"}
+    units = {"bedroom": ("Bedroom", "bedroom"), "living": ("Living room", "living")}
+    fns = {f.id: f.name for f in default_functions()}
+    assert parse_event("Schlafzimmer: Stufe 1", zones, units, fns) == {"action": "max_level", "units": ["bedroom"], "level": 1}
+    assert parse_event("Alle: leise", zones, units, fns) == {"action": "max_level", "units": [], "level": 0}

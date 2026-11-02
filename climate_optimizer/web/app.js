@@ -607,10 +607,10 @@ pages.comfort = async (redraw) => {
   html += '</table></div><p class="hint">Rooms without a comfort temperature carry no comfort cost (the hallway, usually).</p></div>';
   // rules
   html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Rules</h3><span class="spacer"></span><button id="rule-add">Add rule</button></div>
-    <p class="hint">A rule switches a room to another comfort function, moves its comfort temperature, keeps units off, or keeps airing from being suggested, at recurring times. Where rules overlap, the higher priority wins. "Every other week, Monday to Thursday evenings": weekly, every 2 weeks, those four days, 18:00–23:00, starting on a Monday of an "on" week.</p>
+    <p class="hint">A rule switches a room to another comfort function, moves its comfort temperature, keeps units off, limits their fan level (quiet at night), or keeps airing from being suggested, at recurring times. Where rules overlap, the higher priority wins. "Every other week, Monday to Thursday evenings": weekly, every 2 weeks, those four days, 18:00–23:00, starting on a Monday of an "on" week.</p>
     <div id="rule-list"></div></div>`;
   html += `<div class="card"><h3>Calendar</h3><div class="fields"><label class="field">Calendar entity<select id="cal">${entityOptions('calendar', D.calendar, '— no calendar —')}</select></label></div>
-    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K, <code>Wohnzimmer: 23 °C</code> has the room at 23 °C from the event's start to its end (heated ahead), <code>Lüften: aus</code> suggests no airing then. Rooms match by their name, id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or the names given in Settings; functions by name or id, and Normal, Entspannt, Streng, Frostschutz.</p></div>`;
+    <p class="hint">Events override every rule for their time. The title says what: <code>Wohnzimmer: Relaxed</code> picks a comfort function, <code>Schlafzimmer: aus</code> keeps the units there off, <code>Alle: +1</code> raises every comfort temperature by 1 K, <code>Wohnzimmer: 23 °C</code> has the room at 23 °C from the event's start to its end (heated ahead), <code>Schlafzimmer: Stufe 1</code> (or <code>leise</code> for the quietest) limits the fan level there, <code>Lüften: aus</code> suggests no airing then. Rooms match by their name, id, the usual German names (Büro, Schlafzimmer, Wohnzimmer, Küche, Bad, Flur) or the names given in Settings; functions by name or id, and Normal, Entspannt, Streng, Frostschutz.</p></div>`;
   const A = D.airing, windowRooms = L.zones.filter(z => z.windows && (S.config.mapping?.zones?.[z.id]?.windows || []).length);
   const airRule = D.rules.some(r => r.action === 'no_airing' && r.enabled);
   html += `<div class="card"><h3>Airing</h3>
@@ -627,7 +627,7 @@ pages.comfort = async (redraw) => {
   </div>`;
   html += `<div class="card"><div class="toolbar"><h3 style="margin:0">The next two weeks</h3><span class="spacer"></span>
     <span class="hint" id="cal-status"></span><button id="cal-reload" ${D.calendar ? '' : 'disabled'}>Reload calendar</button></div>
-    <p class="hint" style="margin-top:0">Saved rules and the calendar’s events. Hatched: units kept off; outlined: set by a calendar event.</p>
+    <p class="hint" style="margin-top:0">Saved rules and the calendar’s events. Hatched: units kept off; underlined: fan level limited; outlined: set by a calendar event.</p>
     <div id="preview"></div></div>`;
   root.innerHTML = html;
 
@@ -714,6 +714,14 @@ pages.comfort = async (redraw) => {
   };
 };
 
+// a unit's fan modes, quietest first: as set in Settings, else as its proxy reports them
+function fanModes(uid) {
+  const m = S.config?.mapping?.units?.[uid] || {};
+  if (m.fan_modes?.length) return m.fan_modes;
+  const attrs = S.status?.units?.[uid]?.proxy_attrs || {};
+  return attrs.source_fan_modes || [];
+}
+
 function parseRrule(s) {
   const o = {};
   for (const part of (s || '').replace(/^RRULE:/i, '').split(';')) { const [k, v] = part.split('='); if (k) o[k.toUpperCase()] = v || ''; }
@@ -728,16 +736,19 @@ function ruleEditor(r, i, D, fnOpts) {
   const rr = parseRrule(r.rrule);
   const freq = rr.FREQ || 'DAILY';
   const byday = (rr.BYDAY || '').split(',').filter(Boolean);
-  const targets = r.action === 'no_airing' ? '' : r.action === 'lockout'
-    ? L.units.map(u => `<label class="check"><input type="checkbox" data-unit="${u.id}" ${r.units.includes(u.id) ? 'checked' : ''}>${esc(u.name)}</label>`).join(' ')
+  const byUnit = r.action === 'lockout' || r.action === 'max_level';
+  const targets = r.action === 'no_airing' ? '' : byUnit
+    ? (r.action === 'max_level' ? L.units.filter(u => u.kind === 'ac') : L.units).map(u => `<label class="check"><input type="checkbox" data-unit="${u.id}" ${r.units.includes(u.id) ? 'checked' : ''}>${esc(u.name)}</label>`).join(' ')
     : L.zones.map(z => `<label class="check"><input type="checkbox" data-zone="${z.id}" ${r.zones.includes(z.id) ? 'checked' : ''}>${esc(z.name)}</label>`).join(' ');
   box.innerHTML = `<div class="row" style="margin-bottom:8px"><label class="check"><input type="checkbox" data-k="enabled" ${r.enabled ? 'checked' : ''}></label>
       <input data-k="name" value="${esc(r.name)}" style="font-weight:600;flex:1;min-width:160px">
-      <select data-k="action"><option value="comfort" ${r.action === 'comfort' ? 'selected' : ''}>Comfort function</option><option value="offset" ${r.action === 'offset' ? 'selected' : ''}>Comfort temperature ±</option><option value="lockout" ${r.action === 'lockout' ? 'selected' : ''}>Keep units off</option><option value="no_airing" ${r.action === 'no_airing' ? 'selected' : ''}>No airing suggested</option></select>
+      <select data-k="action"><option value="comfort" ${r.action === 'comfort' ? 'selected' : ''}>Comfort function</option><option value="offset" ${r.action === 'offset' ? 'selected' : ''}>Comfort temperature ±</option><option value="lockout" ${r.action === 'lockout' ? 'selected' : ''}>Keep units off</option><option value="max_level" ${r.action === 'max_level' ? 'selected' : ''}>Limit the fan level</option><option value="no_airing" ${r.action === 'no_airing' ? 'selected' : ''}>No airing suggested</option></select>
       ${r.action === 'comfort' ? `<select data-k="function">${fnOpts(r.function)}</select>` : ''}
       ${r.action === 'offset' ? `<input type="number" step="0.5" data-k="offset" value="${r.offset}" style="width:80px"> K` : ''}
+      ${r.action === 'max_level' ? `<span class="hint">at most</span><input type="number" min="0" max="9" step="1" data-k="level" value="${r.level ?? 0}" style="width:70px">` : ''}
       <button class="danger" data-del>Delete</button></div>
-    ${targets ? `<div class="row" style="margin-bottom:8px"><span class="hint">${r.action === 'lockout' ? 'Units (none ticked: all)' : 'Rooms (none ticked: all)'}:</span> ${targets}</div>` : ''}
+    ${targets ? `<div class="row" style="margin-bottom:8px"><span class="hint">${byUnit ? 'Units (none ticked: all)' : 'Rooms (none ticked: all)'}:</span> ${targets}</div>` : ''}
+    ${r.action === 'max_level' ? `<p class="hint" style="margin:0 0 8px">Fan levels count from 0, the quietest: at most 1 leaves the two quietest. ${L.units.filter(u => u.kind === 'ac').map(u => { const fm = fanModes(u.id); return fm.length ? `${esc(u.name)}: ${fm.map((m, i) => `${i} ${esc(m)}`).join(', ')}` : ''; }).filter(Boolean).join(' · ')}</p>` : ''}
     <div class="fields">
       <label class="field">Repeats<select data-r="FREQ"><option value="DAILY" ${freq === 'DAILY' ? 'selected' : ''}>daily</option><option value="WEEKLY" ${freq === 'WEEKLY' ? 'selected' : ''}>weekly</option><option value="MONTHLY" ${freq === 'MONTHLY' ? 'selected' : ''}>monthly</option></select></label>
       <label class="field">Every<input type="number" min="1" data-r="INTERVAL" value="${rr.INTERVAL || 1}"></label>
@@ -764,6 +775,7 @@ function ruleEditor(r, i, D, fnOpts) {
     if (k === 'enabled') r.enabled = e.checked;
     else if (k === 'priority') r.priority = +e.value;
     else if (k === 'offset') r.offset = +e.value;
+    else if (k === 'level') r.level = Math.max(0, Math.round(+e.value || 0));
     else if (k === 'start' || k === 'end') r[k] = e.value || '00:00';
     else r[k] = e.value;
     if (k === 'action') { if (r.action === 'comfort' && !r.function) r.function = D.functions[0].id; pages.comfort(true); }
@@ -813,11 +825,13 @@ async function drawPreview(refresh = false) {
       html += `<div class="heat-row"><span>${day}</span><div class="heat-cells" style="grid-template-columns:repeat(${per},1fr)">`;
       for (let k = d * per; k < (d + 1) * per; k++) {
         const locked = lockUnits.some(l => l?.[k]);
+        const caps = L.units.filter(u => u.zone === z.id).map(u => pv.max_level?.[u.id]?.[k]).filter(c => c !== null && c !== undefined);
+        const cap = caps.length ? Math.min(...caps) : null;
         const fromEvent = pv.event_zone?.[z.id]?.[k] || L.units.some(u => u.zone === z.id && pv.event_unit?.[u.id]?.[k]);
         const off = pv.offset[z.id][k];
         const tg = pv.target?.[z.id]?.[k];
         const t = pv.start + k * pv.step_min * MIN;
-        html += `<span class="${locked ? 'locked' : ''} ${fromEvent ? 'ev' : ''}" style="background:${tg !== null && tg !== undefined ? 'var(--ink-2)' : slot(fnIdx[fn[k]] ?? 0)}" title="${fmtTime(t, S.tz)} ${tg !== null && tg !== undefined ? num(tg, 1) + ' °C' : esc(fnName(fn[k]))}${off ? ' ' + (off > 0 ? '+' : '') + off + ' K' : ''}${locked ? ' · units off' : ''} (${esc(pv.source[z.id][k])})"></span>`;
+        html += `<span class="${locked ? 'locked' : ''} ${fromEvent ? 'ev' : ''} ${cap !== null && !locked ? 'capped' : ''}" style="background:${tg !== null && tg !== undefined ? 'var(--ink-2)' : slot(fnIdx[fn[k]] ?? 0)}" title="${fmtTime(t, S.tz)} ${tg !== null && tg !== undefined ? num(tg, 1) + ' °C' : esc(fnName(fn[k]))}${off ? ' ' + (off > 0 ? '+' : '') + off + ' K' : ''}${locked ? ' · units off' : cap !== null ? ' · fan level at most ' + cap : ''} (${esc(pv.source[z.id][k])})"></span>`;
       }
       html += `</div></div>`;
     }

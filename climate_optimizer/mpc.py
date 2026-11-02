@@ -85,6 +85,7 @@ class UnitSpec:
     since_min: float = 1e9  # minutes in the current on/off state
     modes: tuple[str, ...] = ("heat", "cool")
     forced: np.ndarray | None = None  # (N,) share of each step it must run (a run override), whatever else holds
+    max_level: np.ndarray | None = None  # (N,) highest fan level a rule allows per step, nan where any
 
 
 @dataclass
@@ -297,6 +298,10 @@ def unit_bounds(params: Params, u: UnitSpec, mode: str, tout: np.ndarray, dts: n
         kw = params.units[u.id]["kw"]
         return np.full(N, kw), np.full(N, kw), np.ones(N)
     lo_l, hi_l = u.levels
+    if u.max_level is not None:  # quiet times: no level above the rule's
+        cap = np.asarray(u.max_level, float)
+        hi_l = np.where(np.isfinite(cap), np.minimum(hi_l, np.nan_to_num(cap, nan=hi_l)), hi_l).astype(int)
+        lo_l = np.minimum(lo_l, hi_l)
     m = 1 if mode == "heat" else 2
     lo = np.abs(level_heat(params, u.id, lo_l, m, tout))
     hi = np.abs(level_heat(params, u.id, hi_l, m, tout))
