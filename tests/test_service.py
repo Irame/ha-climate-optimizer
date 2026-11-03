@@ -507,3 +507,45 @@ def test_airing_can_be_skipped(client):
         del svc.planner.airing_done_today
         client.put("/api/config", json={"airing": {"enabled": False}})
         svc.store.put("airing_skip", {})
+
+
+def test_close_windows_sensor(client):
+    import time as _t
+
+    svc = client.svc
+    world = svc.ha.world
+    eid = "binary_sensor.office_balkontuer"
+    world.windows["office"] = True
+    _see(svc)
+    opened = svc.collector.states[eid]["last_changed"]
+    try:
+        client.post("/api/plan")
+        state, attrs = world.extra["sensor.climate_optimizer_close_windows"]
+        t_open = datetime.fromisoformat(opened.replace("Z", "+00:00")).timestamp() * 1000
+        assert abs(datetime.fromisoformat(state).timestamp() * 1000 - (t_open + 10 * 60_000)) < 1000  # heating: after the airing minutes
+        assert attrs["rooms"] == ["Office"] and "heat" in attrs["reason"]
+        later = client.post("/api/windows/later", json={"minutes": 20}).json()["close_not_before"]
+        client.post("/api/plan")
+        state, _ = world.extra["sensor.climate_optimizer_close_windows"]
+        assert abs(datetime.fromisoformat(state).timestamp() * 1000 - later) < 1000
+        assert client.post("/api/windows/later", json={"minutes": 0}).status_code == 422
+    finally:
+        world.windows["office"] = False
+        _see(svc)
+    client.post("/api/plan")
+    assert world.extra["sensor.climate_optimizer_close_windows"][0] == "unknown"
+    assert not svc.store.get("close_later")
+
+
+def test_venting_sensor_and_rules(client):
+    from climate_optimizer.comfort import Rule
+
+    Rule.from_dict({"id": "v", "name": "v", "action": "no_venting"})
+    client.put("/api/config", json={"airing": {"venting": True}})
+    try:
+        r = client.post("/api/plan").json()
+        assert r["plan"]["vent"] is not None and "venting" in r["info"]
+        state, attrs = client.svc.ha.world.extra["sensor.climate_optimizer_venting"]
+        assert state == "unknown" or "until" in attrs  # the demo heats: rarely worth opening
+    finally:
+        client.put("/api/config", json={"airing": {"venting": False}})

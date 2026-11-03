@@ -41,6 +41,11 @@ class AiringConfig(BaseModel):
     per_day: int = Field(1, ge=1, le=4)
     min_gap_h: float = Field(4.0, ge=0.5, le=12)
     sensor: str = "sensor.climate_optimizer_airing"  # where Home Assistant gets the next suggestion
+    # to cool: windows open as long as the outside air does better than the units (summer nights)
+    venting: bool = False
+    vent_hassle_eur: float = Field(0.10, ge=0, le=5)  # what opening them is worth avoiding, each time
+    vent_sensor: str = "sensor.climate_optimizer_venting"
+    close_sensor: str = "sensor.climate_optimizer_close_windows"  # when open windows are best closed
 
 
 class Config(BaseModel):

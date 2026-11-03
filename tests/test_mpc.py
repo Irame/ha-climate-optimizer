@@ -327,3 +327,38 @@ def test_fan_level_limit_caps_the_heat():
     first = np.arange(pr.N) < pr.N // 2
     assert np.all(np.abs(plan.heat["living"][first]) <= lowest[first] + 1e-6)
     assert np.abs(plan.heat["living"]).max() > lowest.max() + 0.1  # cold: more once allowed
+
+
+def _summer(vent, hassle=0.1):
+    import math as _m
+    st = mpc.Settings(season="cool")
+    pr = problem(lambda h: 0.3, tout=20.0, Ta=(26.5, 26.0, 26.5, 26.0, 26.0), settings=st, t0=ms(2026, 7, 14, 18, 2),
+                 comfort={"office": 24.0, "bedroom": 23.0, "living": 24.0, "bath": 24.0})
+    mids = (pr.t[:-1] + pr.t[1:]) / 2
+    hours = np.array([(datetime.fromtimestamp(m / 1000, TZ).hour + datetime.fromtimestamp(m / 1000, TZ).minute / 60) for m in mids])
+    pr.dist[:, DIST.index("tout")] = 23 + 7 * np.cos((hours - 16) / 24 * 2 * _m.pi)  # 16 °C at 4:00, 30 °C at 16:00
+    if vent:
+        pr.venting = mpc.Venting(allowed=np.ones(pr.N, bool), open_now=np.zeros(pr.N), hassle=hassle,
+                                 tref={z: pr.comfort[z] for z in pr.sys.layout.window_zones})
+    return pr
+
+
+def test_venting_cools_with_the_night_air():
+    shut, vented = mpc.solve(_summer(False)), mpc.solve(_summer(True))
+    on = vented.vent > 0.5
+    opens = int(np.sum(on[1:] & ~on[:-1]) + on[0])
+    hours = [datetime.fromtimestamp(x / 1000, TZ).hour for x in vented.t[:-1][on]]
+    assert 1 <= opens <= 2  # not open and shut all the time
+    assert all(h >= 20 or h <= 8 for h in hours)  # when it is cool outside
+    kwh = lambda p: float(np.sum(p.electric * np.diff(p.t) / 3.6e6))
+    assert kwh(vented) < kwh(shut) - 0.2 and vented.cost["total"] < shut.cost["total"]
+    for u in ("office", "bedroom", "living"):  # no unit cools against open windows
+        assert np.all(vented.share[u] <= 1.0 - vented.vent + 1e-6)
+
+
+def test_no_venting_when_it_only_lets_the_heat_out():
+    pr = problem(lambda h: 0.3)
+    pr.venting = mpc.Venting(allowed=np.ones(pr.N, bool), open_now=np.zeros(pr.N), hassle=0.1,
+                             tref={z: pr.comfort[z] for z in pr.sys.layout.window_zones})
+    plan = mpc.solve(pr)
+    assert plan.vent.max() < 0.01

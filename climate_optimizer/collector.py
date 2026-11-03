@@ -123,6 +123,7 @@ class Collector:
         self.meta: dict[str, dict] = store.get("meta", {})
         self.means: dict[str, MinuteMean] = {}
         self.backfill_status: dict = {}
+        self.on_window = None  # called with a door or window sensor that changed
 
     def track(self, entities: list[str]) -> None:
         self.entities = list(entities)
@@ -153,9 +154,12 @@ class Collector:
         if new is None:
             self.states.pop(eid, None)
             return
+        old = d.get("old_state") or {}
         self.states[eid] = new
         if eid not in self.entities:
             return
+        if self.on_window and eid.startswith("binary_sensor.") and new.get("state") != old.get("state"):
+            self.on_window(eid)
         t = _ms(new.get("last_updated") or new.get("last_changed") or time.time())
         if kind_of(eid) == "numeric":
             rows = self.means.setdefault(eid, MinuteMean()).add(t, _float(new.get("state")))

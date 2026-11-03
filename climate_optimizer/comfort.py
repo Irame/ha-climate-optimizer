@@ -109,7 +109,7 @@ OVERRIDE_FUNCTIONS = {
 class Rule:
     id: str
     name: str
-    action: str  # "comfort" | "lockout" | "offset" | "no_airing" | "max_level"
+    action: str  # "comfort" | "lockout" | "offset" | "no_airing" | "no_venting" | "max_level"
     zones: list[str] = field(default_factory=list)  # zone ids; empty = all (for comfort / offset)
     units: list[str] = field(default_factory=list)  # unit ids (for lockout / max_level); empty = all
     function: str | None = None  # comfort function id (action comfort)
@@ -132,7 +132,7 @@ class Rule:
         return asdict(self)
 
     def validate(self) -> None:
-        if self.action not in ("comfort", "lockout", "offset", "no_airing", "max_level"):
+        if self.action not in ("comfort", "lockout", "offset", "no_airing", "no_venting", "max_level"):
             raise ValueError(f"rule {self.name}: unknown action {self.action}")
         if self.action == "comfort" and not self.function:
             raise ValueError(f"rule {self.name}: which comfort function?")
@@ -276,6 +276,7 @@ class Resolved:
     event_zone: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event set the zone's function or offset
     event_unit: dict[str, list[bool]] = field(default_factory=dict)  # a calendar event keeps the unit off
     no_airing: list[bool] = field(default_factory=list)  # no airing to be suggested
+    no_venting: list[bool] = field(default_factory=list)  # no windows open to cool
     target: dict[str, list[float]] = field(default_factory=dict)  # an override's temperature, nan where none
     max_level: dict[str, list[int | None]] = field(default_factory=dict)  # highest fan level allowed, None: any
 
@@ -301,6 +302,7 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
     ev_z = {z: [False] * N for z in zones}
     ev_u = {u: [False] * N for u in units}
     no_air = [False] * N
+    no_vent = [False] * N
     tgt = {z: [math.nan] * N for z in zones}
     cap: dict[str, list[int | None]] = {u: [None] * N for u in units}
     for _, _, spec, ivs in active:
@@ -328,6 +330,10 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
                         ev_u[u][k] = ev_u[u][k] or bool(spec.get("calendar"))
             elif spec["action"] == "no_airing":
                 no_air[k] = True
+                if spec.get("calendar"):  # 'Lüften: aus' means neither
+                    no_vent[k] = True
+            elif spec["action"] == "no_venting":
+                no_vent[k] = True
             elif spec["action"] == "max_level":  # the strictest of those that apply (quiet beats everything)
                 for u in (spec.get("units") or units):
                     if u in cap:
@@ -346,4 +352,4 @@ def resolve(step_starts: list[datetime], step_ends: list[datetime], zones: list[
                         lock[u][k] = False
                         ev_u[u][k] = False
     return Resolved(function=fn, offset=off, locked=lock, source=src, event_zone=ev_z, event_unit=ev_u, no_airing=no_air,
-                    target=tgt, max_level=cap)
+                    target=tgt, max_level=cap, no_venting=no_vent)

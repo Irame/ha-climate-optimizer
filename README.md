@@ -88,6 +88,51 @@ Skipped for two hours, the plan suggests a later time today if one is allowed; s
 
 The sensor lives until Home Assistant restarts; the next plan, at most five minutes later, sets it again. Setting it takes a token of an administrator. Only the next day with an airing is decided exactly; later ones are a preview, planned again on their day.
 
+**Opening the windows to cool.** With "Also open the windows to cool" (Comfort & schedules, Airing), the plan may have every window room open for as long as the outside air does better than the units: on a summer evening and over night, until it is cool enough or the morning gets warm. It opens them as often as it pays, each opening priced for the bother (0.10 € by default), with the units in those rooms off meanwhile. A "No windows open to cool" rule keeps it from set times (`Lüften: aus` from both). Home Assistant gets `sensor.climate_optimizer_venting`, the time to open them, with `until`.
+
+**Closing them.** `sensor.climate_optimizer_close_windows` says when open windows are best closed, whoever opened them: at the end of a suggested airing or venting; after the airing minutes when the plan heats (more only lets the heat out); at once when it cools and it is warmer outside than in. When the outside air helps, or there is nothing open, it is `unknown`. `POST /api/windows/later` with `{"minutes": 5}` puts it off; the dashboard has the button. A window opening or closing has the plan made again within 15 seconds. In Home Assistant:
+
+```yaml
+rest_command:
+  climate_windows_later:
+    url: http://<host>:8099/api/windows/later
+    method: POST
+    content_type: application/json
+    payload: '{"minutes": 5}'
+
+automation:
+  - alias: Open the windows to cool
+    triggers:
+      - trigger: time
+        at: sensor.climate_optimizer_venting
+    actions:
+      - action: notify.mobile_app_phone
+        data:
+          title: Fenster auf
+          message: "Zum Kühlen bis {{ as_timestamp(state_attr('sensor.climate_optimizer_venting', 'until')) | timestamp_custom('%H:%M') }}"
+  - alias: Close the windows
+    triggers:
+      - trigger: time
+        at: sensor.climate_optimizer_close_windows
+    actions:
+      - action: notify.mobile_app_phone
+        data:
+          title: Fenster zu
+          message: "{{ state_attr('sensor.climate_optimizer_close_windows', 'rooms') | join(', ') }}: {{ state_attr('sensor.climate_optimizer_close_windows', 'reason') }}"
+          data:
+            tag: climate-close
+            actions:
+              - action: WINDOWS_LATER
+                title: 5 Minuten länger
+  - alias: Close the windows later
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data: {action: WINDOWS_LATER}
+    actions:
+      - action: rest_command.climate_windows_later
+```
+
 **Overrides.** Two kinds, from the dashboard (Override… and Run… on each card), from Home Assistant, or for a room also from the calendar (`Wohnzimmer: 23 °C`):
 
 - *A room to a temperature*: as soon as it can, or by a time ("warm by 18:00", heated ahead when that is cheapest). Then back to the plan once reached, or held for a while or until a time. The target has its way: being under it costs more than electricity, at any price, and rule and calendar lockouts don't keep the room's units off meanwhile (an open window and a proxy that is off still do). One not reached in 12 hours is dropped.

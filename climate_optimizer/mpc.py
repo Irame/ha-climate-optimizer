@@ -101,6 +101,17 @@ class Airing:
 
 
 @dataclass
+class Venting:
+    """Windows open for as long as it pays, to cool with the outside air (a summer night):
+    every window zone at once, a share of each step, each opening priced for the bother."""
+
+    allowed: np.ndarray  # (N,) bool: may be open then
+    open_now: np.ndarray  # (N,) share already open (windows open now, for their first minutes)
+    hassle: float  # € for opening them
+    tref: dict[str, np.ndarray]  # window zone -> (N,) the air temperature the exchange is reckoned from
+
+
+@dataclass
 class Problem:
     sys: System
     t: np.ndarray  # (N+1,) step boundaries, ms
@@ -113,6 +124,7 @@ class Problem:
     units: list[UnitSpec]
     settings: Settings = field(default_factory=Settings)
     airing: Airing | None = None
+    venting: Venting | None = None
 
     @property
     def N(self) -> int:
@@ -143,6 +155,7 @@ class Plan:
     airing: list[tuple[int, int]] = field(default_factory=list)  # (start ms, end ms) of the airings chosen
     airing_cost: float | None = None  # what they add to the plan's cost (€), heating them back up included
     airing_share: np.ndarray | None = None  # per candidate, as solved (shares when relaxed)
+    vent: np.ndarray | None = None  # (N,) share of each step the windows are open to cool
 
     def step_at(self, t_ms: float) -> int | None:
         if self.t[0] - 5 * MIN <= t_ms < self.t[0]:
@@ -165,6 +178,7 @@ class Plan:
             "alternatives": {k: round(v, 4) for k, v in self.alternatives.items()},
             "comfort_cost": {k: round(v, 4) for k, v in self.comfort_cost.items()},
             "airing": [[int(a), int(b)] for a, b in self.airing],
+            "vent": None if self.vent is None else r(self.vent, 2),
             "airing_cost": None if self.airing_cost is None else round(self.airing_cost, 4),
         }
 
@@ -504,6 +518,25 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                 for j in win_units:
                     R.add([ON[j][k], AIR[c]], [1.0, ov], hi=1.0)
 
+    # venting: the windows open while the outside air cools (or warms) for less than the units
+    VENT = []
+    if pr.venting is not None and sys.nw:
+        vt = pr.venting
+        lb = np.minimum(np.asarray(vt.open_now, float), np.asarray(vt.allowed, float))
+        VENT = np.concatenate([V.add(int(fine.sum()), lb=lb[fine], ub=np.asarray(vt.allowed, float)[fine], integer=True),
+                               V.add(int((~fine).sum()), lb=lb[~fine], ub=np.asarray(vt.allowed, float)[~fine])])
+        vopen = V.add(N, lb=0.0, ub=1.0, c=vt.hassle)
+        win_units = [j for j, u in enumerate(U) if u.zone in layout.window_zones]
+        for k in range(N):
+            if k == 0:
+                R.add([vopen[0], VENT[0]], [1.0, -1.0], lo=-float(vt.open_now[0] > 0))
+            else:
+                R.add([vopen[k], VENT[k], VENT[k - 1]], [1.0, -1.0, 1.0], lo=0.0)
+            for j in win_units:  # no unit runs against open windows
+                R.add([ON[j][k], VENT[k]], [1.0, 1.0], hi=1.0)
+            for c, ov in air_open.get(k, []):  # an airing is not on top of it
+                R.add([VENT[k], AIR[c]], [1.0, ov], hi=1.0)
+
     # dynamics
     wz = [layout.zone_index(z) for z in layout.window_zones]
     for k in range(N):
@@ -520,6 +553,11 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                 if b:
                     cols.append(Q[j][k])
                     vals.append(-b * sign[j])
+            if len(VENT):  # open to cool: Hw (Tout - Ta), Ta as reckoned
+                coef = sum(Bd[i, sl_w.start + jw] * (tout[k] - pr.venting.tref[z][k]) for jw, z in enumerate(layout.window_zones))
+                if coef:
+                    cols.append(VENT[k])
+                    vals.append(-coef)
             for c, ov in air_open.get(k, []):  # an open window: Hw (Tout - Ta), Ta taken as the reference
                 coef = sum(Bd[i, sl_w.start + jw] * ov * (1.0 - pr.window[k, jw]) * (tout[k] - pr.airing.tref[z][k])
                            for jw, z in enumerate(layout.window_zones))
@@ -621,7 +659,7 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
               "total": energy + comfort_cost + starts_cost + term_cost},
         status=status, seconds=seconds, gap=getattr(res, "mip_gap", None),
         comfort_cost={z: float(np.dot(x[v], np.array(V.c)[v])) for z, v in seg_zone.items()},
-        airing=aired, airing_share=air_share,
+        airing=aired, airing_share=air_share, vent=np.clip(x[VENT], 0.0, 1.0) if len(VENT) else None,
     )
     return plan, float(res.fun)
 

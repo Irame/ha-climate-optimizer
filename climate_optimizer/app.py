@@ -44,6 +44,7 @@ class Service:
         self.collector = Collector(self.ha, self.store)
         self.collector.track(tracked_entities(c.mapping))
         self.planner = Planner(lambda: self.cfgs.config, self.store, self.collector, self.ha)
+        self.collector.on_window = self.planner.window_changed
         self.trainer = Trainer(self.planner, str(data_dir / "training.json"))
         self.stop = asyncio.Event()
         self.tasks: list[asyncio.Task] = []
@@ -346,6 +347,21 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
             until = now.timestamp() * 1000 + minutes * MIN
         await s.planner.skip_airing(until)
         return {"skipped_until": int(until) if until else None}
+
+    @app.post("/api/windows/later", dependencies=[Depends(auth)])
+    async def close_later(body: dict):
+        """{"minutes": 5}: the windows may stay open that much longer before the close sensor says so."""
+        s = svc()
+        try:
+            minutes = float(body.get("minutes", 5))
+        except (TypeError, ValueError):
+            raise HTTPException(422, "minutes: a number")
+        if not 0 < minutes <= 12 * 60:
+            raise HTTPException(422, "minutes: up to 12 hours")
+        until = time.time() * 1000 + minutes * MIN
+        s.store.put("close_later", {"until": int(until)})
+        asyncio.create_task(s.planner.replan(fresh=True))
+        return {"close_not_before": int(until)}
 
     @app.get("/api/energy/days", dependencies=[Depends(auth)])
     async def energy(days: int = 14):

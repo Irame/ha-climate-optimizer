@@ -236,6 +236,11 @@ pages.dashboard = async (redraw) => {
   root.innerHTML = html;
   root.querySelectorAll('[data-ov-zone]').forEach(b => b.onclick = () => overrideDialog(b.dataset.ovZone, b.dataset.ovUnit));
   root.querySelectorAll('[data-run-unit]').forEach(b => b.onclick = () => runDialog(b.dataset.runUnit));
+  root.querySelectorAll('[data-close-later]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    await api('windows/later', { method: 'POST', body: JSON.stringify({ minutes: +b.dataset.closeLater }) }).catch(() => null);
+    setTimeout(() => { if (current === 'dashboard') pages.dashboard(); }, 2500);
+  });
   root.querySelectorAll('[data-air-skip]').forEach(b => b.onclick = async () => {
     b.disabled = true;
     await api('airing/skip', { method: 'POST', body: JSON.stringify({ skip: b.dataset.airSkip }) }).catch(() => null);
@@ -252,8 +257,15 @@ pages.dashboard = async (redraw) => {
 };
 
 function airTile(P, info) {
+  const w = info.windows || {};
+  const vp = (info.venting?.periods || []).filter(p => p[1] > Date.now());
+  const closeLine = w.open?.length ? `<div class="s">${w.close_at ? `close the windows ${w.close_at <= Date.now() + MIN ? 'now' : 'at ' + fmtTime(w.close_at, S.tz)}` : 'windows may stay open'} · ${esc(w.reason || '')}</div>
+    <div class="row card-actions" style="gap:6px;margin-top:6px"><button data-close-later="5">5 min longer</button></div>` : '';
+  const ventLine = S.config.airing?.venting ? `<div class="s">${vp.length ? 'to cool: ' + vp.slice(0, 2).map(p => `${p[0] <= Date.now() ? 'now' : fmtTime(p[0], S.tz)}–${fmtTime(p[1], S.tz)}`).join(', ') : 'no opening to cool in the plan'}</div>` : '';
   const ai = info.airing;
-  if (!S.config.airing?.enabled || !ai) return '';
+  if (!S.config.airing?.enabled || !ai) {
+    return closeLine || ventLine ? `<div class="stat"><div class="k">Windows</div>${ventLine}${closeLine}</div>` : '';
+  }
   const sug = ai.suggested || P.airing?.[0];
   const later = (P.airing || []).filter(a => !sug || a[0] > sug[0]);
   const now = Date.now();
@@ -278,7 +290,7 @@ function airTile(P, info) {
     ? `<button data-air-skip="">Suggest again</button>`
     : `<button data-air-skip="2h">Skip 2 h</button><button data-air-skip="today">Skip today</button>`;
   return `<div class="stat"><div class="k">Airing</div><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div>
-    <div class="row card-actions" style="gap:6px;margin-top:6px">${acts}</div></div>`;
+    <div class="row card-actions" style="gap:6px;margin-top:6px">${acts}</div>${ventLine}${closeLine}</div>`;
 }
 
 // ---- overrides: a room to a temperature, a unit to run a while -------------------
@@ -406,7 +418,7 @@ function drawTimeline(box, P, info, hist) {
     P.share[u.id].forEach((v, k) => spans.push({ t0: P.t[k], t1: P.t[k + 1], v, label: v > 0.01 ? `${num(Math.abs(P.heat[u.id][k]), 2)} kW${v < 0.99 ? ', ' + Math.round(v * 100) + ' % of the step' : ''}` : 'off' }));
     return { name: u.name, short: u.name.split(' ')[0], color: zoneColor(u.zone), spans };
   });
-  if (S.config.airing?.enabled || hist?.open) {
+  if (S.config.airing?.enabled || S.config.airing?.venting || hist?.open) {
     // windows: open as recorded (any window room), then the airing planned
     const spans = [];
     const zs = Object.keys(hist?.open || {});
@@ -418,7 +430,8 @@ function drawTimeline(box, P, info, hist) {
     const sug = info.airing?.suggested;
     if (sug && !planned.some(a => a[0] === sug[0])) planned.unshift(sug);
     for (const [a, b] of planned) if (b > now) spans.push({ t0: Math.max(a, now), t1: b, v: 1, label: `airing suggested ${fmtTime(a, S.tz)}–${fmtTime(b, S.tz)}` });
-    if (spans.length || S.config.airing?.enabled) rows.push({ name: 'Windows', short: 'Windows', color: css('--muted'), spans });
+    if (P.vent) P.vent.forEach((v, k) => { if (v > 0.01 && P.t[k + 1] > now) spans.push({ t0: Math.max(P.t[k], now), t1: P.t[k + 1], v, label: `open to cool${v < 0.99 ? ', ' + Math.round(v * 100) + ' % of the step' : ''}` }); });
+    if (spans.length || S.config.airing?.enabled || S.config.airing?.venting) rows.push({ name: 'Windows', short: 'Windows', color: css('--muted'), spans });
   }
   g.add({ title: 'Units: recorded, then planned (height: share of each step running)' }).gantt(rows);
   // electricity, then its price, on the same time axis (two panels: one scale each)
@@ -634,6 +647,13 @@ pages.comfort = async (redraw) => {
       <label class="field">At least apart (h)<input type="number" min="0.5" max="12" step="0.5" data-air="min_gap_h" value="${A.min_gap_h}"></label>
       <label class="field">Sensor in Home Assistant<input data-air="sensor" value="${esc(A.sensor)}" placeholder="none"></label>
     </div>
+    <label class="check" style="margin-top:12px"><input type="checkbox" id="vent-on" ${A.venting ? 'checked' : ''}> Also open the windows to cool, for as long as it pays (summer nights)</label>
+    <div class="fields" style="margin-top:10px">
+      <label class="field">Opening them is worth avoiding (€ each time)<input type="number" min="0" max="5" step="0.05" data-air="vent_hassle_eur" value="${A.vent_hassle_eur ?? 0.1}"></label>
+      <label class="field">Sensor: when to open them<input data-air="vent_sensor" value="${esc(A.vent_sensor || '')}"></label>
+      <label class="field">Sensor: when to close open windows<input data-air="close_sensor" value="${esc(A.close_sensor || '')}"></label>
+    </div>
+    <p class="hint">To cool, the plan opens every window room at once for as long as the outside air does better than the units, over night too, and as often as it pays for the bother priced above; the units there stay off meanwhile. A <b>No venting</b> rule keeps it from those times. The close sensor says when open windows are best closed, whoever opened them: at the end of an airing or a venting, after the airing minutes when it heats, at once when it cools and it is warmer outside.</p>
     <p class="hint">The plan puts it where the heat let out and heated back costs least (when cooling: where the outside air cools best), with the units in the window rooms off meanwhile, on the hour or half hour. Not when a <b>No airing</b> rule or a <code>Lüften: aus</code> event says so. Airings done today are seen at the window sensors${windowRooms.length ? ' (' + windowRooms.map(z => esc(z.name)).join(', ') + ')' : ''}. Home Assistant gets the next one as a timestamp sensor, with its end and extra cost as attributes, to notify with.</p>
     ${A.enabled && !windowRooms.length ? '<div class="msg">No room has window sensors yet: set them in <a href="#settings">Settings</a>, the plan airs the rooms that have them.</div>' : ''}
     ${A.enabled && !airRule ? '<div class="row"><span class="hint">No rule keeps it from the night.</span><button id="air-night">Add “No airing at night”</button></div>' : ''}
@@ -691,6 +711,7 @@ pages.comfort = async (redraw) => {
   root.querySelectorAll('[data-comfort]').forEach(s => s.oninput = () => { if (s.value === '') delete D.comfort[s.dataset.comfort]; else D.comfort[s.dataset.comfort] = +s.value; });
   $('#cal').onchange = e => { D.calendar = e.target.value; };
   const nightRule = () => ({ id: 'night-no-airing', name: 'No airing at night', action: 'no_airing', zones: [], units: [], function: null, offset: 0, rrule: 'FREQ=DAILY', dtstart: new Date().toISOString().slice(0, 10), start: '22:00', end: '07:00', priority: 10, enabled: true });
+  $('#vent-on').onchange = e => { A.venting = e.target.checked; };
   $('#air-on').onchange = e => {
     A.enabled = e.target.checked;
     if (A.enabled && !D.rules.some(r => r.action === 'no_airing')) D.rules.unshift(nightRule());  // nights off, to start with
@@ -751,12 +772,12 @@ function ruleEditor(r, i, D, fnOpts) {
   const freq = rr.FREQ || 'DAILY';
   const byday = (rr.BYDAY || '').split(',').filter(Boolean);
   const byUnit = r.action === 'lockout' || r.action === 'max_level';
-  const targets = r.action === 'no_airing' ? '' : byUnit
+  const targets = r.action === 'no_airing' || r.action === 'no_venting' ? '' : byUnit
     ? (r.action === 'max_level' ? L.units.filter(u => u.kind === 'ac') : L.units).map(u => `<label class="check"><input type="checkbox" data-unit="${u.id}" ${r.units.includes(u.id) ? 'checked' : ''}>${esc(u.name)}</label>`).join(' ')
     : L.zones.map(z => `<label class="check"><input type="checkbox" data-zone="${z.id}" ${r.zones.includes(z.id) ? 'checked' : ''}>${esc(z.name)}</label>`).join(' ');
   box.innerHTML = `<div class="row" style="margin-bottom:8px"><label class="check"><input type="checkbox" data-k="enabled" ${r.enabled ? 'checked' : ''}></label>
       <input data-k="name" value="${esc(r.name)}" style="font-weight:600;flex:1;min-width:160px">
-      <select data-k="action"><option value="comfort" ${r.action === 'comfort' ? 'selected' : ''}>Comfort function</option><option value="offset" ${r.action === 'offset' ? 'selected' : ''}>Comfort temperature ±</option><option value="lockout" ${r.action === 'lockout' ? 'selected' : ''}>Keep units off</option><option value="max_level" ${r.action === 'max_level' ? 'selected' : ''}>Limit the fan level</option><option value="no_airing" ${r.action === 'no_airing' ? 'selected' : ''}>No airing suggested</option></select>
+      <select data-k="action"><option value="comfort" ${r.action === 'comfort' ? 'selected' : ''}>Comfort function</option><option value="offset" ${r.action === 'offset' ? 'selected' : ''}>Comfort temperature ±</option><option value="lockout" ${r.action === 'lockout' ? 'selected' : ''}>Keep units off</option><option value="max_level" ${r.action === 'max_level' ? 'selected' : ''}>Limit the fan level</option><option value="no_airing" ${r.action === 'no_airing' ? 'selected' : ''}>No airing suggested</option><option value="no_venting" ${r.action === 'no_venting' ? 'selected' : ''}>No windows open to cool</option></select>
       ${r.action === 'comfort' ? `<select data-k="function">${fnOpts(r.function)}</select>` : ''}
       ${r.action === 'offset' ? `<input type="number" step="0.5" data-k="offset" value="${r.offset}" style="width:80px"> K` : ''}
       ${r.action === 'max_level' ? `<span class="hint">at most</span><input type="number" min="0" max="9" step="1" data-k="level" value="${r.level ?? 0}" style="width:70px">` : ''}

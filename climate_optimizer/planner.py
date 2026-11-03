@@ -88,6 +88,7 @@ class Planner:
         self.overrides = Overrides(store)
         self._published: dict[str, str] = {}  # override sensors as last set in Home Assistant
         self._run_over: dict[str, float] = {}  # unit -> when its run ended (by hand or by the clock)
+        self._window_task: asyncio.Task | None = None
         self._wake: asyncio.Task | None = None
         self._airing_sent = False
         self.state = PlanState()
@@ -420,7 +421,12 @@ class Planner:
         airing = None
         if cfg.airing.enabled and layout.window_zones:
             airing, info["airing"] = self.airing_spec(now_ms, t, comfort, x0, layout, tz, events)
-        pr = mpc.Problem(sysm, t, dist, win, price, x0, comfort, functions, units, st, airing)
+        venting = None
+        if cfg.airing.venting and layout.window_zones:
+            venting = self.venting_spec(now_ms, t, comfort, x0, layout, res, open_zone, st)
+            if venting.open_now.any():
+                win[:] = 0.0  # open everywhere: the venting's own, and the plan says until when
+        pr = mpc.Problem(sysm, t, dist, win, price, x0, comfort, functions, units, st, airing, venting)
         info["overrides"] = self.overrides.list()
         info["ghi"] = (ghi * 1000).round(0).tolist()  # W/m²
         info["cloud"] = (cloud * 100).round(0).tolist()  # %
@@ -524,6 +530,142 @@ class Planner:
             self.airing_now = None  # the one suggested (or under way) is the one skipped
         asyncio.create_task(self.replan(fresh=True))
 
+    def venting_spec(self, now_ms: float, t: np.ndarray, comfort: dict, x0: np.ndarray, layout: Layout, res,
+                     open_zone: set, st: mpc.Settings) -> mpc.Venting:
+        """Windows open to cool: when the rules allow, every window room at once; open
+        everywhere now, they stay open their first minutes. The exchange is reckoned from
+        the temperatures the last plan expected (the air the windows will meet), else
+        from the comfort temperature."""
+        N = len(t) - 1
+        starts_min = (t[:-1] - now_ms) / MIN
+        allowed = ~np.array(res.no_venting, bool)
+        open_now = np.zeros(N)
+        if open_zone and open_zone >= set(layout.window_zones):
+            open_now[starts_min < st.window_assume_open_min] = 1.0
+            allowed |= open_now > 0
+        prev = self.state.plan if self.state.plan is not None and now_ms - self.state.created < 15 * MIN else None
+        tref = {}
+        for z in layout.window_zones:
+            i = layout.zone_index(z)
+            base = np.asarray(comfort[z], float) if z in comfort else np.full(N, float(x0[i]))
+            if prev is not None and z in prev.temp:
+                ref = np.interp(t[:-1], prev.t, prev.temp[z], right=np.nan)
+                base = np.where(np.isfinite(ref), ref, base)
+            tref[z] = base
+        return mpc.Venting(allowed=allowed, open_now=open_now, hassle=self.cfg.airing.vent_hassle_eur, tref=tref)
+
+    def windows_open(self) -> dict[str, float]:
+        """Window rooms with a window open now -> since when (ms)."""
+        zmap = self.cfg.mapping.get("zones") or {}
+        out = {}
+        for zid in self.cfg.layout_obj().window_zones:
+            for w in (zmap.get(zid) or {}).get("windows") or []:
+                s = self.collector.states.get(w) or {}
+                if s.get("state") == "on":
+                    try:
+                        since = datetime.fromisoformat(str(s.get("last_changed")).replace("Z", "+00:00")).timestamp() * 1000
+                    except ValueError:
+                        since = time.time() * 1000
+                    out[zid] = min(out.get(zid, since), since)
+        return out
+
+    def close_suggestion(self, plan: mpc.Plan, info: dict, now: float) -> tuple[float | None, str]:
+        """When open windows are best closed, and why; None when they may stay open."""
+        open_w = self.windows_open()
+        if not open_w:
+            return None, "all closed"
+        a = self.cfg.airing
+        cur = self.airing_now
+        later = float((self.store.get("close_later") or {}).get("until") or 0)
+        if cur and cur[0] <= now < cur[1]:
+            at, why = cur[1], "the airing is over"
+        elif plan.vent is not None and (k := plan.step_at(now)) is not None and plan.vent[k] >= 0.5:
+            j = next((j for j in range(k, len(plan.vent)) if plan.vent[j] < 0.5), None)
+            if j is None:
+                return None, "open to cool, as far as the plan reaches"
+            at, why = float(plan.t[j]), "cool enough, or the outside air no longer helps"
+        else:
+            layout = self.cfg.layout_obj()
+            tin = np.nanmean([self.live((self.cfg.mapping.get("zones") or {}).get(z, {}).get("thermometer")) for z in open_w])
+            tout = float((info.get("tout") or [np.nan])[0])
+            if not np.isfinite(tin) or not np.isfinite(tout):
+                at, why = min(open_w.values()) + a.duration_min * MIN, "aired long enough"
+            elif tout > tin and plan.mode == "cool":
+                at, why = now, "warmer outside than in"
+            elif tout < tin and plan.mode == "heat":
+                at, why = min(open_w.values()) + a.duration_min * MIN, "aired long enough: more only lets the heat out"
+            else:
+                return None, "the outside air helps now"
+        return max(at, later), why
+
+    async def publish_windows(self, plan: mpc.Plan, info: dict) -> None:
+        """Two sensors: when to open the windows to cool (venting), and when to close open ones."""
+        a = self.cfg.airing
+        if not hasattr(self.ha, "set_state") or not self.ha.connected.is_set():
+            return
+        now = time.time() * 1000
+        iso = lambda ms: datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+        layout = self.cfg.layout_obj()
+        names = {z.id: z.name for z in layout.zones}
+        at, why = self.close_suggestion(plan, info, now)
+        open_w = self.windows_open()
+        if not open_w and (self.store.get("close_later") or {}).get("until"):
+            self.store.put("close_later", {})  # closed: the next opening starts afresh
+        info["windows"] = {"open": sorted(open_w), "close_at": at, "reason": why}
+        want = {a.close_sensor: (iso(at) if at else "unknown",
+                                 {"friendly_name": "Climate optimizer: close windows", "device_class": "timestamp",
+                                  "icon": "mdi:window-closed-variant", "rooms": [names[z] for z in sorted(open_w)], "reason": why,
+                                  "since": iso(min(open_w.values())) if open_w else None})}
+        periods = []
+        if plan.vent is not None:
+            on = plan.vent >= 0.5
+            k = 0
+            while k < len(on):
+                if on[k]:
+                    j = k
+                    while j < len(on) and on[j]:
+                        j += 1
+                    periods.append([int(plan.t[k]), int(plan.t[j])])
+                    k = j
+                else:
+                    k += 1
+        info["venting"] = {"periods": periods}
+        if a.venting:
+            nxt = next((p for p in periods if p[1] > now), None)
+            attrs = {"friendly_name": "Climate optimizer: open windows to cool", "device_class": "timestamp",
+                     "icon": "mdi:window-open-variant", "rooms": [z.name for z in layout.zones if z.windows]}
+            if nxt and not (open_w and nxt[0] <= now):
+                state = iso(max(nxt[0], now))
+                attrs["until"] = iso(nxt[1])
+            else:
+                state = "unknown"
+                attrs["reason"] = "open now, to cool" if nxt else "none in the plan"
+                if nxt:
+                    attrs["until"] = iso(nxt[1])
+            want[a.vent_sensor] = (state, attrs)
+        elif self._published.get(a.vent_sensor):
+            want[a.vent_sensor] = ("unknown", {"friendly_name": "Climate optimizer: open windows to cool", "reason": "venting is off"})
+        for eid, (state, attrs) in want.items():
+            key = json.dumps([state, attrs], sort_keys=True)
+            if self._published.get(eid) == key:
+                continue
+            try:
+                await self.ha.set_state(eid, state, attrs)
+                self._published[eid] = key
+            except Exception as e:
+                log.warning("window sensor %s: %s", eid, e)
+
+    def window_changed(self, eid: str) -> None:
+        """A window opened or closed: plan again soon (the units there, and when to close)."""
+        if self._window_task is not None and not self._window_task.done():
+            return
+
+        async def later():
+            await asyncio.sleep(15)  # several windows opened together: one plan for them
+            await self.replan(fresh=True)
+
+        self._window_task = asyncio.create_task(later())
+
     async def publish_airing(self, plan: mpc.Plan, info: dict) -> None:
         """The next suggestion as a sensor in Home Assistant, for its own automations."""
         a = self.cfg.airing
@@ -588,6 +730,7 @@ class Planner:
             info["prices"] = inputs["prices"]
             self.state = PlanState(plan=plan, created=now, error=None, info=info)
             await self.publish_airing(plan, info)
+            await self.publish_windows(plan, info)
             await self.publish_overrides()
             self._arm()
             self.record_forecast(plan, now)
