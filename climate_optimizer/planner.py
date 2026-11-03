@@ -478,6 +478,9 @@ class Planner:
         done, last = self.airing_done_today(now_ms, tz)
         today = datetime.fromtimestamp(now_ms / 1000, tz).date()
         info = {"done_today": done, "per_day": a.per_day, "duration_min": a.duration_min}
+        skip = self.airing_skipped(now_ms)
+        if skip:
+            info["skipped_until"] = skip
         # every half hour from now to the end of the plan's last day, to see each day's allowed times whole
         last_day = datetime.fromtimestamp(end / 1000, tz).date()
         day_end = datetime.combine(last_day, datetime.min.time(), tz) + timedelta(days=1)
@@ -489,7 +492,7 @@ class Planner:
         blocked = resolve(s_dt, e_dt, [], [], {}, cfg.rule_objs(), events).no_airing
         cand, groups, by_day = [], [], {}
         for x, d, no in zip(starts, s_dt, blocked):
-            if no or (last is not None and d.date() == today and x - last < gap):
+            if no or x < skip or (last is not None and d.date() == today and x - last < gap):
                 continue
             by_day.setdefault(d.date(), []).append(x)
         for day, xs in sorted(by_day.items()):
@@ -509,6 +512,18 @@ class Planner:
             tref[z] = np.asarray(comfort[z], float) if z in comfort else np.full(N, float(x0[i]))
         return mpc.Airing(cand=cand, groups=groups, min_gap_ms=gap, tref=tref), info
 
+    def airing_skipped(self, now_ms: float) -> float:
+        """Until when no airing is to be suggested (someone said not now), 0 if not."""
+        until = float((self.store.get("airing_skip") or {}).get("until") or 0)
+        return until if until > now_ms else 0.0
+
+    async def skip_airing(self, until_ms: float | None) -> None:
+        """No airing suggested before until_ms (None: suggest again), and plan so at once."""
+        self.store.put("airing_skip", {"until": int(until_ms)} if until_ms else {})
+        if until_ms and self.airing_now and self.airing_now[0] < until_ms:
+            self.airing_now = None  # the one suggested (or under way) is the one skipped
+        asyncio.create_task(self.replan(fresh=True))
+
     async def publish_airing(self, plan: mpc.Plan, info: dict) -> None:
         """The next suggestion as a sensor in Home Assistant, for its own automations."""
         a = self.cfg.airing
@@ -518,7 +533,7 @@ class Planner:
         cur = self.airing_now
         if not a.enabled:
             nxt = None
-        elif cur and cur[0] <= now < cur[1]:
+        elif cur and cur[0] <= now < cur[1] and cur[0] >= self.airing_skipped(now):
             nxt = cur  # under way: it stays the suggestion until it is over
         else:
             nxt = next(((s0, e0) for s0, e0 in plan.airing if e0 > now), None)
@@ -536,7 +551,12 @@ class Planner:
                 attrs["extra_cost_eur"] = round(plan.airing_cost, 3)  # all of the plan's airings together
         else:
             state = "unknown"
-            attrs["reason"] = "airing suggestions are off" if not a.enabled else ai.get("none") or "none in the plan yet"
+            skip = self.airing_skipped(now)
+            attrs["reason"] = ("airing suggestions are off" if not a.enabled
+                               else f"skipped until {datetime.fromtimestamp(skip / 1000, self.tz()).strftime('%H:%M')}" if skip
+                               else ai.get("none") or "none in the plan yet")
+            if skip:
+                attrs["skipped_until"] = datetime.fromtimestamp(skip / 1000, timezone.utc).isoformat()
         try:
             await self.ha.set_state(a.sensor, state, attrs)
             self._airing_sent = a.enabled

@@ -321,6 +321,32 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         out["predicted_1h"] = pred
         return _json(out)
 
+    @app.post("/api/airing/skip", dependencies=[Depends(auth)])
+    async def skip_airing(body: dict):
+        """{"skip": "today"} for no more airing today, "2h" (or "90m") for not now; {"skip": ""}
+        to suggest again. For a notification's actions in Home Assistant."""
+        import re as _re
+
+        s = svc()
+        tz = s.planner.tz()
+        now = datetime.now(tz)
+        what = str(body.get("skip", "")).strip().lower()
+        if what in ("", "none", "off", "undo"):
+            until = None
+        elif what == "today":
+            until = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+        else:
+            m = _re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*(h|m|min)?", what)
+            if not m:
+                raise HTTPException(422, 'skip: "today", "2h" or "90m"')
+            n = float(m[1].replace(",", "."))
+            minutes = n if m[2] in ("m", "min") else n * 60
+            if not 0 < minutes <= 48 * 60:
+                raise HTTPException(422, "skip: up to 48 hours")
+            until = now.timestamp() * 1000 + minutes * MIN
+        await s.planner.skip_airing(until)
+        return {"skipped_until": int(until) if until else None}
+
     @app.get("/api/energy/days", dependencies=[Depends(auth)])
     async def energy(days: int = 14):
         s = svc()

@@ -236,6 +236,11 @@ pages.dashboard = async (redraw) => {
   root.innerHTML = html;
   root.querySelectorAll('[data-ov-zone]').forEach(b => b.onclick = () => overrideDialog(b.dataset.ovZone, b.dataset.ovUnit));
   root.querySelectorAll('[data-run-unit]').forEach(b => b.onclick = () => runDialog(b.dataset.runUnit));
+  root.querySelectorAll('[data-air-skip]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    await api('airing/skip', { method: 'POST', body: JSON.stringify({ skip: b.dataset.airSkip }) }).catch(() => null);
+    setTimeout(() => { if (current === 'dashboard') pages.dashboard(); }, 2500);
+  });
   root.querySelectorAll('[data-ov-cancel]').forEach(b => b.onclick = async () => {
     b.disabled = true;
     await api('overrides?id=' + encodeURIComponent(b.dataset.ovCancel), { method: 'DELETE' }).catch(() => null);
@@ -265,11 +270,15 @@ function airTile(P, info) {
     sub = `${day}${num(ai.duration_min, 0)} min${cost}`;
   } else {
     v = '—';
-    sub = ai.none || 'none in the plan';
+    sub = ai.skipped_until ? `skipped until ${fmtTime(ai.skipped_until, S.tz)}` : ai.none || 'none in the plan';
   }
   if (later.length) sub += ` · then ${later.map(a => (fmtDay(a[0], S.tz) !== fmtDay(now, S.tz) ? fmtDay(a[0], S.tz).split(',')[0] + ' ' : '') + fmtTime(a[0], S.tz)).join(', ')}`;
   sub += ai.done_today >= ai.per_day ? ' · done for today' : ai.done_today ? ` · ${ai.done_today} of ${ai.per_day} done today` : '';
-  return `<div class="stat"><div class="k">Airing</div><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div></div>`;
+  const acts = ai.skipped_until
+    ? `<button data-air-skip="">Suggest again</button>`
+    : `<button data-air-skip="2h">Skip 2 h</button><button data-air-skip="today">Skip today</button>`;
+  return `<div class="stat"><div class="k">Airing</div><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div>
+    <div class="row card-actions" style="gap:6px;margin-top:6px">${acts}</div></div>`;
 }
 
 // ---- overrides: a room to a temperature, a unit to run a while -------------------
@@ -585,6 +594,10 @@ const sideCost = (s, d) => {
 
 pages.comfort = async (redraw) => {
   const root = $('#page-comfort');
+  // drawn again after a change: stay where you were (the page is empty for a moment,
+  // and the browser would scroll to the top while the two-week preview loads)
+  const keepY = redraw ? window.scrollY : null;
+  if (redraw) root.style.minHeight = root.offsetHeight + 'px';
   if (!redraw || !S.draft) {
     await loadBase();
     if (!S.entities) S.entities = await api('entities').catch(() => []);
@@ -704,7 +717,8 @@ pages.comfort = async (redraw) => {
       drawPreview();
     } catch (e) { msg.textContent = 'Not saved: ' + e.message; }
   };
-  drawPreview();
+  if (keepY !== null) window.scrollTo(0, keepY);
+  drawPreview().finally(() => { root.style.minHeight = ''; });
   $('#cal-reload').onclick = async () => {
     const b = $('#cal-reload');
     b.disabled = true;
@@ -778,7 +792,11 @@ function ruleEditor(r, i, D, fnOpts) {
     else if (k === 'level') r.level = Math.max(0, Math.round(+e.value || 0));
     else if (k === 'start' || k === 'end') r[k] = e.value || '00:00';
     else r[k] = e.value;
-    if (k === 'action') { if (r.action === 'comfort' && !r.function) r.function = D.functions[0].id; pages.comfort(true); }
+    if (k === 'action') {
+      if (r.action === 'comfort' && !r.function) r.function = D.functions[0].id;
+      if (r.action === 'max_level' && r.level === undefined) r.level = 0;
+      pages.comfort(true);
+    }
     if (k === 'rrule') pages.comfort(true);
   });
   box.querySelectorAll('[data-zone]').forEach(c => c.onchange = () => { r.zones = [...box.querySelectorAll('[data-zone]')].filter(x => x.checked).map(x => x.dataset.zone); });

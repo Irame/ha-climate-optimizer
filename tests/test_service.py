@@ -475,3 +475,35 @@ def test_quiet_rule_caps_the_answer(client):
         assert pv["max_level"]["living"][0] == 0 and pv["max_level"]["office"][0] is None
     finally:
         client.put("/api/config", json={"rules": rules})
+
+
+def test_airing_can_be_skipped(client):
+    import time as _t
+
+    svc = client.svc
+    world = svc.ha.world
+    client.put("/api/config", json={"airing": {"enabled": True}})
+    svc.planner.airing_done_today = lambda *a: (0, None)
+    try:
+        r = client.post("/api/plan").json()
+        first = r["plan"]["airing"][0] if r["plan"]["airing"] else None
+        out = client.post("/api/airing/skip", json={"skip": "2h"}).json()
+        now = _t.time() * 1000
+        assert abs(out["skipped_until"] - (now + 2 * 3.6e6)) < 60_000
+        r = client.post("/api/plan").json()
+        assert all(a >= out["skipped_until"] for a, _ in r["plan"]["airing"])
+        assert r["info"]["airing"]["skipped_until"] == out["skipped_until"]
+        if first and first[0] < out["skipped_until"]:
+            assert world.extra["sensor.climate_optimizer_airing"][0] != datetime.fromtimestamp(first[0] / 1000).astimezone().isoformat()
+        today = client.post("/api/airing/skip", json={"skip": "today"}).json()["skipped_until"]
+        d = datetime.fromtimestamp(today / 1000, svc.planner.tz())
+        assert (d.hour, d.minute) == (0, 0) and d.date() > datetime.now(svc.planner.tz()).date()
+        r = client.post("/api/plan").json()
+        assert all(datetime.fromtimestamp(a / 1000, svc.planner.tz()).date() >= d.date() for a, _ in r["plan"]["airing"])
+        assert client.post("/api/airing/skip", json={"skip": "soon"}).status_code == 422
+        assert client.post("/api/airing/skip", json={"skip": ""}).json() == {"skipped_until": None}
+        assert "skipped_until" not in client.post("/api/plan").json()["info"]["airing"]
+    finally:
+        del svc.planner.airing_done_today
+        client.put("/api/config", json={"airing": {"enabled": False}})
+        svc.store.put("airing_skip", {})

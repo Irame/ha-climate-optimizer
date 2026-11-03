@@ -41,6 +41,51 @@ actions:
       message: "Time to air, for {{ state_attr('sensor.climate_optimizer_airing', 'duration_min') | int }} minutes"
 ```
 
+To offer "not now" and "not today" from the notification itself, give it actions and send them back to the optimizer (`POST /api/airing/skip` with `"skip": "2h"`, `"today"`, or `""` to suggest again; the dashboard's Airing tile has the same buttons):
+
+```yaml
+rest_command:
+  climate_airing_skip:
+    url: http://<host>:8099/api/airing/skip
+    method: POST
+    content_type: application/json
+    payload: '{"skip": "{{ skip }}"}'
+
+automation:
+  - alias: Airing suggestion
+    triggers:
+      - trigger: time
+        at: sensor.climate_optimizer_airing
+    actions:
+      - action: notify.mobile_app_phone
+        data:
+          title: Lüften
+          message: "Jetzt {{ state_attr('sensor.climate_optimizer_airing', 'duration_min') | int }} Minuten lüften"
+          data:
+            tag: climate-airing
+            actions:
+              - action: AIRING_SKIP_2H
+                title: In 2 Stunden
+              - action: AIRING_SKIP_TODAY
+                title: Heute nicht
+  - alias: Airing skipped
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data: {action: AIRING_SKIP_2H}
+        id: 2h
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data: {action: AIRING_SKIP_TODAY}
+        id: today
+    actions:
+      - action: rest_command.climate_airing_skip
+        data:
+          skip: "{{ trigger.id }}"
+```
+
+Skipped for two hours, the plan suggests a later time today if one is allowed; skipped for today, it suggests again tomorrow. The sensor then shows the new time (the time trigger follows it), or `unknown` with `skipped_until`.
+
 The sensor lives until Home Assistant restarts; the next plan, at most five minutes later, sets it again. Setting it takes a token of an administrator. Only the next day with an airing is decided exactly; later ones are a preview, planned again on their day.
 
 **Overrides.** Two kinds, from the dashboard (Override… and Run… on each card), from Home Assistant, or for a room also from the calendar (`Wohnzimmer: 23 °C`):
