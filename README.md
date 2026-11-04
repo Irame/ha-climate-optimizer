@@ -8,11 +8,11 @@ It runs as a container next to Home Assistant, with its own web page for the pla
 
 **The model.** Every room is three heat stores: its air (what the thermometer reads), its surfaces and furniture (charged within hours), and the structure behind them (walls and floors: days). Rooms exchange heat through their air. Losses go to the outside and to the neighbours; sun comes in through the facades; open windows and doors add losses. Each AC unit delivers a learned amount of heat per fan level, a little less the colder it is outside, and all units share one outdoor unit. Its electricity is learned from the phase: a base whenever it runs at all, the heat over an efficiency that follows the temperatures, an extra that grows with the square of the total at high load, an electric limit where the power stops rising however much the units ask, and a little energy for every start (the spike on the phase when the outdoor unit comes on). Low load is dear by the base, high load by the extra; the plan bundles heating where it can, and plans no more heat than the limit allows. The numbers are fitted every night to the recorded temperatures, unit states, plug and phase power, and checked on the latest days, held back from the fit. Once checked, the model learns once more from every day, the latest included, and that one plans, unless it predicts the other days clearly worse or a number halves or doubles (a room's heat store or loss, a unit's heat at a fan level, the efficiency, the outdoor unit's base or limit), which points to odd recent data; the checked model plans then. The outdoor unit's limit starts just above where the phase levels off with several units running, not at the highest reading: an energy meter catches every kettle on that phase too. Two weeks of history cannot tell every number apart (a bigger heat store or a smaller loss look much alike for a while), so the fit leans on what a typical apartment is like and lets the data move away from it where it clearly says so; the units' heat per fan level comes from the phase measurement. A thermometer that stands still for hours counts as having stopped reporting. Sunny days teach the model about sun; until it has seen a few, it predicts them too cool.
 
-**The plan.** Every five minutes the optimizer minimises, over the horizon of known prices:
+**The plan.** Every five minutes, half way between the five-minute marks, the optimizer minimises, over the horizon of known prices:
 
 > electricity × price + comfort cost of every room + compressor starts + the value of heat missing at the end
 
-subject to the model, each unit's lowest and highest fan level, the outdoor unit's shared capacity, minimum run and pause times (the compressor's for the AC units, 15 and 10 minutes by default; the heaters' own, 1 minute, and their starts cost nothing), and the times a unit must not run. It is a mixed-integer linear programme, solved with HiGHS in about a second. The plan heats ahead of expensive hours, lets rooms drift where a deviation costs less than the electricity saved, and keeps compressor starts few.
+subject to the model, each unit's lowest and highest fan level, the outdoor unit's shared capacity, minimum run and pause times (the compressor's for the AC units, 15 and 10 minutes by default; the heaters' own, 1 minute, and their starts cost nothing), and the times a unit must not run. It is a mixed-integer linear programme, solved with HiGHS in about a second. Units switch at the five-minute marks, as the plan made before the mark has it: the next plan leaves the step under way as it runs, and counts minimum runs and pauses from what it last told the proxies (their own state can lag behind). A thermometer that stops reporting is planned from its last reading. The plan heats ahead of expensive hours, lets rooms drift where a deviation costs less than the electricity saved, and keeps compressor starts few.
 
 **Comfort costs.** Being off the comfort temperature costs money, per kelvin and hour, separately for too cold and too warm: a deadband that costs nothing, a linear and a quadratic part, and a limit that is not crossed unless it can't be helped. Four functions come predefined (standard, relaxed, strict, frost protection); any number can be added. The comfort temperature itself is the proxy's target temperature.
 
@@ -156,6 +156,9 @@ rest_command:
     payload: '{"zone": "{{ zone }}", "target": {{ target }}, "at": "{{ at | default("") }}", "hold_min": {{ hold_min | default(0) }}}'
   climate_override_cancel:
     url: "http://<host>:8099/api/overrides?zone={{ zone }}"
+    method: DELETE
+  climate_run_cancel:  # a run stopped, whatever it was
+    url: "http://<host>:8099/api/overrides?unit={{ unit }}"
     method: DELETE
 ```
 

@@ -202,7 +202,7 @@ pages.dashboard = async (redraw) => {
       ru ? `<span class="badge on">running until ${fmtTime(ru.end, S.tz)}<button class="x" data-ov-cancel="${ru.id}" title="Stop">×</button></span>` : ''].join(' ');
     html += `<div class="card unit-card">
       <div class="top"><span class="name"><i style="background:${zoneColor(u.zone)}"></i>${esc(u.name)}</span>${state}</div>
-      <div class="temp">${num(z.temperature, 1)} °C<small>${comfort !== undefined ? `comfort ${num(comfort, 1)} °C` : 'no comfort cost'}</small></div>
+      <div class="temp">${num(Number.isFinite(z.temperature) ? z.temperature : z.last_reading?.[1], 1)} °C<small>${!Number.isFinite(z.temperature) && z.last_reading ? `last reading ${fmtTime(z.last_reading[0], S.tz)} · ` : ''}${comfort !== undefined ? `comfort ${num(comfort, 1)} °C` : 'no comfort cost'}</small></div>
       <div class="line">${comfort !== undefined && fnId ? (String(fnId).startsWith('override') ? esc(info.schedule.source?.[u.zone]?.[0] || 'Override')
         : esc(fnName(fnId)) + (info.schedule.source?.[u.zone]?.[0] && info.schedule.source[u.zone][0] !== 'default' ? ' · ' + esc(info.schedule.source[u.zone][0]) : ''))
         + (P?.comfort_cost?.[u.zone] >= 0.005 ? ` · ${num(P.comfort_cost[u.zone], 2)} € off comfort` : '')

@@ -549,3 +549,44 @@ def test_venting_sensor_and_rules(client):
         assert state == "unknown" or "until" in attrs  # the demo heats: rarely worth opening
     finally:
         client.put("/api/config", json={"airing": {"venting": False}})
+
+
+def test_a_silent_thermometer_plans_from_its_last_reading(client):
+    import time as _t
+
+    svc = client.svc
+    p = svc.planner
+    eid = p.cfg.mapping["zones"]["bedroom"]["thermometer"]
+    now = int(_t.time() * 1000)
+    svc.store.add_rows(eid, [[now - 20 * 60_000, 15.2]])
+    _see(svc)
+    svc.collector.states[eid] = {**svc.collector.states[eid], "state": "unavailable"}
+    try:
+        r = client.post("/api/plan").json()
+        zi = p.cfg.layout_obj().zone_index("bedroom")
+        last = p.last_reading(eid, _t.time() * 1000)
+        others = [x for i, x in enumerate(r["info"]["x0"][:5]) if i != zi]
+        assert r["info"]["x0"][zi] == pytest.approx(last[1]) and last[0] >= now - 20 * 60_000
+        assert any("bedroom" in n.lower() and "last reading" in n for n in r["info"]["notes"])
+        st = client.get("/api/status").json()["zones"]["bedroom"]
+        assert st["last_reading"][1] == pytest.approx(last[1])
+    finally:
+        _see(svc)
+
+
+def test_the_plan_knows_what_it_told_the_proxies(client):
+    """A unit just told to stop is off in the next plan, its pause counted from then,
+    even while the proxy still reports it heating."""
+    import time as _t
+
+    svc = client.svc
+    p = svc.planner
+    now = _t.time() * 1000
+    p._answered["living"] = [False, now - 2 * 60_000, now - 30_000]
+    try:
+        r = client.post("/api/plan").json()  # fresh, no hold; the pause still holds
+        t = r["plan"]["t"]
+        early = [v for x, v in zip(t, r["plan"]["share"]["living"]) if x < now + 5 * 60_000]
+        assert max(early) < 0.01
+    finally:
+        p._answered.pop("living", None)

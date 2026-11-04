@@ -86,7 +86,9 @@ class Service:
 
     async def _plan_loop(self) -> None:
         while not self.stop.is_set():
-            await _sleep_until(self.stop, 300, offset=8)
+            # half way between the five-minute marks: the plan is there before the next step
+            # begins, and decides it once (a plan made at the mark would decide it again)
+            await _sleep_until(self.stop, 300, offset=150)
             if self.ha.connected.is_set():
                 await self.planner.replan()
 
@@ -184,7 +186,8 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         zones = {}
         for z in layout.zones:
             zm = (cfg.mapping.get("zones") or {}).get(z.id) or {}
-            zones[z.id] = {"name": z.name, "temperature": p.live(zm.get("thermometer")),
+            last = p.last_reading(zm.get("thermometer"), now) if not np.isfinite(p.live(zm.get("thermometer"))) else None
+            zones[z.id] = {"name": z.name, "temperature": p.live(zm.get("thermometer")), "last_reading": last,
                            "windows_open": [w for w in zm.get("windows", []) or [] if (s.collector.states.get(w) or {}).get("state") == "on"]}
         return _json({
             "ha": {"connected": s.ha.connected.is_set(), "error": s.ha.error, "version": s.ha.version, "url": s.ha.url},

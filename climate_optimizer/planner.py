@@ -89,6 +89,7 @@ class Planner:
         self._published: dict[str, str] = {}  # override sensors as last set in Home Assistant
         self._run_over: dict[str, float] = {}  # unit -> when its run ended (by hand or by the clock)
         self._window_task: asyncio.Task | None = None
+        self._answered: dict[str, list] = {}  # unit -> [on, since (ms), last answered (ms)], as told the proxy
         self._wake: asyncio.Task | None = None
         self._airing_sent = False
         self.state = PlanState()
@@ -243,7 +244,19 @@ class Planner:
         s = self.collector.states.get(eid or "")
         return _num(s.get("state")) if s else math.nan
 
-    def build_problem(self, now_ms: float, inputs: dict) -> tuple[mpc.Problem, dict]:
+    def last_reading(self, eid: str | None, now_ms: float, hours: float = 12.0) -> list | None:
+        """[time, value] of a sensor's last reading in the store, within hours."""
+        if not eid:
+            return None
+        for r in reversed(self.store.rows(eid, int(now_ms - hours * 3.6e6), int(now_ms) + 1, before=False)):
+            v = _num(r[1])
+            if math.isfinite(v):
+                return [int(r[0]), v]
+        return None
+
+    def build_problem(self, now_ms: float, inputs: dict, hold: bool = False) -> tuple[mpc.Problem, dict]:
+        """hold: the step under way stays as the units run now (a plan on the clock); a plan
+        someone asked for may change it at once."""
         cfg = self.cfg
         layout, params = self.model()
         sysm = build(layout, params)
@@ -288,6 +301,13 @@ class Planner:
         # state now
         zids = layout.zone_ids
         Ta = np.array([self.live(zmap.get(z, {}).get("thermometer")) for z in zids])
+        for i, z in enumerate(zids):  # a thermometer not reporting: its last reading, not the other rooms'
+            if not math.isfinite(Ta[i]):
+                last = self.last_reading(zmap.get(z, {}).get("thermometer"), now_ms)
+                if last:
+                    Ta[i] = last[1]
+                    info["notes"].append(f"{layout.zones[i].name}: thermometer not reporting since "
+                                         f"{datetime.fromtimestamp(last[0] / 1000, tz).strftime('%H:%M')}; planned from its last reading, {last[1]:.1f} °C")
         Tm, Tw, how = self.hidden_state(layout, params, now_ms)
         if Tm is None:
             info["notes"].append(f"state estimate: {how}; assuming surfaces at room temperature")
@@ -395,12 +415,16 @@ class Planner:
                     since = (now_ms - datetime.fromisoformat(str(last).replace("Z", "+00:00")).timestamp() * 1000) / MIN
                 except ValueError:
                     pass
+            told = self._answered.get(u.id)
+            if told and now_ms - told[2] < 3 * MIN and not cfg.shadow:
+                # what it was last told: the proxy's state can lag the answer by its tick
+                running, since = told[0], (now_ms - told[1]) / MIN
             forced = None if u.id in uncontrolled else self.overrides.forced(u.id, t)
             if u.id in uncontrolled and self.overrides.run_for(u.id, now_ms):
                 info["notes"].append(f"{u.name} is asked to run, but {note}")
             caps = np.array([np.nan if c is None else float(c) for c in res.max_level.get(u.id, [None] * N)])
             units.append(mpc.UnitSpec(u.id, u.kind, u.zone, levels=(lo, hi), allowed=allowed, on=running,
-                                      since_min=max(0.0, since), modes=modes, forced=forced,
+                                      since_min=max(0.0, since), modes=modes, forced=forced, hold=hold and note is None,
                                       max_level=caps if u.kind == "ac" and np.isfinite(caps).any() else None))
             proxies[u.id] = {"proxy": m.get("proxy"), "state": mode_now, "note": note, "levels": [lo, hi], "anyway": anyway,
                              "running": running, "comfort": comfort.get(u.zone, [None])[0] if u.zone in comfort else None}
@@ -709,7 +733,8 @@ class Planner:
     async def replan(self, fresh: bool = False) -> None:
         """Plan now. With one already running, its plan will do, unless fresh:
         then plan once more after it, from the state as it is now (a setting
-        changed, the calendar was read, someone asked)."""
+        changed, the calendar was read, someone asked). On the clock (not fresh),
+        the step under way is left as it runs."""
         if self.lock.locked() and not fresh:
             async with self.lock:
                 return
@@ -717,7 +742,7 @@ class Planner:
             now = time.time() * 1000
             try:
                 inputs = await self.fetch(now)
-                pr, info = await asyncio.to_thread(self.build_problem, now, inputs)
+                pr, info = await asyncio.to_thread(self.build_problem, now, inputs, not fresh)
                 plan = await asyncio.to_thread(mpc.solve, pr)
             except Exception as e:
                 log.exception("planning failed")
@@ -778,7 +803,16 @@ class Planner:
             answer = {"follow": False, "reason": "shadow: would run until " + until}
         decision["follow"] = answer.get("follow", True)
         self.store.add_decision(int(now_ms // MIN * MIN), uid, decision)
+        self._note_answer(uid, answer, now_ms)
         return answer
+
+    def _note_answer(self, uid: str, answer: dict, now_ms: float) -> None:
+        if answer.get("follow", True) is False or "hvac_mode" not in answer:
+            return
+        on = answer["hvac_mode"] != "off"
+        told = self._answered.get(uid)
+        since = told[1] if told and told[0] == on else now_ms
+        self._answered[uid] = [on, since, now_ms]
 
     async def poke(self, unit_ids) -> None:
         """Have the units' proxies ask now rather than at their next tick
@@ -953,4 +987,5 @@ class Planner:
             answer = {"follow": False, "reason": "shadow: would " + answer.get("reason", "")}
         decision["follow"] = answer.get("follow", True)
         self.store.add_decision(int(now_ms // MIN * MIN), uid, decision)
+        self._note_answer(uid, answer, now_ms)
         return answer

@@ -362,3 +362,18 @@ def test_no_venting_when_it_only_lets_the_heat_out():
                              tref={z: pr.comfort[z] for z in pr.sys.layout.window_zones})
     plan = mpc.solve(pr)
     assert plan.vent.max() < 0.01
+
+
+def test_the_step_under_way_is_held():
+    """On the clock, a plan leaves the step under way as it runs: decided once, by the plan before."""
+    L = default_layout()
+    warm = problem(lambda h: 0.6, Ta=(23.0, 21.0, 23.5, 23.0, 22.0))
+    warm.units = [mpc.UnitSpec(u.id, u.kind, u.zone, levels=(0, u.levels - 1), on=u.id == "living", since_min=30.0, hold=True)
+                  for u in L.units]
+    p = mpc.solve(warm)
+    assert p.share["living"][0] > 0.99  # warm and dear, but it runs: until the step ends
+    cold = problem(lambda h: 0.2, Ta=(17.0, 16.0, 17.0, 18.0, 17.0))
+    cold.units = [mpc.UnitSpec(u.id, u.kind, u.zone, levels=(0, u.levels - 1), on=False, since_min=60.0, hold=True)
+                  for u in L.units]
+    p = mpc.solve(cold)
+    assert p.share["living"][0] < 0.01 and p.share["living"][1] > 0.99  # cold: on from the next step

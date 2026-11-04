@@ -86,6 +86,7 @@ class UnitSpec:
     modes: tuple[str, ...] = ("heat", "cool")
     forced: np.ndarray | None = None  # (N,) share of each step it must run (a run override), whatever else holds
     max_level: np.ndarray | None = None  # (N,) highest fan level a rule allows per step, nan where any
+    hold: bool = False  # the first step stays as it runs now: the step was decided by the plan before
 
 
 @dataclass
@@ -402,14 +403,17 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         on_lb = np.zeros(N)
         starts = (pr.t[:-1] - pr.t[0]) / MIN  # minutes from now to each step's start
         min_run, min_off = (s.min_run_min, s.min_off_min) if u.kind == "ac" else (s.heater_min_run_min, s.heater_min_off_min)
+        mids = starts + dts * 30.0  # a minimum run or pause holds a step when it lasts past its middle
         if u.on and u.since_min < min_run:
-            keep = starts < min_run - u.since_min
+            keep = mids < min_run - u.since_min
             blocked = np.flatnonzero(~allowed)
             if len(blocked):
                 keep[blocked[0]:] = False  # a lockout ends the minimum run early
             on_lb[keep] = 1.0
         if not u.on and u.since_min < min_off:
-            on_ub[starts < min_off - u.since_min] = 0.0
+            on_ub[mids < min_off - u.since_min] = 0.0
+        if u.hold and allowed[0]:
+            on_lb[0] = on_ub[0] = float(u.on)
         if u.forced is not None:  # asked to run: over lockouts, windows and the pause after a stop
             f = np.asarray(u.forced, float)
             on_ub = np.where(f > 0, 1.0, on_ub)
@@ -764,7 +768,10 @@ def start_now_or_later(pr: Problem, plan: Plan, obj: float) -> Plan:
             continue
         k = later[0]
         discount = (1.0 - sh[k]) * (s.start_cost + e_start * float(pr.price[k]))  # the part of the start not counted
-        now = dataclasses.replace(u, forced=np.where(fine, 1.0, 0.0))
+        f = np.where(fine, 1.0, 0.0)
+        if u.hold:
+            f[0] = 0.0  # the step under way stays as it is: from the next
+        now = dataclasses.replace(u, forced=f)
         alt = dataclasses.replace(pr, units=[now if x.id == u.id else x for x in pr.units])
         p2, o2 = solve_mode(alt, plan.mode)
         if p2 is not None and o2 < obj + discount:
