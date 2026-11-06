@@ -1048,6 +1048,7 @@ const SETTING_FIELDS = [
   ['min_run_min', 'Compressor: minimum run (min)', 1], ['min_off_min', 'Compressor: minimum pause (min)', 1],
   ['start_cost', 'Compressor: wear per start (€)', 0.01],
   ['heater_min_run_min', 'Heaters: minimum run (min)', 1], ['heater_min_off_min', 'Heaters: minimum pause (min)', 1],
+  ['heater_off_after_run_min', 'Heaters: off after a run (min)', 0.5],
   ['terminal_quantile', 'Value heat left at the end at this price quantile', 0.05],
   ['window_assume_open_min', 'An open window closes after (min)', 1],
   ['heat_below_outdoor', 'Heat only if colder outside than (°C)', 0.5], ['cool_above_outdoor', 'Cool only if warmer outside than (°C)', 0.5],

@@ -377,3 +377,17 @@ def test_the_step_under_way_is_held():
                   for u in L.units]
     p = mpc.solve(cold)
     assert p.share["living"][0] < 0.01 and p.share["living"][1] > 0.99  # cold: on from the next step
+
+
+def test_heat_left_at_the_end_follows_the_rooms_function_then():
+    """A room in frost protection at the end of the plan is not to be stocked up to its comfort
+    temperature (an office over the weekend)."""
+    fns = {f.id: f for f in default_functions()}
+    std = {"office": fns["standard"], "bedroom": fns["standard"], "living": fns["standard"], "bath": fns["standard"]}
+    frost = {**std, "office": fns["frost"]}
+    a = mpc.solve(problem(lambda h: 0.41, tout=3.0, Ta=(16.5, 19.0, 20.5, 21.5, 19.5), functions=std))
+    b = mpc.solve(problem(lambda h: 0.41, tout=3.0, Ta=(16.5, 19.0, 20.5, 21.5, 19.5), functions=frost))
+    dt = np.diff(b.t) / 3.6e6
+    office = lambda p: float(np.sum(np.abs(p.heat["office"]) * dt))
+    assert office(b) < 0.5 * office(a)  # frost: no stocking up for the end
+    assert b.temp["office"][-1] < a.temp["office"][-1] - 2

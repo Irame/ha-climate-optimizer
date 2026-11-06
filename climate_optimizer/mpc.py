@@ -59,6 +59,7 @@ class Settings:
     min_off_min: float = 10.0
     heater_min_run_min: float = 1.0  # heaters: no compressor to spare, no cost to a start
     heater_min_off_min: float = 1.0
+    heater_off_after_run_min: float = 2.0  # a heater's run stopped or over: off this long, at once
     terminal_quantile: float = 0.25  # missing heat at the end is valued at this price quantile
     window_assume_open_min: float = 10.0  # an open window is assumed closed after this
     season: str = "auto"  # auto | heat | cool
@@ -604,7 +605,11 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         per_kwh = q_price / (float(cop(params, mode, np.array(Tc[-1]), np.array(tout[-1]))) if has_ac else 1.0)
         if mode == "cool" and not has_ac:
             continue
-        ref = steady_store(params, z, float(Tc[-1]), float(tail))
+        # the store the room's function at the end asks for: frost protection or relaxed
+        # ask for less than the comfort temperature (a weekend office is not to be stocked up)
+        f_end = pr.functions[z][-1]
+        t_end = float(Tc[-1]) - (f_end.below.deadband if mode == "heat" else -f_end.above.deadband)
+        ref = steady_store(params, z, t_end, float(tail))
         D = V.add(1, lb=0.0, c=per_kwh)[0]
         term_vars.append(D)
         sgn = 1.0 if mode == "heat" else -1.0

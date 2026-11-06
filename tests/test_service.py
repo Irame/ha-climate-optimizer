@@ -590,3 +590,24 @@ def test_the_plan_knows_what_it_told_the_proxies(client):
         assert max(early) < 0.01
     finally:
         p._answered.pop("living", None)
+
+
+def test_a_heater_is_off_a_moment_after_its_run(client):
+    import time as _t
+
+    svc = client.svc
+    world = svc.ha.world
+    zi = svc.planner.cfg.layout_obj().zone_index("bath")
+    world.x[zi] = 17.0  # cold: the plan would have it on
+    _see(svc)
+    client.post("/api/overrides", json={"unit": "bath", "run_min": 15})
+    world.pokes.clear()
+    client.delete("/api/overrides?unit=bath")
+    assert ["climate.bath_proxy"] in world.pokes  # at once, not after the plan
+    a = client.post("/api/v1/command", json=world.request("bath")).json()
+    assert a["hvac_mode"] == "off" and a["force"] and a["reason"] == "run over"
+    svc.planner._run_over["bath"] = _t.time() * 1000 - 3 * 60_000  # the moment is over: the plan again
+    client.post("/api/plan")
+    a = client.post("/api/v1/command", json=world.request("bath")).json()
+    assert a["reason"] != "run over"
+    svc.planner._run_over.pop("bath", None)

@@ -401,6 +401,11 @@ class Planner:
                 uncontrolled.add(u.id)
             if u.zone in open_zone:
                 allowed &= starts_min >= st.window_assume_open_min
+            over = self._run_over.get(u.id)
+            if u.kind == "heater" and over is not None and not self.overrides.run_for(u.id, now_ms):
+                rest = st.heater_off_after_run_min - (now_ms - over) / MIN
+                if rest > 0:  # just after its run: off a moment (where that lasts past a step's middle)
+                    allowed &= starts_min + np.diff(t) / MIN / 2 >= rest
             attrs = (ps or {}).get("attributes") or {}
             modes = tuple(x for x in attrs.get("hvac_modes", ["heat", "cool"]) if x in ("heat", "cool")) or ("heat",)
             lo, hi = 0, max(0, u.levels - 1)
@@ -847,6 +852,8 @@ class Planner:
             runs = [o.unit for o in gone if o.kind == "run"]
             for u in runs:
                 self._run_over[u] = time.time() * 1000
+            heaters = [u.id for u in layout.units if u.id in runs and u.kind == "heater"]
+            await self.poke(heaters)  # a heater goes off at once; the plan follows
             units = set(runs) | {u.id for o in gone if o.zone for u in layout.units if u.zone == o.zone}
             # plan without it, then the proxies hear it: off if that is the plan, without first
             # switching off what the plan would have on again a few seconds later
@@ -950,6 +957,19 @@ class Planner:
         run = self.overrides.run_for(uid, now_ms)
         if run is not None:
             return self._run_answer(uid, run, body, now_ms, valid)
+        over = self._run_over.get(uid)
+        pause = self.cfg.settings_obj().heater_off_after_run_min
+        layout0 = self.cfg.layout_obj()
+        if over is not None and now_ms - over < pause * MIN and any(u.id == uid and u.kind == "heater" for u in layout0.units):
+            # a heater's run just over: off at once and for a moment, so the button feels like a switch
+            answer = {"hvac_mode": "off", "force": True,
+                      "valid_until": datetime.fromtimestamp((over + pause * MIN) / 1000, timezone.utc).isoformat(),
+                      "reason": "run over"}
+            if self.cfg.shadow:
+                answer = {"follow": False, "reason": "shadow: run over"}
+            self.store.add_decision(int(now_ms // MIN * MIN), uid, {"on": False, "run_over": True, "follow": answer.get("follow", True)})
+            self._note_answer(uid, answer, now_ms)
+            return answer
         plan = self.state.plan
         if plan is None or now_ms - self.state.created > 15 * MIN:
             return {"follow": False, "reason": "no current plan" + (f": {self.state.error}" if self.state.error else "")}
