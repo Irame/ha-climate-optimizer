@@ -49,7 +49,7 @@ EXTRA_EDGES = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 12.0)  # kW of total heat
 
 @dataclass
 class Settings:
-    horizon_min_h: float = 12.0
+    horizon_min_h: float = 30.0  # past the known prices: the same hour of the day before. Long enough that the end of the plan (where it lets rooms cool, its heat being of no use any more) is past the day it plans
     horizon_max_h: float = 36.0
     fine_h: float = 2.0  # 5-minute steps up to here
     binary_h: float = 0.25  # on/off decided as such up to here, as a share of each step after
@@ -457,7 +457,7 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
     # an extra that grows with the square of the total heat (convex, so exact in
     # pieces), and an electric limit for all of it.
     ac = [j for j, u in enumerate(U) if u.kind == "ac"]
-    extra_vars, extra_slope, ostart = [], None, None
+    extra_vars, extra_slope, ostart, lag_kwh = [], None, None, 0.0
     if ac:
         qmax = params.plant.get("Qmax", 7.0)
         cap = qmax * (capacity_factor(params, tout) if mode == "heat" else np.full(N, 0.9))
@@ -467,7 +467,13 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         anyon = V.add(N, lb=0.0, ub=1.0, c=base_kw * pr.price * dts)
         # a start of the outdoor unit draws a little energy of its own (the spike when it comes on)
         e_start = params.plant.get("Estart", 0.0)
-        ostart = V.add(N, lb=0.0, ub=1.0, c=e_start * pr.price) if e_start > 0 else None
+        # and while it comes up, the units blow little: longer than when one joins it running
+        # (that part is in each unit's start, below); the heat missed is made up later, so it
+        # is priced as the electricity for it
+        extra_lag = max(0.0, params.plant.get("lag_out", 0.0) - params.plant.get("lag_in", 0.0))
+        q_first = float(np.mean([info[j][1].mean() for j in ac]))  # a unit's heat at its lowest level
+        lag_kwh = q_first * extra_lag / 60.0 / cop(params, mode, np.full(N, 21.0), tout)
+        ostart = V.add(N, lb=0.0, ub=1.0, c=(e_start + lag_kwh) * pr.price) if e_start > 0 or extra_lag > 0 else None
         running_now = float(any(u.on for u in U if u.kind == "ac"))
         if kq > 0:
             edges = np.array(EXTRA_EDGES)
@@ -543,6 +549,7 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                 R.add([VENT[k], AIR[c]], [1.0, ov], hi=1.0)
 
     # dynamics
+    lag_in = params.plant.get("lag_in", 0.0)
     wz = [layout.zone_index(z) for z in layout.window_zones]
     for k in range(N):
         Ad, Bd = mats[k]
@@ -558,6 +565,9 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                 if b:
                     cols.append(Q[j][k])
                     vals.append(-b * sign[j])
+                    if u.kind == "ac" and lag_in > 0:  # its first minutes after coming on: little heat
+                        cols.append(ST[j][k])
+                        vals.append(b * sign[j] * float(info[j][1][k]) * lag_in / 60.0 / dts[k])
             if len(VENT):  # open to cool: Hw (Tout - Ta), Ta as reckoned
                 coef = sum(Bd[i, sl_w.start + jw] * (tout[k] - pr.venting.tref[z][k]) for jw, z in enumerate(layout.window_zones))
                 if coef:
@@ -656,6 +666,8 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         electric += sb
         energy += float(np.sum(sb * pr.price * dts))
     starts_cost = float(sum(np.dot(x[ST[j]], V.c[ST[j][0]:ST[j][-1] + 1]) for j in range(nu)))
+    if ac and ostart is not None:  # the outdoor unit's warm-up, as the electricity to make it up
+        starts_cost += float(np.dot(np.clip(x[ostart], 0.0, 1.0), lag_kwh * pr.price))
     comfort_cost = float(np.dot(x[seg_vars], np.array(V.c)[seg_vars])) if seg_vars else 0.0
     term_cost = float(np.dot(x[term_vars], np.array(V.c)[term_vars])) if term_vars else 0.0
     status = {0: "optimal", 1: "time limit"}.get(res.status, res.message)

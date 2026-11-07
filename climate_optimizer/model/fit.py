@@ -77,6 +77,9 @@ def param_list(layout: Layout, params: Params) -> list[P]:
             P(("plant", "Pmax"), "log", 0.3, 0.3, measured=1.0),
             # what a start draws beyond running: the spike on the phase when the outdoor unit comes on
             P(("plant", "Estart"), "log", 1.0, 1e-3, measured=0.5),
+            # minutes a unit blows little heat after it comes on: longer when the outdoor unit
+            # has to start too, shorter when it only joins one already running
+            P(("plant", "lag_out"), "log", 0.8, 0.1), P(("plant", "lag_in"), "log", 0.8, 0.05),
             P(("building", "Tnb"), "lin", 2.0)]
     if any(z.solar for z in layout.zones):
         out.append(P(("building", "solar_air"), "unit", 1.0))
@@ -266,7 +269,41 @@ def unit_heat(params: Params, layout: Layout, grid: Grid, ks: np.ndarray) -> np.
     return out
 
 
-def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray, L: int, sysm=None, hidden=None):
+def run_starts(layout: Layout, grid: Grid) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Per AC unit and step: minutes it ran in the step, minutes it had run before the step since
+    it last came on, and whether the outdoor unit came on with it (nothing else ran before)."""
+    ac = [u.id for u in layout.ac_units]
+    share = {u: np.clip(grid.unit_running(u), 0.0, 1.0) for u in ac}
+    out = {}
+    for u in ac:
+        r = share[u]
+        others = np.max([share[o] for o in ac if o != u], axis=0) if len(ac) > 1 else np.zeros(grid.K)
+        run = r * grid.step_min
+        before = np.zeros(grid.K)
+        cold = np.zeros(grid.K, bool)
+        acc, c = 0.0, False
+        for k in range(grid.K):
+            if r[k] <= 0.05:
+                acc, c = 0.0, False
+                continue
+            if acc == 0.0:  # comes on in this step
+                c = (k == 0 or others[k - 1] <= 0.05) and (k == 0 or r[k - 1] <= 0.05)
+            before[k], cold[k] = acc, c
+            acc += run[k]
+        out[u] = (run, before, cold)
+    return out
+
+
+def start_lag_factor(params: Params, starts: tuple, ks: np.ndarray) -> np.ndarray:
+    """Share of a step's heat a unit delivers, its first minutes after coming on blowing little."""
+    run, before, cold = starts
+    lag = np.where(cold[ks], params.plant.get("lag_out", 0.0), params.plant.get("lag_in", 0.0))
+    lost = np.clip(lag - before[ks], 0.0, run[ks])
+    return np.where(run[ks] > 0, 1.0 - lost / np.maximum(run[ks], 1e-9), 1.0)
+
+
+def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray, L: int, sysm=None, hidden=None,
+                     starts=None):
     """Free-run every window from its start; returns air temperatures (nw, L+1, nz) and electricity (nw, L)."""
     sysm = sysm or build(layout, params)
     Ad, Bd = sysm.discretize(grid.dt_h)
@@ -290,6 +327,8 @@ def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray
     if ac_idx and e_start > 0:
         started[1:] = np.clip(running[1:] - running[:-1], 0.0, 1.0) * (running[:-1] < 0.5)
     p_start = e_start * started / grid.dt_h
+    if starts is None and ac_idx and (params.plant.get("lag_out", 0.0) > 0 or params.plant.get("lag_in", 0.0) > 0):
+        starts = run_starts(layout, grid)
     for j in range(L):
         ks = k0s + j
         q = unit_heat(params, layout, grid, ks)  # (nw, nu), as asked
@@ -298,6 +337,8 @@ def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray
         wv = grid.open[ks] * (grid.tout[ks][:, None] - X[:, win_zone]) if win_zone else np.zeros((nw, 0))
         if ac_idx:
             qd, pe = outdoor_unit(params, q[:, ac_idx], X[:, ac_zone], grid.tout[ks], running[ks])
+            if starts:  # warming up: drawn for, not yet delivered
+                qd = qd * np.column_stack([start_lag_factor(params, starts[layout.units[i].id], ks) for i in ac_idx])
             q[:, ac_idx] = qd  # what the outdoor unit could deliver
             pe = pe + p_start[ks]
         else:
@@ -351,7 +392,7 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
 
     def residuals(theta):
         params = from_theta(theta, plist, base)
-        Ta, Pel = simulate_windows(layout, params, grid, k0s, L)
+        Ta, Pel = simulate_windows(layout, params, grid, k0s, L, starts=starts)
         meas = grid.T[k0s[:, None] + sel[None, :]]  # (nw, ns, nz)
         rt = ((Ta[:, sel] - meas) / FIT["sigma_t"]).ravel()
         # power, averaged over the same 15-minute blocks
@@ -367,6 +408,7 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
         return np.concatenate([robust(np.nan_to_num(rt), c), robust(rp, c), rpr])
 
     calls = {"n": 0}
+    starts = run_starts(layout, grid) if layout.ac_units else None
 
     def fit(windows, x0, nfev, stage):
         nonlocal k0s
@@ -483,6 +525,7 @@ def plant_curve(layout: Layout, params: Params, grid: Grid, pw: dict, n_points: 
             "hours_at_limit": round(float(at_limit.sum()) * grid.dt_h, 1),
             "tout_points": [round(float(grid.tout[k]), 1) for k in idx],
             "start_kwh": params.plant.get("Estart", 0.0),
+            "lag_out_min": params.plant.get("lag_out", 0.0), "lag_in_min": params.plant.get("lag_in", 0.0),
             "starts_per_day": round(float(((share[1:] > 0.5) & (share[:-1] < 0.5)).sum()) / max(grid.K * grid.dt_h / 24, 1e-9), 1)}
 
 

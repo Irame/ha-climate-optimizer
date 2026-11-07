@@ -26,6 +26,7 @@ from .overrides import Overrides
 
 log = logging.getLogger(__name__)
 MIN = 60_000
+VENT_OPEN = 0.25  # a step's share of windows open to cool from which it counts as open (later steps are shares)
 OFF_STATES = ("off", "unavailable", "unknown")
 
 
@@ -60,6 +61,9 @@ def matching_params(params: Params | None, layout: Layout) -> Params:
         base.plant.pop("Pmax", None)
     if "Estart" not in params.plant:  # trained before a start had an energy of its own
         base.plant["Estart"] = 0.0
+    for k in ("lag_out", "lag_in"):  # trained before the warm-up after a start
+        if k not in params.plant:
+            base.plant[k] = 0.0
     base.building.update(params.building)
     return base
 
@@ -541,11 +545,20 @@ class Planner:
             info["none"] = "done today" if done >= a.per_day else "no allowed time in the plan"
             return None, info
         N = len(t) - 1
-        tref = {}
-        for z in layout.window_zones:
-            i = layout.zone_index(z)
-            tref[z] = np.asarray(comfort[z], float) if z in comfort else np.full(N, float(x0[i]))
+        tref = {z: self.expected_air(t, z, layout, x0) for z in layout.window_zones}
         return mpc.Airing(cand=cand, groups=groups, min_gap_ms=gap, tref=tref), info
+
+    def expected_air(self, t: np.ndarray, z: str, layout: Layout, x0: np.ndarray) -> np.ndarray:
+        """The air temperature a room is expected to have: as the last plan had it, else as it is
+        now. What an open window lets out is reckoned from it (not from the comfort temperature:
+        an office in frost protection at 16 °C loses far less than one at 21 °C would)."""
+        N = len(t) - 1
+        base = np.full(N, float(x0[layout.zone_index(z)]))
+        prev = self.state.plan
+        if prev is not None and z in prev.temp and time.time() * 1000 - self.state.created < 15 * MIN:
+            ref = np.interp(t[:-1], prev.t, prev.temp[z], right=np.nan)
+            base = np.where(np.isfinite(ref), ref, base)
+        return base
 
     def airing_skipped(self, now_ms: float) -> float:
         """Until when no airing is to be suggested (someone said not now), 0 if not."""
@@ -572,15 +585,7 @@ class Planner:
         if open_zone and open_zone >= set(layout.window_zones):
             open_now[starts_min < st.window_assume_open_min] = 1.0
             allowed |= open_now > 0
-        prev = self.state.plan if self.state.plan is not None and now_ms - self.state.created < 15 * MIN else None
-        tref = {}
-        for z in layout.window_zones:
-            i = layout.zone_index(z)
-            base = np.asarray(comfort[z], float) if z in comfort else np.full(N, float(x0[i]))
-            if prev is not None and z in prev.temp:
-                ref = np.interp(t[:-1], prev.t, prev.temp[z], right=np.nan)
-                base = np.where(np.isfinite(ref), ref, base)
-            tref[z] = base
+        tref = {z: self.expected_air(t, z, layout, x0) for z in layout.window_zones}
         return mpc.Venting(allowed=allowed, open_now=open_now, hassle=self.cfg.airing.vent_hassle_eur, tref=tref)
 
     def windows_open(self) -> dict[str, float]:
@@ -608,8 +613,8 @@ class Planner:
         later = float((self.store.get("close_later") or {}).get("until") or 0)
         if cur and cur[0] <= now < cur[1]:
             at, why = cur[1], "the airing is over"
-        elif plan.vent is not None and (k := plan.step_at(now)) is not None and plan.vent[k] >= 0.5:
-            j = next((j for j in range(k, len(plan.vent)) if plan.vent[j] < 0.5), None)
+        elif plan.vent is not None and (k := plan.step_at(now)) is not None and plan.vent[k] >= VENT_OPEN:
+            j = next((j for j in range(k, len(plan.vent)) if plan.vent[j] < VENT_OPEN), None)
             if j is None:
                 return None, "open to cool, as far as the plan reaches"
             at, why = float(plan.t[j]), "cool enough, or the outside air no longer helps"
@@ -647,7 +652,7 @@ class Planner:
                                   "since": iso(min(open_w.values())) if open_w else None})}
         periods = []
         if plan.vent is not None:
-            on = plan.vent >= 0.5
+            on = plan.vent >= VENT_OPEN
             k = 0
             while k < len(on):
                 if on[k]:

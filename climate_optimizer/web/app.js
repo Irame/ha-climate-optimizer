@@ -955,6 +955,7 @@ pages.model = async () => {
           <div class="stat"><div class="k">Electric limit</div><div class="v">${pl.Pmax ? num(pl.Pmax, 2) + ' kW' : '–'}</div><div class="s">${pc.hours_at_limit > 0.5 ? `reached for ${num(pc.hours_at_limit, 1)} h` : 'not reached yet: at least this'}</div></div>
           <div class="stat"><div class="k">Extra at high load</div><div class="v">${num((pl.kq || 0) * 1000, 1)} W/kW²</div></div>
           <div class="stat"><div class="k">Each start</div><div class="v">${num((pl.Estart || 0) * 1000, 0)} Wh</div><div class="s">${pc.starts_per_day !== undefined ? `${num(pc.starts_per_day, 1)} starts a day` : 'beyond running'}</div></div>
+          <div class="stat"><div class="k">Warm-up</div><div class="v">${num(pl.lag_out || 0, 1)} min</div><div class="s">little heat after the outdoor unit starts; ${num(pl.lag_in || 0, 1)} min when a unit joins it running</div></div>
         </div>
         <p class="hint">What all units together draw on the phase, against the heat they deliver: a base whenever the outdoor unit runs at all, the heat over the efficiency, and an extra that grows with the square of the total, up to the limit; and a little energy for each start (the spike when it comes on), which has the plan run it fewer, longer times. Little heat is dear by the base, a lot by the extra; the plan bundles heating where it can and keeps clear of full load. The dots are five-minute steps the phase measured, with heat as the model reckons it (it is not measured).</p>
       </div><div><div id="plant-chart"></div><p class="hint" style="margin:4px 0 0">Electricity (kW) against heat (kW), at 7 °C outside and 21 °C inside.</p></div></div></div>`;
@@ -1044,7 +1045,7 @@ pages.model = async () => {
 
 // ---- settings ---------------------------------------------------------------------
 const SETTING_FIELDS = [
-  ['horizon_min_h', 'Plan at least (h)', 1], ['horizon_max_h', 'Plan at most (h)', 1],
+  ['horizon_min_h', 'Plan at least (h; past the known prices, those of the day before)', 1], ['horizon_max_h', 'Plan at most (h)', 1],
   ['min_run_min', 'Compressor: minimum run (min)', 1], ['min_off_min', 'Compressor: minimum pause (min)', 1],
   ['start_cost', 'Compressor: wear per start (€)', 0.01],
   ['heater_min_run_min', 'Heaters: minimum run (min)', 1], ['heater_min_off_min', 'Heaters: minimum pause (min)', 1],

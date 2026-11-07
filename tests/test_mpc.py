@@ -345,11 +345,12 @@ def _summer(vent, hassle=0.1):
 
 def test_venting_cools_with_the_night_air():
     shut, vented = mpc.solve(_summer(False)), mpc.solve(_summer(True))
-    on = vented.vent > 0.5
+    on = vented.vent > 0.25  # later steps are shares: open part of the time, or tilted
     opens = int(np.sum(on[1:] & ~on[:-1]) + on[0])
-    hours = [datetime.fromtimestamp(x / 1000, TZ).hour for x in vented.t[:-1][on]]
+    pr = _summer(True)
+    tout = pr.dist[:, DIST.index("tout")]
     assert 1 <= opens <= 2  # not open and shut all the time
-    assert all(h >= 20 or h <= 8 for h in hours)  # when it is cool outside
+    assert np.all(tout[on] < pr.comfort["living"][on])  # only while the outside air is the cooler
     kwh = lambda p: float(np.sum(p.electric * np.diff(p.t) / 3.6e6))
     assert kwh(vented) < kwh(shut) - 0.2 and vented.cost["total"] < shut.cost["total"]
     for u in ("office", "bedroom", "living"):  # no unit cools against open windows
