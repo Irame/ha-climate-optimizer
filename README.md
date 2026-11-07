@@ -248,6 +248,8 @@ The proxy sends its state (see the proxy's README). The answer:
 
 The proxy's fan mode offset limits the levels: an offset of −1 caps the top level one lower, and +1 raises the lowest level by one.
 
+A proxy with `power_control: setpoint` runs its levels as setpoints a few degrees past the AC's own reading instead of fan speeds (`setpoint_offsets`); give the unit as many levels in the layout as there are offsets. The optimizer notes when a proxy changes over and reads the history accordingly: before, a level is the fan mode then; after, it is the level the proxy reports (`+2 K`), or else the gap between setpoint and the AC's reading. The levels then mean something else, so once there are three days under the new control, training (the nightly one included) uses only those days; until then it uses all of them, and the Model page says so.
+
 ## Development
 
 ```sh

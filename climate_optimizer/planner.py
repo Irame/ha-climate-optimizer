@@ -129,15 +129,46 @@ class Planner:
 
     def mapping(self) -> dict:
         """The configured mapping, with each AC unit's fan modes filled in when
-        left empty: as its proxy reports them, else as the device lists them."""
+        left empty: as its proxy reports them, else as the device lists them.
+        A proxy under setpoint power control gives its levels ("+2 K"), the
+        offsets, since when, and the fan modes before (for older history)."""
         m = json.loads(json.dumps(self.cfg.mapping))
         reported = self.store.get("fan_modes") or {}
+        power = self.store.get("power_control") or {}
         for u in (m.get("units") or {}).values():
+            pc = power.get(u.get("proxy", "")) or {}
+            if pc.get("mode") == "setpoint":
+                u["fan_modes_before"] = list(u.get("fan_modes") or pc.get("fan_modes_before") or [])
+                u.update(power_control="setpoint", setpoint_offsets=list(pc.get("offsets") or []),
+                         power_since=pc.get("since"), fan_modes=list(reported.get(u.get("proxy", "")) or []))
             if not u.get("fan_modes"):
                 fm = reported.get(u.get("proxy", "")) or (self.collector.meta.get(u.get("source", "")) or {}).get("fan_modes")
                 if fm:
                     u["fan_modes"] = list(fm)
         return m
+
+    def power_switch(self) -> float | None:
+        """When the latest unit went over to setpoint power control (or back)."""
+        ts = [float(pc["since"]) for pc in (self.store.get("power_control") or {}).values() if pc.get("since")]
+        return max(ts) if ts else None
+
+    def _note_power(self, eid: str, body: dict, now_ms: float) -> None:
+        """How a proxy makes its device work harder: fan speeds, or setpoints past
+        its reading. A change means the levels mean something else from now on."""
+        mode = body.get("power_control") or "fan"
+        offsets = [float(x) for x in body.get("setpoint_offsets") or []] if mode == "setpoint" else []
+        known = self.store.get("power_control") or {}
+        old = known.get(eid)
+        if old is None and mode == "fan":
+            return  # as ever: nothing to note
+        if old is not None and old.get("mode") == mode and old.get("offsets", []) == offsets:
+            return
+        before = (old or {}).get("fan_modes_before")
+        if mode == "setpoint" and not before:
+            before = (self.store.get("fan_modes") or {}).get(eid) if (old or {}).get("mode", "fan") == "fan" else None
+        log.info("%s: power control %s %s from now on", eid, mode, offsets or "")
+        self.store.put("power_control", {**known, eid: {"mode": mode, "offsets": offsets, "since": int(now_ms),
+                                                         "fan_modes_before": before}})
 
     def unit_for_proxy(self, eid: str) -> str | None:
         for uid, m in (self.cfg.mapping.get("units") or {}).items():
@@ -950,6 +981,7 @@ class Planner:
         now_ms = now_ms or time.time() * 1000
         eid = body.get("entity_id", "")
         self.requests[eid] = ProxyRequest(now_ms, body)
+        self._note_power(eid, body, now_ms)
         fm = body.get("source_fan_modes")
         if fm:
             known = self.store.get("fan_modes") or {}

@@ -15,6 +15,7 @@ heat-per-level the model assumes.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -72,8 +73,10 @@ def parse_rows(export: dict) -> Parsed:
         if dom == "climate":
             out = []
             for r in rows:
-                r = list(r) + [None] * 6
-                out.append({"t": _ts(r[0]), "state": r[1], "set": _num(r[2]), "cur": _num(r[3]), "action": r[4], "fan": r[5]})
+                r = list(r) + [None] * 7
+                # sfan: a proxy's level of the device under it
+                out.append({"t": _ts(r[0]), "state": r[1], "set": _num(r[2]), "cur": _num(r[3]), "action": r[4], "fan": r[5],
+                            "sfan": r[6]})
             out.sort(key=lambda x: x["t"])
             p.climate[eid] = out
         elif dom == "weather":
@@ -331,13 +334,33 @@ def mask_stuck(T: np.ndarray, step_min: int, keep_h: float = 1.0, min_h: float =
     return T, share
 
 
+def _setpoint_level(r: dict, prow: dict | None, labels: list, offsets: list) -> int:
+    """A level under setpoint power control: as the proxy says it ran it, else from
+    how far past its own reading the device was set (the largest offset within it)."""
+    if prow is not None and prow.get("sfan") in labels:
+        return labels.index(prow["sfan"])
+    gap = r["set"] - r["cur"] if r["state"] == "heat" else r["cur"] - r["set"]
+    if not np.isfinite(gap):
+        return 0
+    return max([i for i, o in enumerate(offsets) if o <= gap + 0.01] or [0])
+
+
 def _ac_fractions(parsed: Parsed, cfg: dict, levels: int, t0, step, K, room) -> np.ndarray:
-    """Share of each step heating/cooling at each fan level, from the real unit's history."""
+    """Share of each step heating/cooling at each fan level, from the real unit's history.
+
+    Under setpoint power control (power_control: setpoint, from power_since on)
+    the levels are setpoints past the device's own reading, not fan speeds;
+    before that, its fan modes then (fan_modes_before) are the levels."""
     out = np.zeros((K, 2, levels))
     rows = parsed.climate.get(cfg.get("source", ""), [])
     if not rows:
         return out
     modes = list(cfg.get("fan_modes") or [])
+    offsets = list(cfg.get("setpoint_offsets") or []) if cfg.get("power_control") == "setpoint" else []
+    since = float(cfg.get("power_since") or 0) if offsets else math.inf
+    before = list(cfg.get("fan_modes_before") or modes) if offsets else modes
+    prows = parsed.climate.get(cfg.get("proxy", ""), []) if offsets else []
+    pt = np.array([r["t"] for r in prows]) if prows else np.zeros(0)
     rt = np.array([r["t"] for r in rows])
     sub = 10
     fine = t0 + (np.arange(K * sub) + 0.5) * (step / sub)
@@ -357,8 +380,12 @@ def _ac_fractions(parsed: Parsed, cfg: dict, levels: int, t0, step, K, room) -> 
                 continue
             if st == "cool" and sp > room[k] + 1.0:
                 continue
-        fan = r.get("fan")
-        lvl = modes.index(fan) if fan in modes else (levels - 1 if not modes else 0)
+        if fine[n] >= since:
+            j = int(np.searchsorted(pt, fine[n], side="right")) - 1
+            lvl = _setpoint_level(r, prows[j] if j >= 0 else None, modes, offsets)
+        else:
+            fan = r.get("fan")
+            lvl = before.index(fan) if fan in before else (levels - 1 if not before else 0)
         lvl = min(max(lvl, 0), levels - 1)
         out[k, 0 if st == "heat" else 1, lvl] += 1.0 / sub
     return out

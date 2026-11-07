@@ -70,7 +70,8 @@ def _float(s) -> float:
 def row_for(eid: str, t: int, state: str, attrs: dict) -> list:
     k = kind_of(eid)
     if k == "climate":
-        return [t, state, attrs.get("temperature"), attrs.get("current_temperature"), attrs.get("hvac_action"), attrs.get("fan_mode")]
+        return [t, state, attrs.get("temperature"), attrs.get("current_temperature"), attrs.get("hvac_action"), attrs.get("fan_mode"),
+                attrs.get("source_fan_mode")]
     if k == "weather":
         return [t, state, attrs.get("temperature"), attrs.get("cloud_coverage")]
     if k == "binary":

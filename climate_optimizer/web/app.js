@@ -751,6 +751,8 @@ pages.comfort = async (redraw) => {
 
 // a unit's fan modes, quietest first: as set in Settings, else as its proxy reports them
 function fanModes(uid) {
+  const st = S.status?.units?.[uid] || {};
+  if (st.power_control === 'setpoint' && st.levels?.length) return st.levels;  // "+2 K": setpoints past the AC's reading
   const m = S.config?.mapping?.units?.[uid] || {};
   if (m.fan_modes?.length) return m.fan_modes;
   const attrs = S.status?.units?.[uid]?.proxy_attrs || {};
@@ -934,6 +936,7 @@ pages.model = async () => {
       <div class="stat"><div class="k">Electricity on check days</div><div class="v">${num(rep.energy?.sim, 1)} kWh</div><div class="s">${rep.energy?.observed ? 'measured ' + num(rep.energy.obs, 1) + ' kWh' : 'no phase measurement'}</div></div>
     </div>`;
     for (const w of rep.warnings || []) html += `<div class="msg">${esc(w)}</div>`;
+    if (rep.power_note) html += `<div class="msg">${esc(rep.power_note)}</div>`;
     html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th></tr>`;
     L.zones.forEach((z, i) => {
       const zs = rep.zones?.[z.id] || {};

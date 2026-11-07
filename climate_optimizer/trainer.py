@@ -44,6 +44,22 @@ def write_progress(path: str | None, d: dict) -> None:
     os.replace(tmp, path)
 
 
+POWER_MIN_DAYS = 3  # days under the new power control before training on them alone
+
+
+def power_window(start: float, switch: float | None, now: float) -> tuple[float, str | None]:
+    """Where training starts. After a unit went over to setpoint power control its
+    levels mean something else: once there are a few days of it, only those; until
+    then all days, the earlier read with the fan levels then, and a note."""
+    if not switch or switch <= start:
+        return start, None
+    day = time.strftime("%Y-%m-%d", time.localtime(switch / 1000))
+    if now - switch >= POWER_MIN_DAYS * 864e5:
+        return switch, f"trained on the days since the change of power control ({day})"
+    return start, (f"power control changed on {day}: trained on all days for now, "
+                   f"on those since once there are {POWER_MIN_DAYS}")
+
+
 def train_job(export: dict, layout: dict, mapping: dict, initial: dict | None, progress_path: str | None = None) -> dict:
     from .model.dataset import build_grid, parse_rows
     from .model.fit import train
@@ -89,7 +105,8 @@ class Trainer:
         try:
             now = int(time.time() * 1000)
             ents = tracked_entities(cfg.mapping)
-            export = await asyncio.to_thread(p.store.export, ents, int(now - cfg.history_days * 864e5), now,
+            start, note = power_window(now - cfg.history_days * 864e5, p.power_switch(), now)
+            export = await asyncio.to_thread(p.store.export, ents, int(start), now,
                                              p.collector.meta, {**p.location(), "tz": str(p.tz())})
             if self._pool is None:
                 self._pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
@@ -99,7 +116,7 @@ class Trainer:
             res = await loop.run_in_executor(self._pool, train_job, export, cfg.layout, p.mapping(), initial, self.progress_path)
             from .model.layout import Params
             p.params = Params.from_dict(res["params"])
-            p.report = {**res["report"], "finished": time.time() * 1000}
+            p.report = {**res["report"], "finished": time.time() * 1000, **({"power_note": note} if note else {})}
             p.store.put("params", res["params"])
             p.store.put("params_checked", res["checked"])
             p.store.put("report", p.report)

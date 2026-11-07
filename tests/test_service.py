@@ -611,3 +611,26 @@ def test_a_heater_is_off_a_moment_after_its_run(client):
     a = client.post("/api/v1/command", json=world.request("bath")).json()
     assert a["reason"] != "run over"
     svc.planner._run_over.pop("bath", None)
+
+
+def test_setpoint_power_control_is_noted(client):
+    p = client.svc.planner
+    body = client.svc.ha.world.request("living")
+    p.command(body, now_ms=1_000_000)
+    assert "climate.living_proxy" not in (client.svc.store.get("power_control") or {})  # fan control: nothing to note
+    sp = {**body, "power_control": "setpoint", "setpoint_offsets": [1, 2, 3], "source_fan_modes": ["+1 K", "+2 K", "+3 K"]}
+    p.command(sp, now_ms=2_000_000)
+    p.command(sp, now_ms=3_000_000)  # the same again: since stays
+    pc = client.svc.store.get("power_control")["climate.living_proxy"]
+    assert pc["mode"] == "setpoint" and pc["since"] == 2_000_000 and pc["fan_modes_before"] == body["source_fan_modes"]
+    u = p.mapping()["units"]["living"]
+    assert u["fan_modes"] == ["+1 K", "+2 K", "+3 K"] and u["setpoint_offsets"] == [1.0, 2.0, 3.0]
+    assert u["power_since"] == 2_000_000 and p.power_switch() == 2_000_000
+    from climate_optimizer.trainer import power_window
+    day = 864e5
+    assert power_window(0, 2 * day, 3 * day)[0] == 0  # one day of it: all days still
+    assert power_window(0, 2 * day, 6 * day)[0] == 2 * day  # three: those alone
+    assert power_window(5 * day, 2 * day, 6 * day) == (5 * day, None)  # out of the window anyway
+    p.command(body, now_ms=4_000_000)  # back to fan control
+    client.svc.store.put("power_control", {})
+    client.svc.store.put("fan_modes", {})

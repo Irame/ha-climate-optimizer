@@ -175,6 +175,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         now = time.time() * 1000
         layout, _ = p.model()
         units = {}
+        full = p.mapping().get("units") or {}
         for u in layout.units:
             m = (cfg.mapping.get("units") or {}).get(u.id) or {}
             req = p.requests.get(m.get("proxy", ""))
@@ -182,7 +183,9 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
             ps = s.collector.states.get(m.get("proxy", "")) or {}
             units[u.id] = {"name": u.name, "zone": u.zone, "kind": u.kind, "proxy": m.get("proxy"),
                            "proxy_state": ps.get("state"), "proxy_attrs": ps.get("attributes"),
-                           "last_request": req.t if req else None, "decision": dec[-1] if dec else None}
+                           "last_request": req.t if req else None, "decision": dec[-1] if dec else None,
+                           "power_control": (full.get(u.id) or {}).get("power_control", "fan"),
+                           "levels": (full.get(u.id) or {}).get("fan_modes") or []}
         zones = {}
         for z in layout.zones:
             zm = (cfg.mapping.get("zones") or {}).get(z.id) or {}

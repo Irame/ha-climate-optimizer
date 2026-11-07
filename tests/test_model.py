@@ -204,3 +204,41 @@ def test_start_energy_shows_at_the_starts(trained):
     starts = np.clip(run[1:] - run[:-1], 0, 1) * (run[:-1] < 0.5)
     extra = (b - a)[0].sum() * grid.dt_h
     assert starts.sum() > 3 and extra == pytest.approx(0.05 * starts[: grid.K - 2].sum(), rel=0.05)
+
+
+def test_setpoint_power_control_levels():
+    """Under setpoint power control the levels are setpoints past the device's own
+    reading: training reads them from the proxy's level, else from that gap, and the
+    days before with the fan modes then."""
+    from climate_optimizer.model.dataset import _ts
+    from climate_optimizer.model.synthetic import FAN_MODES
+
+    layout = default_layout()
+    r = synthetic.run(days=2, seed=4, realism=False)
+    ex = json.loads(json.dumps(synthetic.to_export(r)))
+    m = synthetic.mapping_for(layout)
+    base = build_grid(parse_rows(ex), layout, m).ac_frac["living"]
+    src, prx = m["units"]["living"]["source"], m["units"]["living"]["proxy"]
+    rows = ex["history"][src]
+    since = _ts(rows[len(rows) // 2][0])
+    offs, labels = [1.0, 2.0, 3.0, 4.0], ["+1 K", "+2 K", "+3 K", "+4 K"]
+    new, prows = [], []
+    for t, st, sp, cur, act, fan in rows:
+        if _ts(t) >= since and st in ("heat", "cool"):
+            lvl = FAN_MODES.index(fan)
+            sp = cur + offs[lvl] + 0.5 if st == "heat" else cur - offs[lvl] - 0.5  # rounded away from the room
+            prows.append([t, st, 21.0, 20.0, act, "medium", labels[lvl]])
+            fan = "auto"
+        new.append([t, st, sp, cur, act, fan])
+    ex["history"][src] = new
+    unit = {**m["units"]["living"], "power_control": "setpoint", "setpoint_offsets": offs, "power_since": since,
+            "fan_modes": labels, "fan_modes_before": FAN_MODES}
+    m2 = {**m, "units": {**m["units"], "living": unit}}
+    ex["history"][prx] = prows
+    got = build_grid(parse_rows(ex), layout, m2).ac_frac["living"]
+    assert base.sum() > 5 and np.abs(got - base).max() < 1e-9  # from the proxy's level
+    ex["history"][prx] = []
+    gap = build_grid(parse_rows(ex), layout, m2).ac_frac["living"]
+    assert np.abs(gap - base).max() < 1e-9  # from the gap: 0.5 K past the offset is still that level
+    wrong = build_grid(parse_rows(ex), layout, m).ac_frac["living"]  # read as fan modes, "auto" is no level
+    assert np.abs(wrong - base).max() > 0.5
