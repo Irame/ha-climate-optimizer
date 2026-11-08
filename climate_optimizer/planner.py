@@ -105,6 +105,49 @@ class Planner:
         self.params: Params | None = Params.from_dict(p) if p else None
         self.report: dict | None = store.get("report")
 
+    # ---- the models trained, to go back to one ----
+    MODELS_KEPT = 10
+
+    def models(self) -> list[dict]:
+        """The last trained models, newest first, with which one plans."""
+        now_id = self.store.get("model_id")
+        out = []
+        for e in self.store.get("models") or []:
+            r = e.get("report") or {}
+            val = [v for v in r.get("rmse_val") or [] if v is not None and math.isfinite(v)]
+            out.append({"id": e["id"], "trained": r.get("finished"), "rmse_val": round(sum(val) / len(val), 3) if val else None,
+                        "days": len((r.get("days") or {}).get("train") or []) + len((r.get("days") or {}).get("val") or []),
+                        "note": r.get("power_note"), "current": e["id"] == now_id,
+                        "heat": {u: v.get("heat") for u, v in (e.get("params") or {}).get("units", {}).items() if v.get("heat")}})
+        return out
+
+    def remember_model(self, params: dict, checked: dict | None, report: dict) -> str:
+        """A model just trained: kept with the last few, and the one planning now."""
+        import uuid
+        hist = self.store.get("models") or []
+        if not hist and self.params is not None and self.report:  # the one before keeping them: kept too
+            hist = [{"id": uuid.uuid4().hex[:8], "params": self.params.to_dict(), "checked": self.store.get("params_checked"),
+                     "report": self.report}]
+        e = {"id": uuid.uuid4().hex[:8], "params": params, "checked": checked, "report": report}
+        self.store.put("models", ([e] + hist)[: self.MODELS_KEPT])
+        self.store.put("model_id", e["id"])
+        return e["id"]
+
+    def use_model(self, mid: str) -> dict | None:
+        """Plan with an earlier model again; the nightly training waits until one by hand."""
+        e = next((x for x in self.store.get("models") or [] if x["id"] == mid), None)
+        if e is None:
+            return None
+        self.params = Params.from_dict(e["params"])
+        self.report = e["report"]
+        self.store.put("params", e["params"])
+        self.store.put("params_checked", e.get("checked") or e["params"])
+        self.store.put("report", e["report"])
+        self.store.put("model_id", mid)
+        self.store.put("model_kept", int(time.time() * 1000))
+        log.info("planning with model %s again; nightly training paused", mid)
+        return e
+
     # ---- context ----
     @property
     def cfg(self) -> Config:
@@ -148,8 +191,10 @@ class Planner:
         return m
 
     def power_switch(self) -> float | None:
-        """When the latest unit went over to setpoint power control (or back)."""
-        ts = [float(pc["since"]) for pc in (self.store.get("power_control") or {}).values() if pc.get("since")]
+        """When the latest unit now under setpoint power control went over to it.
+        (Back on fan speeds, the levels mean what they meant before: no switch.)"""
+        ts = [float(pc["since"]) for pc in (self.store.get("power_control") or {}).values()
+              if pc.get("since") and pc.get("mode") == "setpoint"]
         return max(ts) if ts else None
 
     def _note_power(self, eid: str, body: dict, now_ms: float) -> None:

@@ -1,5 +1,6 @@
 """The service end to end against the simulated apartment."""
 
+import json
 from datetime import datetime
 
 import pytest
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from climate_optimizer.app import create_app
 from climate_optimizer.demo import demo_service
-from climate_optimizer.model.layout import default_layout, default_params
+from climate_optimizer.model.layout import Params, default_layout, default_params
 
 
 @pytest.fixture(scope="module")
@@ -634,3 +635,22 @@ def test_setpoint_power_control_is_noted(client):
     p.command(body, now_ms=4_000_000)  # back to fan control
     client.svc.store.put("power_control", {})
     client.svc.store.put("fan_modes", {})
+
+
+def test_earlier_models_can_be_used_again(client):
+    p, store = client.svc.planner, client.svc.store
+    first = p.params.to_dict()
+    rep = {"finished": 1.0, "rmse_val": [0.5, 0.7], "days": {"train": [1, 2], "val": [3]}}
+    a = p.remember_model(first, first, rep)
+    second = json.loads(json.dumps(first))
+    second["units"]["living"]["heat"] = [9.0 for _ in second["units"]["living"]["heat"]]
+    b = p.remember_model(second, second, {**rep, "finished": 2.0})
+    p.params, p.report = Params.from_dict(second), {**rep, "finished": 2.0}
+    ms = client.get("/api/model").json()["models"]
+    assert [m["id"] for m in ms][:2] == [b, a] and ms[0]["current"] and ms[1]["rmse_val"] == 0.6
+    assert client.post(f"/api/model/use/{a}").json()["ok"]
+    assert p.params.units["living"]["heat"] == first["units"]["living"]["heat"]
+    m = client.get("/api/model").json()
+    assert m["kept"] and m["models"][1]["current"]
+    assert client.post("/api/model/use/nope").status_code == 404
+    store.put("model_kept", None)

@@ -117,9 +117,11 @@ class Trainer:
             from .model.layout import Params
             p.params = Params.from_dict(res["params"])
             p.report = {**res["report"], "finished": time.time() * 1000, **({"power_note": note} if note else {})}
+            p.remember_model(res["params"], res["checked"], p.report)
             p.store.put("params", res["params"])
             p.store.put("params_checked", res["checked"])
             p.store.put("report", p.report)
+            p.store.put("model_kept", None)
             log.info("trained: rmse %s", res["report"].get("rmse_val"))
         except Exception as e:
             log.exception("training failed")

@@ -16,6 +16,7 @@ heat-per-level the model assumes.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -24,6 +25,8 @@ import numpy as np
 
 from .layout import Layout
 from .solar import irradiance
+
+_SP_LABEL = re.compile(r"^\+(\d+(?:\.\d+)?) K$")
 
 MIN = 60_000
 
@@ -334,27 +337,64 @@ def mask_stuck(T: np.ndarray, step_min: int, keep_h: float = 1.0, min_h: float =
     return T, share
 
 
-def _setpoint_level(r: dict, prow: dict | None, labels: list, offsets: list) -> int:
-    """A level under setpoint power control: as the proxy says it ran it, else from
-    how far past its own reading the device was set (the largest offset within it)."""
-    if prow is not None and prow.get("sfan") in labels:
-        return labels.index(prow["sfan"])
-    gap = r["set"] - r["cur"] if r["state"] == "heat" else r["cur"] - r["set"]
-    if not np.isfinite(gap):
-        return 0
-    return max([i for i, o in enumerate(offsets) if o <= gap + 0.01] or [0])
+def _sp_offset(label) -> float | None:
+    """The offset in a proxy's level under setpoint power control ("+2 K"), else None."""
+    m = _SP_LABEL.match(str(label or ""))
+    return float(m.group(1)) if m else None
 
 
 def _ac_fractions(parsed: Parsed, cfg: dict, levels: int, t0, step, K, room) -> np.ndarray:
     """Share of each step heating/cooling at each fan level, from the real unit's history.
 
-    Under setpoint power control (power_control: setpoint, from power_since on)
-    the levels are setpoints past the device's own reading, not fan speeds;
-    before that, its fan modes then (fan_modes_before) are the levels."""
+    Where its proxy ran it under setpoint power control (its level then reads "+2 K"),
+    the level is that setpoint offset, whatever the control is now; elsewhere it is the
+    device's fan mode. Under setpoint control now (from power_since on) without the
+    proxy's level, it is the gap between the device's setpoint and its own reading."""
     out = np.zeros((K, 2, levels))
     rows = parsed.climate.get(cfg.get("source", ""), [])
     if not rows:
         return out
+    setpoint_now = cfg.get("power_control") == "setpoint"
+    # the fan speeds, weakest first (under setpoint control now: those before)
+    modes = list(cfg.get("fan_modes_before") or []) if setpoint_now else list(cfg.get("fan_modes") or [])
+    prows = parsed.climate.get(cfg.get("proxy", ""), [])
+    pt = np.array([r["t"] for r in prows]) if prows else np.zeros(0)
+    # the setpoint offsets, weakest first: as set now, else as the proxy's history shows them
+    offsets = [float(x) for x in cfg.get("setpoint_offsets") or []] if setpoint_now else []
+    offsets = offsets or sorted({o for r in prows if (o := _sp_offset(r.get("sfan"))) is not None})
+    since = float(cfg.get("power_since") or 0) if setpoint_now else math.inf
+    rt = np.array([r["t"] for r in rows])
+    sub = 10
+    fine = t0 + (np.arange(K * sub) + 0.5) * (step / sub)
+    idx = np.searchsorted(rt, fine, side="right") - 1
+    pidx = np.searchsorted(pt, fine, side="right") - 1
+    for n, i in enumerate(idx):
+        if i < 0:
+            continue
+        r = rows[i]
+        st = r["state"]
+        if st not in ("heat", "cool"):
+            continue
+        k = n // sub
+        sp = r["set"]
+        # a unit held in heat at its lowest setpoint (idle_action: hold_setpoint) is idle
+        if np.isfinite(sp) and np.isfinite(room[k]):
+            if st == "heat" and sp < room[k] - 1.0:
+                continue
+            if st == "cool" and sp > room[k] + 1.0:
+                continue
+        o = _sp_offset(prows[pidx[n]].get("sfan")) if pidx[n] >= 0 else None
+        if o is not None and offsets:
+            lvl = int(np.argmin([abs(o - x) for x in offsets]))
+        elif fine[n] >= since:
+            gap = sp - r["cur"] if st == "heat" else r["cur"] - sp
+            lvl = max([j for j, x in enumerate(offsets) if x <= gap + 0.01] or [0]) if np.isfinite(gap) else 0
+        else:
+            fan = r.get("fan")
+            lvl = modes.index(fan) if fan in modes else (levels - 1 if not modes else 0)
+        lvl = min(max(lvl, 0), levels - 1)
+        out[k, 0 if st == "heat" else 1, lvl] += 1.0 / sub
+    return out
     modes = list(cfg.get("fan_modes") or [])
     offsets = list(cfg.get("setpoint_offsets") or []) if cfg.get("power_control") == "setpoint" else []
     since = float(cfg.get("power_since") or 0) if offsets else math.inf

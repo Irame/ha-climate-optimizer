@@ -97,7 +97,8 @@ class Service:
             await _sleep_until(self.stop, 600, offset=30)
             cfg = self.cfgs.config
             rep = self.planner.report or {}
-            if self.ha.connected.is_set() and retrain_due((rep.get("finished") or 0) / 1000, datetime.now(self.planner.tz()), cfg.retrain_hour):
+            kept = self.store.get("model_kept")  # an earlier model chosen again: no nightly training until one by hand
+            if self.ha.connected.is_set() and not kept and retrain_due((rep.get("finished") or 0) / 1000, datetime.now(self.planner.tz()), cfg.retrain_hour):
                 await self.trainer.run()
 
     async def config_changed(self, old, new) -> None:
@@ -408,7 +409,19 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         _, params = s.planner.model()
         return _json({"params": params.to_dict(), "trained": s.planner.params is not None, "report": s.planner.report,
                       "training": s.trainer.running, "started": s.trainer.started, "progress": s.trainer.progress(),
-                      "error": s.trainer.error})
+                      "error": s.trainer.error, "models": s.planner.models(), "kept": s.store.get("model_kept")})
+
+    @app.post("/api/model/use/{mid}", dependencies=[Depends(auth)])
+    async def use_model(mid: str):
+        """Plan with an earlier model again (the last ten are kept). Nightly training
+        then waits until one is started by hand."""
+        s = svc()
+        if s.trainer.running:
+            raise HTTPException(409, "training is running")
+        if s.planner.use_model(mid) is None:
+            raise HTTPException(404, "no such model")
+        asyncio.create_task(s.planner.replan())
+        return {"ok": True}
 
     @app.post("/api/model/train", dependencies=[Depends(auth)])
     async def train(fresh: bool = False):

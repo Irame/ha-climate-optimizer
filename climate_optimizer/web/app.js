@@ -937,6 +937,7 @@ pages.model = async () => {
     </div>`;
     for (const w of rep.warnings || []) html += `<div class="msg">${esc(w)}</div>`;
     if (rep.power_note) html += `<div class="msg">${esc(rep.power_note)}</div>`;
+    if (m.kept) html += `<div class="msg">Planning with an earlier model, chosen ${ago(m.kept)}. Nightly training waits until you retrain by hand.</div>`;
     html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th></tr>`;
     L.zones.forEach((z, i) => {
       const zs = rep.zones?.[z.id] || {};
@@ -973,7 +974,23 @@ pages.model = async () => {
         <div class="toolbar"><div class="chips" id="val-zones"></div></div><div id="val-chart"></div></div>`;
     }
   }
+  if ((m.models || []).length > 1) {
+    html += `<div class="card"><h3>Earlier models</h3><div class="table-wrap"><table><tr><th>Trained</th><th class="num">Days</th><th class="num">Error on check days</th><th>Heat per level (kW)</th><th></th></tr>`;
+    for (const e of m.models) {
+      const heat = Object.entries(e.heat || {}).map(([u, h]) => `${esc(unitOf(u)?.name || u)}: ${h.map(v => num(v, 1)).join(' / ')}`).join('<br>');
+      html += `<tr><td>${fmtDay(e.trained, S.tz)} ${fmtTime(e.trained, S.tz)}${e.note ? `<div class="hint" style="margin:0">${esc(e.note)}</div>` : ''}</td>
+        <td class="num">${e.days}</td><td class="num">${num(e.rmse_val, 2)} K</td><td style="font-size:12px">${heat}</td>
+        <td>${e.current ? '<b>planning</b>' : `<button data-use="${esc(e.id)}" ${m.training ? 'disabled' : ''}>Use</button>`}</td></tr>`;
+    }
+    html += `</table></div><p class="hint">The last ten trained models. Going back to one plans with it from the next plan on; nightly training then waits until you retrain by hand, so it stays. The error compares models only roughly: each was checked on its own days.</p></div>`;
+  }
   root.innerHTML = html;
+  root.querySelectorAll('[data-use]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try { await api('model/use/' + b.dataset.use, { method: 'POST' }); S.trainDone = 'Planning with the earlier model now.'; }
+    catch (e) { S.trainDone = null; alert(e.message); }
+    pages.model();
+  });
   $('#train').onclick = () => api('model/train', { method: 'POST' }).then(() => pages.model());
   $('#train-fresh').onclick = () => api('model/train?fresh=true', { method: 'POST' }).then(() => pages.model());
   $('#diag').onclick = async () => {

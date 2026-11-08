@@ -240,5 +240,8 @@ def test_setpoint_power_control_levels():
     ex["history"][prx] = []
     gap = build_grid(parse_rows(ex), layout, m2).ac_frac["living"]
     assert np.abs(gap - base).max() < 1e-9  # from the gap: 0.5 K past the offset is still that level
-    wrong = build_grid(parse_rows(ex), layout, m).ac_frac["living"]  # read as fan modes, "auto" is no level
+    wrong = build_grid(parse_rows(ex), layout, m).ac_frac["living"]  # neither the proxy's level nor the switch known
     assert np.abs(wrong - base).max() > 0.5
+    ex["history"][prx] = prows  # back on fan speeds now: the stretch under setpoint control still reads as such
+    back = build_grid(parse_rows(ex), layout, m).ac_frac["living"]
+    assert np.abs(back - base).max() < 1e-9

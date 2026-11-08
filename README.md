@@ -191,7 +191,7 @@ docker compose up -d --build
 Then open `http://<host>:8099`:
 
 1. **Settings:** check the Home Assistant connection. For every room, choose the thermometer and the window or door sensors, and tick where its windows face: the model then looks for sun only from there, which it learns much sooner. For every unit, choose its proxy entity and the device under it, plus the fan modes quietest first. Then set the outdoor thermometer, the weather entity, the phase the outdoor unit hangs on, and the price source. For the phases, the car and the heater, an energy meter (kWh) is better than a power sensor where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, while a power sensor's reports miss what happens between them. Save.
-2. The optimizer backfills what Home Assistant's recorder has (10 days by default) and trains on it. This takes a minute or two. The **Model** page shows how well it predicts.
+2. The optimizer backfills what Home Assistant's recorder has (10 days by default) and trains on it. This takes a minute or two. The **Model** page shows how well it predicts. It keeps the last ten trained models: if plans got worse after a training, **Use** an earlier one under *Earlier models*. It plans from the next plan on, and nightly training waits until you retrain by hand, so it stays until then. That is safer than going back to an older version of the optimizer: an older version reads newer settings (a rule kind it doesn't know) as invalid, and it keeps planning with the model it finds.
 3. Point every proxy at the optimizer and set it to `auto`:
 
    ```yaml
@@ -248,7 +248,7 @@ The proxy sends its state (see the proxy's README). The answer:
 
 The proxy's fan mode offset limits the levels: an offset of −1 caps the top level one lower, and +1 raises the lowest level by one.
 
-A proxy with `power_control: setpoint` runs its levels as setpoints a few degrees past the AC's own reading instead of fan speeds (`setpoint_offsets`); give the unit as many levels in the layout as there are offsets. The optimizer notes when a proxy changes over and reads the history accordingly: before, a level is the fan mode then; after, it is the level the proxy reports (`+2 K`), or else the gap between setpoint and the AC's reading. The levels then mean something else, so once there are three days under the new control, training (the nightly one included) uses only those days; until then it uses all of them, and the Model page says so.
+A proxy with `power_control: setpoint` runs its levels as setpoints a few degrees past the AC's own reading instead of fan speeds (`setpoint_offsets`); give the unit as many levels in the layout as there are offsets. The optimizer reads the history accordingly: wherever the proxy reported a level like `+2 K`, that setpoint offset is the level, also after going back to fan speeds (a test for an evening stays a test); elsewhere it is the fan mode then; under setpoint control without the proxy's level, the gap between setpoint and the AC's reading. The levels then mean something else, so once there are three days under the new control, training (the nightly one included) uses only those days; until then it uses all of them, and the Model page says so.
 
 ## Development
 
