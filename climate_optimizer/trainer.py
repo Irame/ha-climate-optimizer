@@ -65,12 +65,16 @@ def train_job(export: dict, layout: dict, mapping: dict, initial: dict | None, p
     from .model.fit import train
     from .model.layout import Layout, Params
 
+    from .planner import regrid_units, unit_offsets
+
     write_progress(progress_path, {"stage": "grid"})
     lay = Layout.from_dict(layout)
     grid = build_grid(parse_rows(export), lay, mapping)
-    res = train(lay, grid, Params.from_dict(initial) if initial else None,
+    offs = unit_offsets(mapping)  # under setpoint control the levels are these offsets: heat learned along them
+    res = train(lay, grid, regrid_units(Params.from_dict(initial), offs) if initial else None,
                 progress=lambda d: write_progress(progress_path, d))
-    return {"params": res["params"].to_dict(), "checked": res["checked"].to_dict(), "report": _plain(res["report"])}
+    return {"params": regrid_units(res["params"], offs).to_dict(), "checked": regrid_units(res["checked"], offs).to_dict(),
+            "report": _plain(res["report"])}
 
 
 class Trainer:

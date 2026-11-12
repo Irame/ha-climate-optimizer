@@ -632,6 +632,10 @@ def test_setpoint_power_control_is_noted(client):
     assert power_window(0, 2 * day, 3 * day)[0] == 0  # one day of it: all days still
     assert power_window(0, 2 * day, 6 * day)[0] == 2 * day  # three: those alone
     assert power_window(5 * day, 2 * day, 6 * day) == (5 * day, None)  # out of the window anyway
+    p.command({**sp, "setpoint_offsets": [1, 2, 4]}, now_ms=3_500_000)  # other offsets: what is learned holds along them
+    assert client.svc.store.get("power_control")["climate.living_proxy"]["since"] == 2_000_000
+    p.command({**sp, "setpoint_fan_modes": ["quiet", "low", "high"]}, now_ms=3_600_000)  # other fan modes: anew
+    assert client.svc.store.get("power_control")["climate.living_proxy"]["since"] == 3_600_000
     p.command(body, now_ms=4_000_000)  # back to fan control
     client.svc.store.put("power_control", {})
     client.svc.store.put("fan_modes", {})
@@ -654,3 +658,42 @@ def test_earlier_models_can_be_used_again(client):
     assert m["kept"] and m["models"][1]["current"]
     assert client.post("/api/model/use/nope").status_code == 404
     store.put("model_kept", None)
+
+
+def test_trying_every_level(client):
+    import time as _t
+
+    import numpy as np
+
+    p = client.svc.planner
+    assert client.post("/api/model/explore", json={"days": 99}).status_code == 422
+    ex = client.post("/api/model/explore", json={"days": 1}).json()["explore"]
+    assert client.get("/api/model").json()["explore"]["until"] == ex["until"]
+    now = _t.time() * 1000
+    t = np.arange(now, now + 2 * 864e5, 15 * 60_000)
+    a, b = p.explore_caps(0, 4, t, p.tz()), p.explore_caps(1, 4, t, p.tz())
+    inside = t[:-1] < ex["until"]
+    assert set(a[inside]) == {0.0, 1.0, 2.0, 3.0} and np.isnan(a[~inside]).all()  # every level, then any
+    assert (a[inside] != b[inside]).all()  # the units take different turns
+    r = client.post("/api/plan").json()
+    assert any("Trying every level" in n for n in r["info"]["notes"])
+    client.post("/api/model/explore", json={"days": 0})
+    assert client.get("/api/model").json()["explore"] is None
+
+
+def test_a_window_counts_once_open_a_moment(client):
+    svc = client.svc
+    world = svc.ha.world
+    world.windows["office"] = True
+    _see(svc)
+    try:
+        r = client.post("/api/plan").json()
+        assert any("window just opened" in n for n in r["info"]["notes"])
+        eid = "binary_sensor.office_balkontuer"
+        st = svc.collector.states[eid]
+        st["last_changed"] = datetime.fromtimestamp(datetime.fromisoformat(st["last_changed"].replace("Z", "+00:00")).timestamp() - 180).isoformat()
+        r = client.post("/api/plan").json()
+        assert not any("window just opened" in n for n in r["info"]["notes"])
+    finally:
+        world.windows["office"] = False
+        _see(svc)

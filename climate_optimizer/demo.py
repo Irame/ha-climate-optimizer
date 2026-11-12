@@ -54,6 +54,7 @@ class World:
                              "proxy_mode": "auto", "target": synthetic.TARGETS.get(u.zone, (22.0, 22.0))[0]}
                       for u in self.layout.units}
         self.windows = {z: False for z in self.layout.window_zones}
+        self._win_seen: dict[str, tuple[bool, int]] = {}  # as last reported, and since when
         self.planner = None
         self.handlers = []
         self.last_pel = 0.0
@@ -215,7 +216,11 @@ class World:
         add("sensor.balkon_temperatur", round(self.tout_at(self.t), 1), friendly_name="Balkon Temperatur",
             unit_of_measurement="°C", device_class="temperature")
         for z, o in self.windows.items():
+            was = self._win_seen.get(z)
+            if was is None or was[0] != o:
+                self._win_seen[z] = was = (o, self.t)
             add(f"binary_sensor.{z}_balkontuer", "on" if o else "off", friendly_name=f"{synthetic.NAMES.get(z, z)} Balkontür", device_class="door")
+            out[-1]["last_changed"] = _iso(was[1])
         for u in self.layout.units:
             st = self.units[u.id]
             zi = self.layout.zone_index(u.zone)

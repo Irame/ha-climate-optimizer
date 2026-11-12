@@ -245,3 +245,39 @@ def test_setpoint_power_control_levels():
     ex["history"][prx] = prows  # back on fan speeds now: the stretch under setpoint control still reads as such
     back = build_grid(parse_rows(ex), layout, m).ac_frac["living"]
     assert np.abs(back - base).max() < 1e-9
+
+
+def test_heat_is_learned_along_the_setpoint_offsets():
+    from climate_optimizer.model.dataset import _sp_offset, offset_weights, regrid_heat
+    from climate_optimizer.planner import matching_params
+
+    assert _sp_offset("+2 K") == 2.0 and _sp_offset("+2.5 K low") == 2.5 and _sp_offset("low") is None
+    assert offset_weights(3.0, [2.0, 4.0]) == [(0, 0.5), (1, 0.5)]  # between two levels: half each
+    assert offset_weights(1.0, [2.0, 4.0]) == [(0, 1.0)] and offset_weights(6.0, [2.0, 4.0]) == [(1, 1.0)]
+    assert offset_weights(4.0, [1.0, 2.0, 4.0]) == [(2, 1.0)]
+    assert regrid_heat([1.0, 2.0, 3.0], [1, 2, 3], [1.5, 3, 4]) == [1.5, 3.0, 4.0]  # along, and straight on past the end
+    layout = default_layout()
+    p = default_params(layout)
+    p.units["living"]["heat"] = [1.0, 2.0, 3.0, 4.0]
+    p.units["living"]["offsets"] = [1.0, 2.0, 3.0, 4.0]
+    m = matching_params(p, layout, {"living": [2.0, 4.0, 6.0, 8.0]})
+    assert m.units["living"]["heat"] == [2.0, 4.0, 6.0, 8.0] and m.units["living"]["offsets"] == [2.0, 4.0, 6.0, 8.0]
+    assert p.units["living"]["heat"] == [1.0, 2.0, 3.0, 4.0]  # the trained model itself is left as it is
+
+
+def test_metered_loads_come_off_the_phase():
+    """A fridge on the outdoor unit's phase with a plug of its own: taken off, the phase is the units again."""
+    layout = default_layout()
+    r = synthetic.run(days=2, seed=4, realism=False)
+    ex = json.loads(json.dumps(synthetic.to_export(r)))
+    m = synthetic.mapping_for(layout)
+    base = build_grid(parse_rows(ex), layout, m).phase
+    rows = ex["stats_5min"][m["phase"]]
+    fridge = [[t, 150.0 if (i // 6) % 2 else 0.0] for i, (t, _) in enumerate(rows)]  # W, half an hour on, half off
+    ex["stats_5min"][m["phase"]] = [[t, w + f[1]] for (t, w), f in zip(rows, fridge)]
+    ex["stats_5min"]["sensor.fridge_power"] = fridge
+    ex["meta"]["sensor.fridge_power"] = {"unit": "W", "device_class": "power"}
+    with_it = build_grid(parse_rows(ex), layout, m).phase
+    off = build_grid(parse_rows(ex), layout, {**m, "phase_subtract": ["sensor.fridge_power"]}).phase
+    ok = np.isfinite(base) & np.isfinite(off)
+    assert np.abs(with_it[ok] - base[ok]).max() > 0.1 and np.abs(off[ok] - base[ok]).max() < 1e-6

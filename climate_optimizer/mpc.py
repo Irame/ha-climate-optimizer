@@ -62,6 +62,7 @@ class Settings:
     heater_off_after_run_min: float = 2.0  # a heater's run stopped or over: off this long, at once
     terminal_quantile: float = 0.25  # missing heat at the end is valued at this price quantile
     window_assume_open_min: float = 10.0  # an open window is assumed closed after this
+    window_open_after_min: float = 2.0  # an opened window counts once open this long (a step onto the balcony does not)
     season: str = "auto"  # auto | heat | cool
     heat_below_outdoor: float = 20.0  # auto: heating only if it gets colder than this within a day
     cool_above_outdoor: float = 20.0  # auto: cooling only if it gets warmer than this within a day

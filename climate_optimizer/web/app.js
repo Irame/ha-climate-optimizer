@@ -938,6 +938,12 @@ pages.model = async () => {
     for (const w of rep.warnings || []) html += `<div class="msg">${esc(w)}</div>`;
     if (rep.power_note) html += `<div class="msg">${esc(rep.power_note)}</div>`;
     if (m.kept) html += `<div class="msg">Planning with an earlier model, chosen ${ago(m.kept)}. Nightly training waits until you retrain by hand.</div>`;
+    const ex = m.explore;
+    html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Every level</h3><span class="spacer"></span>
+      ${ex ? `<button id="explore-stop">Stop</button>` : `<label class="field" style="margin:0">Days <input type="number" id="explore-days" min="1" max="14" value="3" style="width:60px"></label><button id="explore">Try every level</button>`}</div>
+      <p class="hint" style="margin-bottom:0">${ex
+        ? `Trying every level until ${fmtDay(ex.until, S.tz)} ${fmtTime(ex.until, S.tz)}: for each AC unit the highest level allowed takes turns every 3 hours, another one the next day at the same hour.`
+        : `The plan mostly reaches for the highest level, so training rarely sees what the lower ones do (and after a change of the proxies' power control, not at all). For a few days, each AC unit then runs no higher than a level that takes turns every 3 hours. It may cost a little comfort; the nightly training after it learns from those days.`}</p></div>`;
     html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th></tr>`;
     L.zones.forEach((z, i) => {
       const zs = rep.zones?.[z.id] || {};
@@ -985,6 +991,9 @@ pages.model = async () => {
     html += `</table></div><p class="hint">The last ten trained models. Going back to one plans with it from the next plan on; nightly training then waits until you retrain by hand, so it stays. The error compares models only roughly: each was checked on its own days.</p></div>`;
   }
   root.innerHTML = html;
+  const exploreSet = days => api('model/explore', { method: 'POST', body: JSON.stringify({ days }) }).then(() => pages.model()).catch(e => alert(e.message));
+  if ($('#explore')) $('#explore').onclick = () => exploreSet(+$('#explore-days').value || 3);
+  if ($('#explore-stop')) $('#explore-stop').onclick = () => exploreSet(0);
   root.querySelectorAll('[data-use]').forEach(b => b.onclick = async () => {
     b.disabled = true;
     try { await api('model/use/' + b.dataset.use, { method: 'POST' }); S.trainDone = 'Planning with the earlier model now.'; }
@@ -1072,6 +1081,7 @@ const SETTING_FIELDS = [
   ['heater_off_after_run_min', 'Heaters: off after a run (min)', 0.5],
   ['terminal_quantile', 'Value heat left at the end at this price quantile', 0.05],
   ['window_assume_open_min', 'An open window closes after (min)', 1],
+  ['window_open_after_min', 'An opened window counts once open (min)', 0.5],
   ['heat_below_outdoor', 'Heat only if colder outside than (°C)', 0.5], ['cool_above_outdoor', 'Cool only if warmer outside than (°C)', 0.5],
   ['time_limit_s', 'Solver time limit (s)', 1], ['binary_h', 'On/off decided as such for (h)', 0.05],
 ];
@@ -1130,6 +1140,7 @@ pages.settings = async () => {
     ${field('Outdoor thermometer', 'mapping.outdoor', 'temp')}
     ${field('Weather (forecast)', 'mapping.weather', 'weather')}
     ${field('Phase with the outdoor unit: energy (kWh) or power (W)', 'mapping.phase', 'power')}
+    <label class="field">On that phase, metered on their own (taken off it): energy (kWh) or power (W)${entityMulti('mapping.phase_subtract', 'power', M.phase_subtract)}</label>
     <label class="field">Other phases: energy (kWh) or power (W)${entityMulti('mapping.phases_other', 'power', M.phases_other)}</label>
     ${field('Car charger: energy (kWh) or power (W), optional', 'mapping.car', 'power')}
     <label class="field">Prices from<select data-path="prices.source"><option value="tibber_prices" ${C.prices.source === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${C.prices.source === 'attributes' ? 'selected' : ''}>a sensor's attributes</option></select></label>

@@ -409,7 +409,22 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         _, params = s.planner.model()
         return _json({"params": params.to_dict(), "trained": s.planner.params is not None, "report": s.planner.report,
                       "training": s.trainer.running, "started": s.trainer.started, "progress": s.trainer.progress(),
-                      "error": s.trainer.error, "models": s.planner.models(), "kept": s.store.get("model_kept")})
+                      "error": s.trainer.error, "models": s.planner.models(), "kept": s.store.get("model_kept"),
+                      "explore": s.planner.exploring()})
+
+    @app.post("/api/model/explore", dependencies=[Depends(auth)])
+    async def explore(body: dict):
+        """Try every level for some days (default 3) so training sees them all; days 0 ends it."""
+        s = svc()
+        try:
+            days = float(body.get("days", 3))
+        except (TypeError, ValueError):
+            raise HTTPException(422, "days: a number")
+        if not 0 <= days <= 14:
+            raise HTTPException(422, "days: 0 to 14")
+        ex = s.planner.explore(days)
+        asyncio.create_task(s.planner.replan())
+        return {"explore": ex}
 
     @app.post("/api/model/use/{mid}", dependencies=[Depends(auth)])
     async def use_model(mid: str):

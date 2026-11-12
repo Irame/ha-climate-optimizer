@@ -26,7 +26,7 @@ import numpy as np
 from .layout import Layout
 from .solar import irradiance
 
-_SP_LABEL = re.compile(r"^\+(\d+(?:\.\d+)?) K$")
+_SP_LABEL = re.compile(r"^\+(\d+(?:\.\d+)?) K(?: .+)?$")  # "+2 K", or "+2 K low" with a fan mode per level
 
 MIN = 60_000
 
@@ -222,7 +222,8 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
                min_hours: float = 24, stuck_h: float | None = 3.0) -> Grid:
     """mapping: {"zones": {zid: {"thermometer": eid, "windows": [eid]}},
                  "units": {uid: {"source": eid, "proxy": eid, "fan_modes": [...], "power": eid}},
-                 "outdoor": eid, "weather": eid, "phase": eid, "phases_other": [...], "car": eid, "price": eid}"""
+                 "outdoor": eid, "weather": eid, "phase": eid, "phase_subtract": [...], "phases_other": [...], "car": eid,
+                 "price": eid}"""
     step = step_min * MIN
     zones = mapping.get("zones", {})
     notes = []
@@ -302,6 +303,10 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
 
 
     phase = kw(mapping.get("phase", ""))
+    # loads on that phase with a meter of their own: taken off, so less of what is not the units remains
+    metered = [e for e in mapping.get("phase_subtract") or [] if e and e != mapping.get("phase") and e in parsed.num]
+    if metered:
+        phase = np.clip(phase - np.sum([np.nan_to_num(kw(e)) for e in metered], axis=0), 0.0, None)
     others = [kw(e) for e in mapping.get("phases_other", []) if e and e != mapping.get("phase")]
     car = kw(mapping["car"]) if mapping.get("car") else None
     price = []
@@ -335,6 +340,42 @@ def mask_stuck(T: np.ndarray, step_min: int, keep_h: float = 1.0, min_h: float =
                     share[i] += (k - start - keep) / len(col)
                 start = k
     return T, share
+
+
+def offset_weights(o: float, offsets: list[float]) -> list[tuple[int, float]]:
+    """A setpoint offset as shares of the levels around it (weakest first): run at
+    +3 K with levels at +2 and +4 K counts half to each, so what is learned is heat
+    along the offsets, and holds when the offsets are set differently."""
+    if not offsets:
+        return [(0, 1.0)]
+    if o <= offsets[0]:
+        return [(0, 1.0)]
+    for i in range(len(offsets) - 1):
+        a, b = offsets[i], offsets[i + 1]
+        if o <= b:
+            w = (o - a) / (b - a) if b > a else 1.0
+            return [(i, 1.0 - w), (i + 1, w)] if 0 < w < 1 else [(i + 1 if w >= 1 else i, 1.0)]
+    return [(len(offsets) - 1, 1.0)]
+
+
+def regrid_heat(heat: list[float], old: list[float], new: list[float]) -> list[float]:
+    """Heat per level learned at one set of offsets, at another: along the offsets,
+    straight on past the ends (never below nothing)."""
+    if len(heat) != len(old) or len(old) < 1:
+        return list(heat)
+    if len(old) == 1:
+        return [float(heat[0])] * len(new)
+    x, y = np.asarray(old, float), np.asarray(heat, float)
+    out = []
+    for o in new:
+        if o < x[0]:
+            v = y[0] + (o - x[0]) * (y[1] - y[0]) / (x[1] - x[0])
+        elif o > x[-1]:
+            v = y[-1] + (o - x[-1]) * (y[-1] - y[-2]) / (x[-1] - x[-2])
+        else:
+            v = float(np.interp(o, x, y))
+        out.append(max(0.05, float(v)))
+    return out
 
 
 def _sp_offset(label) -> float | None:
@@ -385,8 +426,10 @@ def _ac_fractions(parsed: Parsed, cfg: dict, levels: int, t0, step, K, room) -> 
                 continue
         o = _sp_offset(prows[pidx[n]].get("sfan")) if pidx[n] >= 0 else None
         if o is not None and offsets:
-            lvl = int(np.argmin([abs(o - x) for x in offsets]))
-        elif fine[n] >= since:
+            for lvl, w in offset_weights(o, offsets):
+                out[k, 0 if st == "heat" else 1, min(max(lvl, 0), levels - 1)] += w / sub
+            continue
+        if fine[n] >= since:
             gap = sp - r["cur"] if st == "heat" else r["cur"] - sp
             lvl = max([j for j, x in enumerate(offsets) if x <= gap + 0.01] or [0]) if np.isfinite(gap) else 0
         else:

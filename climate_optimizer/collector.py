@@ -26,6 +26,7 @@ def tracked_entities(mapping: dict, extra: list[str] = ()) -> list[str]:
         out += [u.get("source"), u.get("proxy"), u.get("power")]
     out += [mapping.get(k) for k in ("outdoor", "weather", "phase", "car", "price")]
     out += mapping.get("phases_other") or []
+    out += mapping.get("phase_subtract") or []
     out += list(extra)
     seen, res = set(), []
     for e in out:

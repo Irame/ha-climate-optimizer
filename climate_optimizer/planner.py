@@ -18,7 +18,7 @@ from .comfort import OVERRIDE_FUNCTIONS, ComfortFunction, parse_event, resolve
 from .config import Config
 from .dispatch import FanDispatcher
 from .inputs import blend_outdoor, fetch_events, fetch_forecast, fetch_prices
-from .model.dataset import build_grid, parse_rows
+from .model.dataset import build_grid, parse_rows, regrid_heat
 from .model.layout import Layout, Params, default_params
 from .model.solar import irradiance
 from .model.thermal import DIST, build, estimate_hidden
@@ -38,12 +38,36 @@ def _num(v) -> float:
         return math.nan
 
 
-def matching_params(params: Params | None, layout: Layout) -> Params:
+def unit_offsets(mapping: dict) -> dict[str, list[float]]:
+    """The setpoint offsets of the units under setpoint power control now."""
+    return {uid: [float(x) for x in u["setpoint_offsets"]] for uid, u in (mapping.get("units") or {}).items()
+            if u.get("power_control") == "setpoint" and u.get("setpoint_offsets")}
+
+
+def regrid_units(params: Params, offsets: dict[str, list[float]]) -> Params:
+    """A unit's heat per level learned at other setpoint offsets than it has now:
+    taken along the offsets to the ones it has (and noted with them)."""
+    for uid, new in offsets.items():
+        u = params.units.get(uid)
+        if not u or "heat" not in u:
+            continue
+        old = u.get("offsets")
+        if old and list(old) != list(new) and len(old) == len(u["heat"]):
+            u["heat"] = regrid_heat(u["heat"], old, new)
+        if len(u["heat"]) == len(new):
+            u["offsets"] = list(new)
+    return params
+
+
+def matching_params(params: Params | None, layout: Layout, offsets: dict[str, list[float]] | None = None) -> Params:
     """The trained parameters if they describe this layout, else the defaults
-    with whatever trained values still fit."""
+    with whatever trained values still fit; heat per level along the setpoint
+    offsets where a unit has other ones now."""
     base = default_params(layout)
     if params is None:
         return base
+    if offsets:
+        params = regrid_units(Params.from_dict(json.loads(json.dumps(params.to_dict()))), offsets)
     for z in base.zones:
         if z in params.zones:
             base.zones[z].update(params.zones[z])
@@ -104,6 +128,39 @@ class Planner:
         p = store.get("params")
         self.params: Params | None = Params.from_dict(p) if p else None
         self.report: dict | None = store.get("report")
+
+    # ---- trying every level, so training sees them all ----
+    EXPLORE_BLOCK_H = 3.0
+
+    def exploring(self, now_ms: float | None = None) -> dict | None:
+        ex = self.store.get("explore")
+        now_ms = now_ms or time.time() * 1000
+        return ex if ex and ex.get("until", 0) > now_ms else None
+
+    def explore(self, days: float, now_ms: float | None = None) -> dict | None:
+        """For some days, each AC unit runs no higher than a level that takes turns
+        every few hours (another one the next day at the same hour): the plan, which
+        mostly reaches for the highest, then shows training what the lower ones do.
+        0 days ends it."""
+        now_ms = now_ms or time.time() * 1000
+        ex = {"since": int(now_ms), "until": int(now_ms + days * 864e5)} if days > 0 else None
+        self.store.put("explore", ex)
+        return ex
+
+    def explore_caps(self, j: int, levels: int, t: np.ndarray, tz) -> np.ndarray | None:
+        """Per plan step, the highest level unit j may use while trying every level (nan: any)."""
+        ex = self.exploring(float(t[0]))
+        if ex is None or levels < 2:
+            return None
+        caps = np.full(len(t) - 1, np.nan)
+        day0 = datetime.fromtimestamp(ex["since"] / 1000, tz).date()
+        for k, a in enumerate(t[:-1]):
+            if a >= ex["until"]:
+                break
+            d = datetime.fromtimestamp(a / 1000, tz)
+            block = int((d.hour + d.minute / 60) // self.EXPLORE_BLOCK_H)
+            caps[k] = (block + (d.date() - day0).days + j) % levels
+        return caps
 
     # ---- the models trained, to go back to one ----
     MODELS_KEPT = 10
@@ -168,7 +225,7 @@ class Planner:
 
     def model(self) -> tuple[Layout, Params]:
         layout = self.cfg.layout_obj()
-        return layout, matching_params(self.params, layout)
+        return layout, matching_params(self.params, layout, unit_offsets(self.mapping()))
 
     def mapping(self) -> dict:
         """The configured mapping, with each AC unit's fan modes filled in when
@@ -202,17 +259,23 @@ class Planner:
         its reading. A change means the levels mean something else from now on."""
         mode = body.get("power_control") or "fan"
         offsets = [float(x) for x in body.get("setpoint_offsets") or []] if mode == "setpoint" else []
+        fans = list(body.get("setpoint_fan_modes") or []) if mode == "setpoint" else []
         known = self.store.get("power_control") or {}
         old = known.get(eid)
         if old is None and mode == "fan":
             return  # as ever: nothing to note
-        if old is not None and old.get("mode") == mode and old.get("offsets", []) == offsets:
+        # fan modes not known before (a proxy before they were sent): taken as the same
+        same_fans = old is not None and (old.get("fans") is None or old.get("fans") == fans)
+        if old is not None and old.get("mode") == mode and old.get("offsets", []) == offsets and old.get("fans") == fans:
             return
         before = (old or {}).get("fan_modes_before")
         if mode == "setpoint" and not before:
             before = (self.store.get("fan_modes") or {}).get(eid) if (old or {}).get("mode", "fan") == "fan" else None
-        log.info("%s: power control %s %s from now on", eid, mode, offsets or "")
-        self.store.put("power_control", {**known, eid: {"mode": mode, "offsets": offsets, "since": int(now_ms),
+        # other offsets alone: what is learned holds along them; another control or other fan modes start anew
+        same = old is not None and old.get("mode") == mode and same_fans
+        since = old["since"] if same and old.get("since") else int(now_ms)
+        log.info("%s: power control %s %s %s from now on", eid, mode, offsets or "", fans or "")
+        self.store.put("power_control", {**known, eid: {"mode": mode, "offsets": offsets, "fans": fans, "since": since,
                                                          "fan_modes_before": before}})
 
     def unit_for_proxy(self, eid: str) -> str | None:
@@ -391,6 +454,9 @@ class Planner:
         Tm, Tw, how = self.hidden_state(layout, params, now_ms)
         if Tm is None:
             info["notes"].append(f"state estimate: {how}; assuming surfaces at room temperature")
+        if (ex := self.exploring(now_ms)) is not None:
+            info["notes"].append("Trying every level until " + datetime.fromtimestamp(ex["until"] / 1000, tz).strftime("%d.%m. %H:%M")
+                                 + f": the highest level allowed takes turns every {self.EXPLORE_BLOCK_H:g} h, so training sees them all")
         known = np.isfinite(Ta)
         if not known.any():
             raise ValueError("no room temperature available")
@@ -404,10 +470,14 @@ class Planner:
         win = np.zeros((N, sysm.nw))
         starts_min = (t[:-1] - now_ms) / MIN
         open_zone = set()
+        opened = self.windows_open()
         for j, z in enumerate(layout.window_zones):
-            if any((self.collector.states.get(w) or {}).get("state") == "on" for w in zmap.get(z, {}).get("windows", []) or []):
+            if z in opened and now_ms - opened[z] >= st.window_open_after_min * MIN - 1000:
                 win[starts_min < st.window_assume_open_min, j] = 1.0
                 open_zone.add(z)
+            elif z in opened:
+                name = next((x.name for x in layout.zones if x.id == z), z)
+                info["notes"].append(f"{name}: window just opened; it counts once open {st.window_open_after_min:g} min")
 
         # schedule
         step_starts = [datetime.fromtimestamp(x / 1000, tz) for x in t[:-1]]
@@ -508,6 +578,10 @@ class Planner:
             if u.id in uncontrolled and self.overrides.run_for(u.id, now_ms):
                 info["notes"].append(f"{u.name} is asked to run, but {note}")
             caps = np.array([np.nan if c is None else float(c) for c in res.max_level.get(u.id, [None] * N)])
+            if u.kind == "ac":
+                ex = self.explore_caps(layout.units.index(u), u.levels, t, tz)
+                if ex is not None:  # trying every level: the highest allowed takes turns
+                    caps = np.where(np.isfinite(ex), np.fmin(caps, np.maximum(ex, lo)), caps)
             units.append(mpc.UnitSpec(u.id, u.kind, u.zone, levels=(lo, hi), allowed=allowed, on=running,
                                       since_min=max(0.0, since), modes=modes, forced=forced, hold=hold and note is None,
                                       max_level=caps if u.kind == "ac" and np.isfinite(caps).any() else None))
@@ -766,12 +840,15 @@ class Planner:
                 log.warning("window sensor %s: %s", eid, e)
 
     def window_changed(self, eid: str) -> None:
-        """A window opened or closed: plan again soon (the units there, and when to close)."""
+        """A window opened or closed: plan again soon (the units there, and when to close).
+        Opened, once it has been open a moment: stepping onto the balcony changes nothing."""
         if self._window_task is not None and not self._window_task.done():
             return
+        opened = (self.collector.states.get(eid) or {}).get("state") == "on"
+        wait = max(15.0, self.cfg.settings_obj().window_open_after_min * 60 + 5) if opened else 15.0
 
         async def later():
-            await asyncio.sleep(15)  # several windows opened together: one plan for them
+            await asyncio.sleep(wait)  # several windows opened together: one plan for them
             await self.replan(fresh=True)
 
         self._window_task = asyncio.create_task(later())
