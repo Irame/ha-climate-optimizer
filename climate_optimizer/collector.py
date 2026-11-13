@@ -131,6 +131,8 @@ class Collector:
         self.entities = list(entities)
 
     async def on_connect(self, history_days: int) -> None:
+        # anything held from before a cut-off is stale: the gap comes from Home Assistant's history
+        self.means = {}
         states = await self.ha.states()
         for s in states:
             self.states[s["entity_id"]] = s

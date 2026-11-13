@@ -294,6 +294,8 @@ class Planner:
         except Exception as e:
             out["errors"].append(f"prices: {e}")
             out["prices"] = self.store.get("last_prices") or []
+            if out["prices"] and max(x[1] for x in out["prices"]) < now_ms:
+                out["errors"].append("prices: the last ones known have run out; the plan repeats the day before")
         else:
             self.store.put("last_prices", out["prices"])
             hist = {int(k): v for k, v in (self.store.get("price_history") or {}).items()}
@@ -563,6 +565,7 @@ class Planner:
                 off = int(req.body.get("fan_mode_offset") or 0)
                 lo, hi = max(0, off), max(max(0, off), min(hi, hi + off))
             running = attrs.get("hvac_action") in ("heating", "cooling")
+            run_mode = {"heating": "heat", "cooling": "cool"}.get(attrs.get("hvac_action")) or (req.body.get("run_mode") if req else None)
             since = 1e9
             last = (req.body.get("last_switch") if req else None) or (ps or {}).get("last_changed")
             if last:
@@ -574,6 +577,7 @@ class Planner:
             if told and now_ms - told[2] < 3 * MIN and not cfg.shadow:
                 # what it was last told: the proxy's state can lag the answer by its tick
                 running, since = told[0], (now_ms - told[1]) / MIN
+                run_mode = (told[3] if len(told) > 3 else None) or run_mode
             forced = None if u.id in uncontrolled else self.overrides.forced(u.id, t)
             if u.id in uncontrolled and self.overrides.run_for(u.id, now_ms):
                 info["notes"].append(f"{u.name} is asked to run, but {note}")
@@ -584,6 +588,7 @@ class Planner:
                     caps = np.where(np.isfinite(ex), np.fmin(caps, np.maximum(ex, lo)), caps)
             units.append(mpc.UnitSpec(u.id, u.kind, u.zone, levels=(lo, hi), allowed=allowed, on=running,
                                       since_min=max(0.0, since), modes=modes, forced=forced, hold=hold and note is None,
+                                      run_mode=run_mode if running else None,
                                       max_level=caps if u.kind == "ac" and np.isfinite(caps).any() else None))
             proxies[u.id] = {"proxy": m.get("proxy"), "state": mode_now, "note": note, "levels": [lo, hi], "anyway": anyway,
                              "running": running, "comfort": comfort.get(u.zone, [None])[0] if u.zone in comfort else None}
@@ -690,7 +695,12 @@ class Planner:
                 continue  # done, or the day's allowed times run past the plan: planned later
             idx = list(range(len(cand), len(cand) + len(xs)))
             cand += [(x, x + D) for x in xs]
-            groups.append((idx, min(due, len(xs))))
+            # no more than fit the day's allowed times the gap apart (else no plan with airing at all)
+            fit, prev = 1, xs[0]
+            for x in xs[1:]:
+                if x - prev >= gap:
+                    fit, prev = fit + 1, x
+            groups.append((idx, min(due, fit)))
         if not cand:
             info["none"] = "done today" if done >= a.per_day else "no allowed time in the plan"
             return None, info
@@ -842,13 +852,16 @@ class Planner:
     def window_changed(self, eid: str) -> None:
         """A window opened or closed: plan again soon (the units there, and when to close).
         Opened, once it has been open a moment: stepping onto the balcony changes nothing."""
-        if self._window_task is not None and not self._window_task.done():
-            return
         opened = (self.collector.states.get(eid) or {}).get("state") == "on"
         wait = max(15.0, self.cfg.settings_obj().window_open_after_min * 60 + 5) if opened else 15.0
+        # several windows within a while: one plan, once the last of them counts
+        self._window_due = max(getattr(self, "_window_due", 0.0), time.time() + wait)
+        if self._window_task is not None and not self._window_task.done():
+            return
 
         async def later():
-            await asyncio.sleep(wait)  # several windows opened together: one plan for them
+            while (left := self._window_due - time.time()) > 0:
+                await asyncio.sleep(left)
             await self.replan(fresh=True)
 
         self._window_task = asyncio.create_task(later())
@@ -939,6 +952,12 @@ class Planner:
         if k is not None and k < len(caps) and caps[k] is not None:
             hi = min(hi, int(caps[k]))
             lo = min(lo, hi)
+        plan = self.state.plan
+        if k is not None and plan is not None and getattr(unit, "kind", "ac") == "ac":  # trying every level: its turn
+            ids = [u.id for u in self.cfg.layout_obj().units]
+            ex = self.explore_caps(ids.index(uid), unit.levels, plan.t, self.tz()) if uid in ids else None
+            if ex is not None and k < len(ex) and np.isfinite(ex[k]):
+                hi = min(hi, max(int(ex[k]), lo))
         return lo, hi
 
     def _run_answer(self, uid: str, run, body: dict, now_ms: float, valid: str) -> dict:
@@ -974,8 +993,9 @@ class Planner:
             return
         on = answer["hvac_mode"] != "off"
         told = self._answered.get(uid)
-        since = told[1] if told and told[0] == on else now_ms
-        self._answered[uid] = [on, since, now_ms]
+        same = told and told[0] == on and (not on or (told[3] if len(told) > 3 else None) == answer["hvac_mode"])
+        since = told[1] if same else now_ms
+        self._answered[uid] = [on, since, now_ms, answer["hvac_mode"] if on else None]
 
     async def poke(self, unit_ids) -> None:
         """Have the units' proxies ask now rather than at their next tick
@@ -1025,8 +1045,8 @@ class Planner:
     def _arm(self) -> None:
         """Wake when an override ends by the clock, so its proxies hear at once."""
         nxt = self.overrides.next_change(time.time() * 1000)
-        if self._wake is not None and not self._wake.done():
-            self._wake.cancel()
+        if self._wake is not None and not self._wake.done() and self._wake is not asyncio.current_task():
+            self._wake.cancel()  # (not itself: it is the one replanning, and pokes after)
         if nxt is None:
             return
 
@@ -1102,14 +1122,15 @@ class Planner:
     def command(self, body: dict, now_ms: float | None = None) -> dict:
         now_ms = now_ms or time.time() * 1000
         eid = body.get("entity_id", "")
-        self.requests[eid] = ProxyRequest(now_ms, body)
-        self._note_power(eid, body, now_ms)
-        fm = body.get("source_fan_modes")
-        if fm:
-            known = self.store.get("fan_modes") or {}
-            if known.get(eid) != fm:
-                self.store.put("fan_modes", {**known, eid: list(fm)})
         uid = self.unit_for_proxy(eid)
+        if uid is not None:  # what a proxy says about itself is kept only for the optimizer's units
+            self.requests[eid] = ProxyRequest(now_ms, body)
+            self._note_power(eid, body, now_ms)
+            fm = body.get("source_fan_modes")
+            if fm:
+                known = self.store.get("fan_modes") or {}
+                if known.get(eid) != fm:
+                    self.store.put("fan_modes", {**known, eid: list(fm)})
         valid = datetime.fromtimestamp((now_ms + 3 * MIN) / 1000, timezone.utc).isoformat()
         if uid is None:
             return {"follow": False, "reason": "not a unit of the optimizer"}

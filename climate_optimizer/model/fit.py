@@ -312,6 +312,10 @@ def simulate_windows(layout: Layout, params: Params, grid: Grid, k0s: np.ndarray
         hidden = estimate_hidden(sysm, grid.T, grid.tout, grid.sol, grid.dt_h)
     Tm, Tw = hidden
     Tf = np.column_stack([_ffill(grid.T[:, i]) for i in range(nz)]) if nz else grid.T  # a masked start: the last reading
+    if nz and not np.isfinite(Tf).all():  # none yet, or a room without a thermometer: the other rooms' mean
+        with np.errstate(all="ignore"):
+            rm = np.nanmean(Tf, axis=1)
+        Tf = np.where(np.isfinite(Tf), Tf, np.where(np.isfinite(rm), rm, 20.0)[:, None])
     X = np.concatenate([Tf[k0s], Tm[k0s], Tw[k0s]], axis=1)  # (nw, n)
     nw = len(k0s)
     Ta = np.empty((nw, L + 1, nz))
@@ -402,7 +406,7 @@ def train(layout: Layout, grid: Grid, initial: Params | None = None, progress=No
         okb = ok[:, : nb * e].reshape(len(k0s), nb, e).all(axis=2)
         ps = Pel[:, : nb * e].reshape(len(k0s), nb, e).mean(axis=2)
         po = np.nan_to_num(obs[idx][:, : nb * e]).reshape(len(k0s), nb, e).mean(axis=2)
-        rp = np.where(okb, (ps - po) / FIT["sigma_p"], 0.0).ravel()
+        rp = np.nan_to_num(np.where(okb, (ps - po) / FIT["sigma_p"], 0.0)).ravel()
         rpr = (theta - theta0) / sig
         c = FIT["huber"]
         return np.concatenate([robust(np.nan_to_num(rt), c), robust(rp, c), rpr])

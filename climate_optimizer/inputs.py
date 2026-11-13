@@ -96,11 +96,16 @@ def parse_prices(obj, unit_hint: str = "") -> list[tuple[int, int, float]]:
 
 
 def fixed_price_at(cfg, d: datetime) -> float:
-    """A fixed tariff's price at a local time: its periods over its one price, the last that holds."""
+    """The fixed tariff's price at a local time: its periods over its one price, the last that holds."""
+    return tariff_price_at(cfg.fixed_price, cfg.fixed_periods, d)
+
+
+def tariff_price_at(base: float, periods, d: datetime) -> float:
+    """A tariff's price at a local time: the last of its periods that holds, else its price."""
     days = ("mo", "tu", "we", "th", "fr", "sa", "su")
     m = d.hour * 60 + d.minute
-    price = float(cfg.fixed_price)
-    for p in cfg.fixed_periods:
+    price = float(base)
+    for p in periods:
         a = int(p.start[:2]) * 60 + int(p.start[3:])
         b = int(p.end[:2]) * 60 + int(p.end[3:])
         today, yesterday = days[d.weekday()], days[(d.weekday() - 1) % 7]
@@ -108,8 +113,8 @@ def fixed_price_at(cfg, d: datetime) -> float:
             hit = a <= m < b and (not p.days or today in p.days)
         elif a > b:  # past midnight: the night belongs to the day it starts
             hit = (m >= a and (not p.days or today in p.days)) or (m < b and (not p.days or yesterday in p.days))
-        else:
-            hit = False
+        else:  # from a time to the same time: the whole day
+            hit = not p.days or today in p.days
         if hit:
             price = float(p.price)
     return price

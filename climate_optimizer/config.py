@@ -62,6 +62,16 @@ class PriceConfig(BaseModel):
     sensor: str = ""  # for source attributes; also the price history shown in the UI
     fixed_price: float = Field(0.30, ge=-1, le=5)  # €/kWh, whenever no period below holds
     fixed_periods: list[PricePeriod] = []  # later ones win where they overlap
+    monthly_fee: float = Field(0.0, ge=0, le=1000)  # €, for comparing tariffs
+
+
+class Tariff(BaseModel):
+    """A tariff to compare with the one paid now: a price, times with their own, a monthly fee."""
+    model_config = ConfigDict(extra="ignore")
+    name: str = "Fixed price"
+    price: float = Field(0.30, ge=-1, le=5)  # €/kWh
+    periods: list[PricePeriod] = []
+    monthly_fee: float = Field(0.0, ge=0, le=1000)  # €
 
 
 class AiringConfig(BaseModel):
@@ -101,6 +111,7 @@ class Config(BaseModel):
     api_token: str = ""  # required from the proxies and the UI when set
     retrain_hour: int = 3
     history_days: int = 30
+    tariffs: list[Tariff] = Field(default_factory=list)  # to compare with what is paid now
 
     @field_validator("layout")
     @classmethod
@@ -190,6 +201,13 @@ class ConfigStore:
             patch = json.loads(json.dumps(patch))
             if patch.get("ha", {}).get("token") == "********":
                 patch["ha"].pop("token")
+            new_url = str(patch.get("ha", {}).get("url") or "").rstrip("/")
+            if new_url and new_url != str(cur["ha"].get("url") or "").rstrip("/") and not os.environ.get("HA_URL"):
+                # the stored token goes to no other address than the one it was given for
+                if os.environ.get("HA_TOKEN"):
+                    raise ValueError("ha.url: the token comes from the container (HA_TOKEN); set HA_URL there too")
+                if not patch["ha"].get("token"):
+                    patch["ha"]["token"] = ""
             if patch.get("api_token") == "********":
                 patch.pop("api_token")
             for k, v in patch.items():

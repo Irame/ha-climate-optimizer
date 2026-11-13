@@ -207,9 +207,20 @@ def estimate_hidden(sys: System, T: np.ndarray, tout: np.ndarray, sol: np.ndarra
     Tm = np.empty((K, nz))
     Tw = np.empty((K, nz))
     Tnb = params.building.get("Tnb", 20.0)
+    tout = np.asarray(tout, float)
+    if not np.isfinite(tout).all():  # one gap would run on through the filter: filled straight across
+        ok = np.isfinite(tout)
+        idx = np.arange(K)
+        tout = np.interp(idx, idx[ok], tout[ok]) if ok.any() else np.full(K, 10.0)
+    sol = np.nan_to_num(np.asarray(sol, float))
+    filled = np.column_stack([_ffill(T[:, i]) for i in range(nz)]) if nz else np.zeros((K, 0))
+    with np.errstate(all="ignore"):
+        rowmean = np.nanmean(np.where(np.isfinite(filled), filled, np.nan), axis=1) if nz else np.zeros(K)
+    rowmean = np.where(np.isfinite(rowmean), rowmean, 20.0)
     for i, z in enumerate(zids):
         p = params.zones[z]
-        ta = _ffill(T[:, i])
+        ta = filled[:, i]
+        ta = np.where(np.isfinite(ta), ta, rowmean)  # no reading yet (or a room without a thermometer): the others' mean
         first = min(K, int(round(24 / dt_h)))
         T0 = float(np.nanmean(ta[:first])) if np.isfinite(ta[:first]).any() else 20.0
         Ac = np.array([[-(p["Ham"] + p["Hmw"]) / p["Cm"], p["Hmw"] / p["Cm"]],

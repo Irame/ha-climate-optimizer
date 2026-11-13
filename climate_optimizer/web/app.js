@@ -96,6 +96,8 @@ function zoneColor(zid) {
 function zoneName(zid) { return (S.config?.layout?.zones || []).find(z => z.id === zid)?.name || zid; }
 function unitOf(uid) { return (S.config?.layout?.units || []).find(u => u.id === uid); }
 function fnName(id) { return String(id).startsWith('override') ? 'Override' : (S.config?.functions || []).find(f => f.id === id)?.name || id; }
+// today's date where the apartment is (UTC's would be yesterday after midnight, and flip "every 2 weeks")
+function localDate() { return new Date().toLocaleDateString('en-CA', { timeZone: S.tz }); }
 function ago(ms) {
   if (!ms) return 'never';
   const s = (Date.now() - ms) / 1000;
@@ -184,7 +186,7 @@ pages.dashboard = async (redraw) => {
     let state = '<span class="badge">off</span>';
     if (share >= 0.5) state = `<span class="badge ${heat < 0 ? 'cool' : 'on'}">${heat < 0 ? 'cooling' : 'heating'} ${num(Math.abs(heat), 1)} kW${us.decision?.level !== undefined ? ' · level ' + us.decision.level : ''}</span>`;
     let next = '';
-    if (P) {
+    if (P && P.share[u.id]) {
       const on = P.share[u.id];
       const now0 = on[0] >= 0.5;
       const j = on.findIndex((v, i) => i > 0 && (v >= 0.5) !== now0 && (now0 || v > 0.05));
@@ -415,7 +417,7 @@ function drawTimeline(box, P, info, hist) {
         if (v > 0.01 && t < now) spans.push({ t0: t, t1: Math.min(now, t + step), v, label: hu ? `ran ${Math.round(v * 100)} %${hu.level[i] !== null ? ', level ' + num(hu.level[i], 1) : ''}` : `${num(hh[i], 2)} kW` });
       });
     }
-    P.share[u.id].forEach((v, k) => spans.push({ t0: P.t[k], t1: P.t[k + 1], v, label: v > 0.01 ? `${num(Math.abs(P.heat[u.id][k]), 2)} kW${v < 0.99 ? ', ' + Math.round(v * 100) + ' % of the step' : ''}` : 'off' }));
+    (P.share[u.id] || []).forEach((v, k) => spans.push({ t0: P.t[k], t1: P.t[k + 1], v, label: v > 0.01 ? `${num(Math.abs(P.heat[u.id][k]), 2)} kW${v < 0.99 ? ', ' + Math.round(v * 100) + ' % of the step' : ''}` : 'off' }));
     return { name: u.name, short: u.name.split(' ')[0], color: zoneColor(u.zone), spans };
   });
   if (S.config.airing?.enabled || S.config.airing?.venting || hist?.open) {
@@ -527,10 +529,14 @@ pages.history = async (redraw) => {
     ${h.error ? `<div class="msg err">${esc(h.error)}</div>` : ''}
     <div class="card"><div id="hist-chart"></div></div>
     <div class="card"><h3>Energy and cost</h3><div id="hist-sum"></div></div>
-    <div class="card"><h3>Electricity per day: expected and measured</h3><div id="energy-days"><p class="hint">Loading…</p></div></div>`;
+    <div class="card"><h3>Electricity per day: expected and measured</h3><div id="energy-days"><p class="hint">Loading…</p></div></div>
+    <div class="card"><div class="toolbar"><h3 style="margin:0">Tariffs compared</h3><span class="spacer"></span><div class="chips" id="tariff-days">${[14, 30, 60].map(x => `<button class="chip ${(S.tariffDays || 30) === x ? 'active' : ''}" data-d="${x}">${x} days</button>`).join('')}</div></div><div id="tariffs"><p class="hint">Loading…</p></div></div>`;
   root.querySelectorAll('#hist-range button').forEach(b => b.onclick = () => { S.histHours = +b.dataset.h; S.histLong = null; pages.history(); });
   zoneChips($('#hist-zones'), () => pages.history(true));
-  if (!h.t) return;
+  api('energy/days?days=14').then(drawEnergyDays).catch(e => { const b = $('#energy-days'); if (b) b.innerHTML = `<p class="hint">${esc(e.message)}</p>`; });
+  root.querySelectorAll('#tariff-days button').forEach(b => b.onclick = () => { S.tariffDays = +b.dataset.d; root.querySelectorAll('#tariff-days button').forEach(x => x.classList.toggle('active', x === b)); drawTariffs(); });
+  drawTariffs();
+  if (!h.t) { $('#hist-sum').innerHTML = '<p class="hint">Nothing recorded for this time yet.</p>'; return; }
   const g = new ChartGroup($('#hist-chart'), { x0: h.start, x1: h.end, now: h.end, tz: S.tz });
   const zones = S.config.layout.zones.filter(z => S.zoneSel === 'all' || z.id === S.zoneSel);
   const tp = g.add({ title: 'Room temperature (°C): measured, and what the plans predicted an hour earlier', unit: '°C', height: 220 });
@@ -560,7 +566,6 @@ pages.history = async (redraw) => {
   const priceAt = t => { const p = pr.find(p => p[0] <= t && t < p[1]); return p ? p[2] : null; };
   if (h.phase) h.t.forEach((t, i) => { const v = h.phase[i]; if (v !== null) { kwh += v / 12; const p = priceAt(t); if (p !== null) eur += v / 12 * p; } });
   const heaterKwh = Object.values(h.heater || {}).reduce((a, arr) => a + arr.reduce((b, v) => b + (v || 0) / 12, 0), 0);
-  api('energy/days?days=14').then(drawEnergyDays).catch(e => { const b = $('#energy-days'); if (b) b.innerHTML = `<p class="hint">${esc(e.message)}</p>`; });
   $('#hist-sum').innerHTML = `<div class="stats">
     <div class="stat"><div class="k">Outdoor unit phase</div><div class="v">${num(kwh, 1)} kWh</div><div class="s">${num(eur, 2)} € at the recorded prices · includes other loads on that phase</div></div>
     <div class="stat"><div class="k">Heaters</div><div class="v">${num(heaterKwh, 1)} kWh</div><div class="s">from their plugs</div></div>
@@ -569,6 +574,60 @@ pages.history = async (redraw) => {
 
 // Per day: what the day's first plan expected the units to draw, against what they drew, over
 // the same hours; the bars side by side, the numbers beside them (a table, readable without color).
+// ---- tariffs compared: the household's use of the last days at other prices ----------------
+async function drawTariffs() {
+  const box = $('#tariffs');
+  if (!box) return;
+  const days = S.tariffDays || 30;
+  const draft = S.tariffDraft = S.tariffDraft || JSON.parse(JSON.stringify(S.config.tariffs || []));
+  let res = null, err = null;
+  try { res = await api('tariffs/compare?days=' + days); } catch (e) { err = e.message; }
+  if (!$('#tariffs')) return;
+  let html = '';
+  if (err) html += `<p class="hint">${esc(err)}</p>`;
+  if (res) {
+    html += `<p class="hint" style="margin-top:0">${num(res.kwh, 0)} kWh in ${num(res.days, 1)} days with every one of the ${res.phases} phases and the price recorded (${num(res.kwh_per_day, 1)} kWh a day, ${Math.round((res.night_share || 0) * 100)} % between 22:00 and 06:00; ${num(res.outdoor_phase_kwh, 0)} kWh on the outdoor unit's phase).</p>
+      <div class="table-wrap"><table><tr><th>Tariff</th><th class="num">A month</th><th class="num">Against now</th><th class="num">Per kWh, fees in</th><th class="num">These ${num(res.days, 0)} days</th></tr>
+      ${res.tariffs.map(t => `<tr${t.current ? ' style="font-weight:600"' : ''}><td>${esc(t.name)}</td><td class="num">${num(t.month_eur, 2)} €</td>
+        <td class="num">${t.current ? '' : `<span style="color:${t.diff_month_eur < 0 ? 'var(--ok, #2a8)' : 'var(--err, #c44)'}">${t.diff_month_eur > 0 ? '+' : ''}${num(t.diff_month_eur, 2)} €</span>`}</td>
+        <td class="num">${num(t.ct_per_kwh, 1)} ct</td><td class="num">${num(t.energy_eur, 2)} € + ${num(t.fee_eur, 2)} €</td></tr>`).join('')}</table></div>`;
+  }
+  html += `<h4 style="margin:14px 0 6px">Tariffs to compare</h4>
+    <div class="fields"><label class="field">Monthly fee now (€)<input type="number" step="0.01" id="fee-now" value="${S.config.prices.monthly_fee ?? 0}"></label></div>
+    ${draft.map((t, i) => `<div class="card" data-ti="${i}" style="margin:8px 0">
+      <div class="fields"><label class="field">Name<input data-tk="name" value="${esc(t.name || '')}"></label>
+        <label class="field">Price (€/kWh)<input type="number" step="0.001" data-tk="price" value="${t.price ?? 0.3}"></label>
+        <label class="field">Monthly fee (€)<input type="number" step="0.01" data-tk="monthly_fee" value="${t.monthly_fee ?? 0}"></label></div>
+      ${(t.periods || []).length ? '' : '<p class="hint" style="margin:0 0 6px">One price at all hours.</p>'}
+      <div class="table-wrap"${(t.periods || []).length ? '' : ' hidden'}><table data-periods><tr><th>From</th><th>To</th><th>€/kWh</th><th>Days (none: every day)</th><th></th></tr>${(t.periods || []).map(tariffRow).join('')}</table></div>
+      <button type="button" data-add-time="${i}">Add a time with its own price</button> <button type="button" data-drop="${i}">Remove this tariff</button></div>`).join('')}
+    <div class="toolbar"><button type="button" id="tariff-new">Add a tariff</button><span class="spacer"></span><span class="hint" id="tariff-msg"></span><button class="primary" id="tariff-save">Save and compare</button></div>
+    <p class="hint">What was used, as it was used, at each tariff's prices: with a day and night rate the plan would heat more in the night, with one price all day it would shift less, and a car could charge when it is cheapest. The monthly fees count for the days covered. "Now" is priced with the prices recorded for each quarter hour (Tibber's include taxes and grid fees; its monthly fee and the meter's go in "Monthly fee now").</p>`;
+  box.innerHTML = html;
+  const collect = () => {
+    box.querySelectorAll('[data-ti]').forEach(b => {
+      const t = draft[+b.dataset.ti];
+      t.name = b.querySelector('[data-tk="name"]').value.trim() || 'Tariff';
+      t.price = +b.querySelector('[data-tk="price"]').value;
+      t.monthly_fee = +b.querySelector('[data-tk="monthly_fee"]').value || 0;
+      t.periods = readTariffRows(b.querySelector('[data-periods]'));
+    });
+  };
+  box.querySelectorAll('[data-tariff-del]').forEach(b => b.onclick = () => { b.closest('tr').remove(); });
+  box.querySelectorAll('[data-add-time]').forEach(b => b.onclick = () => { collect(); draft[+b.dataset.addTime].periods.push({ start: '22:00', end: '06:00', price: 0.25, days: [] }); drawTariffs(); });
+  box.querySelectorAll('[data-drop]').forEach(b => b.onclick = () => { collect(); draft.splice(+b.dataset.drop, 1); drawTariffs(); });
+  $('#tariff-new').onclick = () => { collect(); draft.push({ name: draft.length ? 'Day and night' : 'Fixed price', price: 0.30, monthly_fee: 0, periods: [] }); drawTariffs(); };
+  $('#tariff-save').onclick = async () => {
+    collect();
+    if ([...box.querySelectorAll('[data-tk="price"], [data-k="price"]')].some(i => i.value === '')) { $('#tariff-msg').textContent = 'Every tariff and time needs a price'; return; }
+    try {
+      S.config = await api('config', { method: 'PUT', body: JSON.stringify({ tariffs: draft, prices: { ...S.config.prices, monthly_fee: +$('#fee-now').value || 0 } }) });
+      S.tariffDraft = null;
+      drawTariffs();
+    } catch (e) { $('#tariff-msg').textContent = 'Not saved: ' + e.message; }
+  };
+}
+
 function drawEnergyDays(days) {
   const box = $('#energy-days');
   if (!box) return;
@@ -710,7 +769,7 @@ pages.comfort = async (redraw) => {
   root.querySelectorAll('[data-default]').forEach(s => s.onchange = () => { if (s.value) D.defaults[s.dataset.default] = s.value; else delete D.defaults[s.dataset.default]; });
   root.querySelectorAll('[data-comfort]').forEach(s => s.oninput = () => { if (s.value === '') delete D.comfort[s.dataset.comfort]; else D.comfort[s.dataset.comfort] = +s.value; });
   $('#cal').onchange = e => { D.calendar = e.target.value; };
-  const nightRule = () => ({ id: 'night-no-airing', name: 'No airing at night', action: 'no_airing', zones: [], units: [], function: null, offset: 0, rrule: 'FREQ=DAILY', dtstart: new Date().toISOString().slice(0, 10), start: '22:00', end: '07:00', priority: 10, enabled: true });
+  const nightRule = () => ({ id: 'night-no-airing', name: 'No airing at night', action: 'no_airing', zones: [], units: [], function: null, offset: 0, rrule: 'FREQ=DAILY', dtstart: localDate(), start: '22:00', end: '07:00', priority: 10, enabled: true });
   $('#vent-on').onchange = e => { A.venting = e.target.checked; };
   $('#air-on').onchange = e => {
     A.enabled = e.target.checked;
@@ -725,7 +784,7 @@ pages.comfort = async (redraw) => {
   D.rules.forEach((r, i) => rl.appendChild(ruleEditor(r, i, D, fnOpts)));
   if (!D.rules.length) rl.innerHTML = '<p class="hint">No rules: every room uses its default all the time.</p>';
   $('#rule-add').onclick = () => {
-    D.rules.push({ id: 'rule' + Date.now().toString(36), name: 'New rule', action: 'comfort', zones: [], units: [], function: D.functions[0].id, offset: 0, rrule: 'FREQ=DAILY', dtstart: new Date().toISOString().slice(0, 10), start: '22:00', end: '06:00', priority: 10, enabled: true });
+    D.rules.push({ id: 'rule' + Date.now().toString(36), name: 'New rule', action: 'comfort', zones: [], units: [], function: D.functions[0].id, offset: 0, rrule: 'FREQ=DAILY', dtstart: localDate(), start: '22:00', end: '06:00', priority: 10, enabled: true });
     pages.comfort(true);
   };
   $('#cf-reset').onclick = () => { S.draft = null; pages.comfort(); };
@@ -938,12 +997,6 @@ pages.model = async () => {
     for (const w of rep.warnings || []) html += `<div class="msg">${esc(w)}</div>`;
     if (rep.power_note) html += `<div class="msg">${esc(rep.power_note)}</div>`;
     if (m.kept) html += `<div class="msg">Planning with an earlier model, chosen ${ago(m.kept)}. Nightly training waits until you retrain by hand.</div>`;
-    const ex = m.explore;
-    html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Every level</h3><span class="spacer"></span>
-      ${ex ? `<button id="explore-stop">Stop</button>` : `<label class="field" style="margin:0">Days <input type="number" id="explore-days" min="1" max="14" value="3" style="width:60px"></label><button id="explore">Try every level</button>`}</div>
-      <p class="hint" style="margin-bottom:0">${ex
-        ? `Trying every level until ${fmtDay(ex.until, S.tz)} ${fmtTime(ex.until, S.tz)}: for each AC unit the highest level allowed takes turns every 3 hours, another one the next day at the same hour.`
-        : `The plan mostly reaches for the highest level, so training rarely sees what the lower ones do (and after a change of the proxies' power control, not at all). For a few days, each AC unit then runs no higher than a level that takes turns every 3 hours. It may cost a little comfort; the nightly training after it learns from those days.`}</p></div>`;
     html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th></tr>`;
     L.zones.forEach((z, i) => {
       const zs = rep.zones?.[z.id] || {};
@@ -980,6 +1033,12 @@ pages.model = async () => {
         <div class="toolbar"><div class="chips" id="val-zones"></div></div><div id="val-chart"></div></div>`;
     }
   }
+  const ex = m.explore;
+  html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Every level</h3><span class="spacer"></span>
+    ${ex ? `<button id="explore-stop">Stop</button>` : `<label class="field" style="margin:0">Days <input type="number" id="explore-days" min="1" max="14" value="3" style="width:60px"></label><button id="explore">Try every level</button>`}</div>
+    <p class="hint" style="margin-bottom:0">${ex
+      ? `Trying every level until ${fmtDay(ex.until, S.tz)} ${fmtTime(ex.until, S.tz)}: for each AC unit the highest level allowed takes turns every 3 hours, another one the next day at the same hour.`
+      : `The plan mostly reaches for the highest level, so training rarely sees what the lower ones do (and after a change of the proxies' power control, not at all). For a few days, each AC unit then runs no higher than a level that takes turns every 3 hours. It may cost a little comfort; the nightly training after it learns from those days.`}</p></div>`;
   if ((m.models || []).length > 1) {
     html += `<div class="card"><h3>Earlier models</h3><div class="table-wrap"><table><tr><th>Trained</th><th class="num">Days</th><th class="num">Error on check days</th><th>Heat per level (kW)</th><th></th></tr>`;
     for (const e of m.models) {
@@ -1000,8 +1059,8 @@ pages.model = async () => {
     catch (e) { S.trainDone = null; alert(e.message); }
     pages.model();
   });
-  $('#train').onclick = () => api('model/train', { method: 'POST' }).then(() => pages.model());
-  $('#train-fresh').onclick = () => api('model/train?fresh=true', { method: 'POST' }).then(() => pages.model());
+  $('#train').onclick = () => api('model/train', { method: 'POST' }).then(() => pages.model()).catch(e => alert(e.message));
+  $('#train-fresh').onclick = () => api('model/train?fresh=true', { method: 'POST' }).then(() => pages.model()).catch(e => alert(e.message));
   $('#diag').onclick = async () => {
     const b = $('#diag'), box = $('#diag-msg');
     b.disabled = true;
@@ -1109,7 +1168,8 @@ pages.settings = async () => {
       return `<tr><td>${esc(u.name)}</td><td><label class="check"><input type="checkbox" data-shadow-unit="${u.id}" ${(C.shadow_units || []).includes(u.id) ? 'checked' : ''}> even when its proxy is off</label></td>
         <td>${first ? `<input type="number" step="0.5" style="width:90px" data-shadow-comfort="${u.zone}" value="${C.shadow_comfort?.[u.zone] ?? ''}" placeholder="proxy’s"> °C <span class="hint">${esc(zname)}</span>` : ''}</td></tr>`;
     }).join('')}</table></div>
-    <div class="fields" style="margin-top:12px"><label class="field">API token for proxies and this page<input type="password" data-path="api_token" value="${esc(C.api_token)}" placeholder="none"></label></div></div>`;
+    <div class="fields" style="margin-top:12px"><label class="field">API token for proxies and this page<input type="password" data-path="api_token" value="${esc(C.api_token)}" placeholder="none"></label></div>
+    ${C.api_token ? '' : '<p class="hint">Without a token, anyone on your network can change these settings. Set one, and give it to the proxies as <code>optimizer_token</code>. Changing the Home Assistant address asks for its token again.</p>'}</div>`;
   html += `<div class="card"><h3>Home Assistant</h3><div class="fields wide">
     <label class="field">URL<input data-path="ha.url" value="${esc(C.ha.url)}" placeholder="http://homeassistant.local:8123" ${C.env?.ha_url ? 'disabled' : ''}>${C.env?.ha_url ? '<span class="hint">set by the container’s HA_URL</span>' : ''}</label>
     <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}" ${C.env?.ha_token ? 'disabled' : ''}>${C.env?.ha_token ? '<span class="hint">set by the container’s HA_TOKEN</span>' : ''}</label></div>
@@ -1152,7 +1212,7 @@ pages.settings = async () => {
     <div class="table-wrap"><table id="tariff"><tr><th>From</th><th>To</th><th>€/kWh</th><th>Days (none: every day)</th><th></th></tr>
       ${(C.prices.fixed_periods || []).map(tariffRow).join('')}</table></div>
     <button id="tariff-add" type="button">Add a time with its own price</button>
-    <p class="hint">With "a fixed tariff", the price above holds whenever none of the times below does: for a day and night rate, the day price above and 22:00 to 06:00 at the night price; for a cheaper weekend, add one from 00:00 to 24:00 on Sa and Su. A time ending before it starts runs past midnight, on the nights it starts. Where times overlap, the lower one in the list wins. With one price at all hours, the plan still saves energy and heats when the heat pump works best, but has no cheap hours to heat ahead into.</p>
+    <p class="hint">With "a fixed tariff", the price above holds whenever none of the times below does: for a day and night rate, the day price above and 22:00 to 06:00 at the night price; for a cheaper weekend, add one from 00:00 to 00:00 (the whole day) on Sa and Su. A time ending before it starts runs past midnight, on the nights it starts. Where times overlap, the lower one in the list wins. With one price at all hours, the plan still saves energy and heats when the heat pump works best, but has no cheap hours to heat ahead into.</p>
     <p class="hint">For the phases, the car and the heater an energy meter (kWh) is the better choice where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, where a power sensor's reports miss what happens between them. Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
   html += `<div class="card"><h3>Optimizer</h3><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
     <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
@@ -1198,7 +1258,8 @@ pages.settings = async () => {
     const msg = $('#st-msg');
     root.querySelectorAll('[data-path]').forEach(inp => {
       if (inp.dataset.multi !== undefined) { set(C, inp.dataset.path, JSON.parse(inp.dataset.multi)); return; }
-      let v = inp.type === 'checkbox' ? inp.checked : inp.type === 'number' ? (inp.value === '' ? null : +inp.value) : inp.value.trim();
+      if (inp.type === 'number' && inp.value === '') return;  // left empty: keeps its value (or the default)
+      let v = inp.type === 'checkbox' ? inp.checked : inp.type === 'number' ? +inp.value : inp.value.trim();
       if (inp.dataset.list) v = String(v).split(',').map(s => s.trim()).filter(Boolean);
       set(C, inp.dataset.path, v);
     });
@@ -1211,11 +1272,8 @@ pages.settings = async () => {
       const al = root.querySelector(`[data-alias="${z.id}"]`);
       if (al) z.aliases = al.value.split(',').map(x => x.trim()).filter(Boolean);
     }
-    C.prices.fixed_periods = [...root.querySelectorAll('[data-tariff]')].map(r => {
-      const end = r.querySelector('[data-k="end"]').value;
-      return { start: r.querySelector('[data-k="start"]').value, end: end === '23:59' ? '24:00' : end,
-               price: +r.querySelector('[data-k="price"]').value, days: [...r.querySelectorAll('[data-day]')].filter(b => b.checked).map(b => b.dataset.day) };
-    });
+    if ([...root.querySelectorAll('[data-tariff] [data-k="price"]')].some(i => i.value === '')) { msg.textContent = 'Not saved: a tariff time without a price'; return; }
+    C.prices.fixed_periods = readTariffRows(root.querySelector('#tariff'));
     C.shadow_units = [...root.querySelectorAll('[data-shadow-unit]')].filter(b => b.checked).map(b => b.dataset.shadowUnit);
     C.shadow_comfort = Object.fromEntries([...root.querySelectorAll('[data-shadow-comfort]')].filter(i => i.value !== '').map(i => [i.dataset.shadowComfort, +i.value]));
     const lat = $('#lat').value, lon = $('#lon').value;
@@ -1235,6 +1293,14 @@ function tariffRow(p = {}) {
     <td><input type="number" step="0.001" data-k="price" value="${p.price ?? 0.25}" style="width:80px"></td>
     <td>${WEEKDAYS.map(d => `<label class="check" style="margin-right:6px"><input type="checkbox" data-day="${d}" ${days.includes(d) ? 'checked' : ''}>${d[0].toUpperCase() + d[1]}</label>`).join('')}</td>
     <td><button type="button" data-tariff-del>✕</button></td></tr>`;
+}
+
+function readTariffRows(container) {
+  return [...container.querySelectorAll('[data-tariff]')].map(r => {
+    const end = r.querySelector('[data-k="end"]').value;
+    return { start: r.querySelector('[data-k="start"]').value, end: end === '23:59' ? '24:00' : end,
+             price: +r.querySelector('[data-k="price"]').value, days: [...r.querySelectorAll('[data-day]')].filter(b => b.checked).map(b => b.dataset.day) };
+  });
 }
 
 function get(o, path) { return path.split('.').reduce((a, k) => a?.[k], o); }

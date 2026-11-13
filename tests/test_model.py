@@ -281,3 +281,43 @@ def test_metered_loads_come_off_the_phase():
     off = build_grid(parse_rows(ex), layout, {**m, "phase_subtract": ["sensor.fridge_power"]}).phase
     ok = np.isfinite(base) & np.isfinite(off)
     assert np.abs(with_it[ok] - base[ok]).max() > 0.1 and np.abs(off[ok] - base[ok]).max() < 1e-6
+
+
+def test_an_outdoor_gap_and_a_room_without_thermometer_do_not_stop_the_model():
+    from climate_optimizer.model.fit import simulate_windows
+    from climate_optimizer.model.thermal import build, estimate_hidden
+
+    layout = default_layout()
+    r = synthetic.run(days=3, seed=4, realism=False)
+    ex = json.loads(json.dumps(synthetic.to_export(r)))
+    m = synthetic.mapping_for(layout)
+    rows = ex["stats_5min"][m["outdoor"]]
+    a, b = rows[0][0] + 30 * 3600e3, rows[0][0] + 42 * 3600e3  # twelve hours without the outdoor sensor
+    ex["stats_5min"][m["outdoor"]] = [x for x in rows if not a <= x[0] < b]
+    m = {**m, "weather": ""}
+    hall = m["zones"]["hall"]["thermometer"]
+    m["zones"] = {**m["zones"], "hall": {**m["zones"]["hall"], "thermometer": ""}}  # and no thermometer in the hall
+    g = build_grid(parse_rows(ex), layout, m)
+    assert np.isfinite(g.tout).all()
+    gap = (g.t >= a + 4 * 3600e3) & (g.t < b - 1)
+    assert not g.valid[gap].any() and g.valid[~gap].mean() > 0.9  # not checked in the gap, the rest is
+    p = default_params(layout)
+    Tm, Tw = estimate_hidden(build(layout, p), g.T, g.tout, g.sol, g.dt_h)
+    assert np.isfinite(Tm).all() and np.isfinite(Tw).all()
+    Ta, Pel = simulate_windows(layout, p, g, np.array([0, len(g.t) // 2]), 288)
+    assert np.isfinite(Ta).all() and np.isfinite(Pel).all()
+    assert hall not in [z.get("thermometer") for z in m["zones"].values()]
+
+
+def test_a_stopped_thermometer_does_not_count_as_complete():
+    layout = default_layout()
+    r = synthetic.run(days=2, seed=4, realism=False)
+    ex = json.loads(json.dumps(synthetic.to_export(r)))
+    m = synthetic.mapping_for(layout)
+    th = m["zones"]["office"]["thermometer"]
+    rows = ex["stats_5min"][th]
+    for x in rows[100:200]:  # eight hours of the same reading
+        x[1] = rows[100][1]
+    g = build_grid(parse_rows(ex), layout, m)
+    k = int(np.searchsorted(g.t, rows[150][0]))
+    assert not g.valid[k]

@@ -1,3 +1,4 @@
+import dataclasses
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -422,3 +423,38 @@ def test_a_fixed_tariff_with_a_night_rate():
         PriceConfig.model_validate({"fixed_periods": [{"start": "25:00", "end": "06:00", "price": 0.2}]})
     with pytest.raises(Exception):
         PriceConfig.model_validate({"fixed_periods": [{"start": "22:00", "end": "06:00", "price": 0.2, "days": ["xx"]}]})
+
+
+def test_a_unit_asked_to_run_runs_while_the_windows_are_open_to_cool():
+    pr = _summer(True)
+    pr.venting.open_now = np.where((pr.t[:-1] - pr.t[0]) < 10 * MIN, 1.0, 0.0)  # every window open now
+    f = np.zeros(pr.N)
+    f[(pr.t[:-1] - pr.t[0]) < 15 * MIN] = 1.0
+    pr.units = [dataclasses.replace(u, forced=f) if u.id == "bedroom" else u for u in pr.units]
+    plan = mpc.solve(pr)  # no "no feasible plan"
+    assert plan.share["bedroom"][0] > 0.99
+
+
+def test_a_unit_running_in_the_other_mode_may_stop_at_once():
+    pr = problem(lambda h: 0.3, Ta=(23.5, 23.0, 24.0, 23.0, 23.0), tout=18.0)
+    pr.units = [dataclasses.replace(u, on=True, since_min=2.0, hold=True, run_mode="heat", modes=("heat", "cool"))
+                if u.id == "living" else u for u in pr.units]
+    cool, _ = mpc.solve_mode(pr, "cool")
+    heat, _ = mpc.solve_mode(pr, "heat")
+    assert heat.share["living"][0] > 0.99  # in its own mode, its minimum run holds
+    assert cool is None or cool.share["living"][0] < 0.01 or cool.share["living"][0] > 0.99  # in the other: free, not forced
+    pr2 = dataclasses.replace(pr, units=[dataclasses.replace(u, run_mode="cool") if u.id == "living" else u for u in pr.units])
+    h2, _ = mpc.solve_mode(pr2, "heat")
+    assert h2.share["living"][0] < 0.01  # running to cool, a heating plan need not keep it on (it is warm)
+
+
+def test_a_tariff_time_from_midnight_to_midnight_is_the_whole_day():
+    from zoneinfo import ZoneInfo as _Z
+
+    from climate_optimizer.config import PriceConfig
+    from climate_optimizer.inputs import fixed_price_at
+
+    tz = _Z("Europe/Berlin")
+    cfg = PriceConfig.model_validate({"fixed_price": 0.3, "fixed_periods": [{"start": "00:00", "end": "00:00", "price": 0.2, "days": ["sa"]}]})
+    assert fixed_price_at(cfg, datetime(2026, 11, 14, 13, 0, tzinfo=tz)) == 0.2
+    assert fixed_price_at(cfg, datetime(2026, 11, 15, 13, 0, tzinfo=tz)) == 0.3

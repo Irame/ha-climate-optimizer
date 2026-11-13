@@ -138,6 +138,19 @@ def resample(parsed: Parsed, eid: str, t0, step, K, max_age=6 * 3600e3):
     return step_means(t, v, t0, step, K, max_age)
 
 
+def bridge(a: np.ndarray, default: float = 10.0) -> np.ndarray:
+    """Every gap filled straight across, the ends with the nearest value: for what must
+    run on (the model's state), not for what is checked."""
+    a = np.array(a, dtype=float)
+    ok = np.isfinite(a)
+    if not ok.any():
+        return np.full(len(a), default)
+    if ok.all():
+        return a
+    i = np.arange(len(a))
+    return np.interp(i, i[ok], a[ok])
+
+
 def fill_gaps(a, max_steps):
     a = np.array(a, dtype=float)
     ok = np.where(np.isfinite(a))[0]
@@ -203,6 +216,7 @@ class Grid:
     notes: list = field(default_factory=list)  # problems with the data worth telling
     ghi: np.ndarray | None = None  # (K,) sun on the ground after clouds, kW/m²
     cloud: np.ndarray | None = None  # (K,) cloud cover 0..1 as recorded, NaN unknown
+    phase_all: np.ndarray | None = None  # (K,) kW on that phase, the loads metered on their own included
 
     @property
     def K(self) -> int:
@@ -282,7 +296,8 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
             pt, pv = parsed.num[eid]
             unit = str((parsed.meta.get(eid) or {}).get("unit") or "kWh").lower()
             return counter_power(pt, pv, t0, step, K, ENERGY_UNITS.get(unit, 1.0))
-        return resample(parsed, eid, t0, step, K, 1e18) * _unit_w(parsed.meta, eid)
+        # a power sensor's last value holds a while (it reports on change), not through an outage
+        return resample(parsed, eid, t0, step, K, 30 * 60e3) * _unit_w(parsed.meta, eid)
 
     units = mapping.get("units", {})
     ac_frac, heater_kw = {}, {}
@@ -303,6 +318,7 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
 
 
     phase = kw(mapping.get("phase", ""))
+    phase_all = phase.copy()
     # loads on that phase with a meter of their own: taken off, so less of what is not the units remains
     metered = [e for e in mapping.get("phase_subtract") or [] if e and e != mapping.get("phase") and e in parsed.num]
     if metered:
@@ -313,14 +329,18 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
     if mapping.get("price") and mapping["price"] in parsed.num:
         pt, pv = parsed.num[mapping["price"]]
         price = [(float(a_), float(b_)) for a_, b_ in zip(pt, pv) if np.isfinite(b_)]
-    valid = np.isfinite(T).all(axis=1) & np.isfinite(tout)
     T, stuck = mask_stuck(T, step_min, min_h=stuck_h) if stuck_h else (T, np.zeros(T.shape[1]))
+    # complete where every room with a thermometer and the outside are known (a room without one is reckoned, not checked)
+    seen = [i for i, z in enumerate(layout.zone_ids) if zones.get(z, {}).get("thermometer") in parsed.num]
+    valid = np.isfinite(T[:, seen]).all(axis=1) & np.isfinite(tout) if seen else np.isfinite(tout)
+    # the model runs on through a longer gap outside (filled straight across), it is only not checked there
+    tout = bridge(tout)
     for i, z in enumerate(layout.zone_ids):
         if stuck[i] > 0.02:
             notes.append(f"The {z} thermometer stood still for {stuck[i] * 100:.0f} % of the time; those stretches count as missing.")
     return Grid(t=t, step_min=step_min, T=T, tout=tout, open=opn, sol=sol, hc=hc, hs=hs, ac_frac=ac_frac,
                 heater_kw=heater_kw, phase=phase, others=others, car=car, valid=valid, price=price, tz=tzname, notes=notes,
-                ghi=ghi, cloud=cloud)
+                ghi=ghi, cloud=cloud, phase_all=phase_all)
 
 
 def mask_stuck(T: np.ndarray, step_min: int, keep_h: float = 1.0, min_h: float = 3.0) -> tuple[np.ndarray, np.ndarray]:

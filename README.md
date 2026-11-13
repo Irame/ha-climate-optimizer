@@ -215,6 +215,10 @@ The container starts as root, hands its data directory to `PUID:PGID` (default `
 
 The overview shows what the units draw, measured on the phase and the heaters' plugs and then as planned, above the price; the tooltip has what it costs an hour. The History page lists, per day, what the day's first plan expected the units to draw against what they drew over the same hours (the phase less what it draws with every unit off, plus the heaters), and what it cost. The overview's Today tile has the same for the day so far.
 
+### Tariffs compared
+
+The History page puts what the household used over the last 14, 30 or 60 days (every phase measured: the outdoor unit's and the other phases) at the prices recorded for each quarter hour, against tariffs to compare: one price, or times with their own (a night rate, a cheaper weekend), each with a monthly fee. It shows what each costs a month, what that is per kWh with the fees in, and the difference to now. `GET /api/tariffs/compare?days=30` gives the same. It prices what was used as it was used: with a night rate the plan would heat more at night, with one price all day it would shift less.
+
 ### Diagnostics
 
 **Download diagnostics** on the Model page writes one file with what the training reads: the recorded temperatures, unit states and power (numeric sensors as 5-minute means), the settings without the Home Assistant URL and tokens, the trained model and its report, and the last three days of plans. Without the page:

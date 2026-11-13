@@ -71,7 +71,8 @@ class Settings:
 
     @staticmethod
     def from_dict(d: dict) -> Settings:
-        return Settings(**{k: v for k, v in d.items() if k in Settings.__dataclass_fields__})
+        # a field left empty keeps its default (None would break planning)
+        return Settings(**{k: v for k, v in d.items() if k in Settings.__dataclass_fields__ and v is not None})
 
 
 @dataclass
@@ -89,6 +90,7 @@ class UnitSpec:
     forced: np.ndarray | None = None  # (N,) share of each step it must run (a run override), whatever else holds
     max_level: np.ndarray | None = None  # (N,) highest fan level a rule allows per step, nan where any
     hold: bool = False  # the first step stays as it runs now: the step was decided by the plan before
+    run_mode: str | None = None  # heat | cool: what it runs in now (its minimum run and hold hold only in that mode)
 
 
 @dataclass
@@ -406,7 +408,9 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         starts = (pr.t[:-1] - pr.t[0]) / MIN  # minutes from now to each step's start
         min_run, min_off = (s.min_run_min, s.min_off_min) if u.kind == "ac" else (s.heater_min_run_min, s.heater_min_off_min)
         mids = starts + dts * 30.0  # a minimum run or pause holds a step when it lasts past its middle
-        if u.on and u.since_min < min_run:
+        # a run in the other mode is no run of this one: it may stop at once to switch
+        running = u.on and (u.kind == "heater" or u.run_mode is None or u.run_mode == mode)
+        if running and u.since_min < min_run:
             keep = mids < min_run - u.since_min
             blocked = np.flatnonzero(~allowed)
             if len(blocked):
@@ -414,7 +418,7 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
             on_lb[keep] = 1.0
         if not u.on and u.since_min < min_off:
             on_ub[mids < min_off - u.since_min] = 0.0
-        if u.hold and allowed[0]:
+        if u.hold and allowed[0] and (running or not u.on):
             on_lb[0] = on_ub[0] = float(u.on)
         if u.forced is not None:  # asked to run: over lockouts, windows and the pause after a stop
             f = np.asarray(u.forced, float)
@@ -528,7 +532,8 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         for k, opens in air_open.items():
             for c, ov in opens:
                 for j in win_units:
-                    R.add([ON[j][k], AIR[c]], [1.0, ov], hi=1.0)
+                    if not _forced_at(U[j], k):  # a unit asked to run runs, windows or not
+                        R.add([ON[j][k], AIR[c]], [1.0, ov], hi=1.0)
 
     # venting: the windows open while the outside air cools (or warms) for less than the units
     VENT = []
@@ -544,8 +549,9 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                 R.add([vopen[0], VENT[0]], [1.0, -1.0], lo=-float(vt.open_now[0] > 0))
             else:
                 R.add([vopen[k], VENT[k], VENT[k - 1]], [1.0, -1.0, 1.0], lo=0.0)
-            for j in win_units:  # no unit runs against open windows
-                R.add([ON[j][k], VENT[k]], [1.0, 1.0], hi=1.0)
+            for j in win_units:  # no unit runs against open windows (unless asked to run)
+                if not _forced_at(U[j], k):
+                    R.add([ON[j][k], VENT[k]], [1.0, 1.0], hi=1.0)
             for c, ov in air_open.get(k, []):  # an airing is not on top of it
                 R.add([VENT[k], AIR[c]], [1.0, ov], hi=1.0)
 
@@ -764,6 +770,10 @@ def solve(pr: Problem) -> Plan:
     return best
 
 
+def _forced_at(u: UnitSpec, k: int) -> bool:
+    return u.forced is not None and float(np.asarray(u.forced)[k]) > 0
+
+
 def start_now_or_later(pr: Problem, plan: Plan, obj: float) -> Plan:
     """A plan that has a unit off now but on right after the on/off steps may only be putting
     off a start: after them a step is a share, and a start there is counted by its share, so
@@ -795,6 +805,7 @@ def start_now_or_later(pr: Problem, plan: Plan, obj: float) -> Plan:
         if p2 is not None and o2 < obj + discount:
             p2.alternatives = plan.alternatives
             plan, obj = p2, o2
+            pr = alt  # the next unit's trial keeps this one started
     return plan
 
 

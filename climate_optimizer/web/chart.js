@@ -8,6 +8,7 @@ const el = (tag, attrs = {}, parent) => {
   return e;
 };
 
+const escH = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 export const fmtTime = (t, tz) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: tz });
 export const fmtDay = (t, tz) => new Date(t).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'numeric', timeZone: tz });
 
@@ -76,7 +77,7 @@ export class ChartGroup {
     const rows = this.panels.flatMap(p => p.valuesAt(t));
     const head = `${fmtDay(t, this.tz)} ${fmtTime(t, this.tz)}${t > this.now ? ' · plan' : ''}`;
     this.tip.innerHTML = `<div class="tip-head">${head}</div>` + rows.map(r =>
-      `<div class="tip-row"><span class="sw" style="background:${r.color || 'transparent'}"></span><span>${r.name}</span><b>${r.text}</b></div>`).join('');
+      `<div class="tip-row"><span class="sw" style="background:${r.color || 'transparent'}"></span><span>${escH(r.name)}</span><b>${escH(r.text)}</b></div>`).join('');
     this.tip.hidden = false;
     const box = this.container.getBoundingClientRect();
     const w = this.tip.offsetWidth;
@@ -170,7 +171,7 @@ class Panel {
       for (const s of this.series) {
         if (!s.name || s.noLegend || s.tipOnly || seen.has(s.legendKey || s.name)) continue;
         seen.add(s.legendKey || s.name);
-        lg.insertAdjacentHTML('beforeend', `<span><i style="background:${s.color}"></i>${s.legendKey || s.name}</span>`);
+        lg.insertAdjacentHTML('beforeend', `<span><i style="background:${s.color}"></i>${escH(s.legendKey || s.name)}</span>`);
       }
       this.wrap.appendChild(lg);
     }

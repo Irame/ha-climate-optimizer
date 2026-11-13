@@ -8,6 +8,7 @@ import contextlib
 import gzip
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timedelta
@@ -79,7 +80,8 @@ class Service:
         last_prune = 0.0
         while not self.stop.is_set():
             await _sleep_until(self.stop, 60, offset=1)
-            self.collector.tick()
+            if self.ha.connected.is_set():  # cut off, the last values would be written on as if measured
+                self.collector.tick()
             if time.time() - last_prune > 6 * 3600:
                 last_prune = time.time()
                 self.store.prune(int((time.time() - (self.cfgs.config.history_days + 5) * 86400) * 1000))
@@ -376,6 +378,17 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         days = max(1, min(days, 60))
         return _json(await asyncio.to_thread(energy_days, s, days))
 
+    @app.get("/api/tariffs/compare", dependencies=[Depends(auth)])
+    async def tariffs_compare(days: int = 30):
+        """What the household's electricity of the last days cost, and what it would have
+        cost with each tariff to compare (Settings: tariffs)."""
+        s = svc()
+        days = max(1, min(days, 90))
+        try:
+            return _json(await asyncio.to_thread(compare_tariffs, s, days))
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+
     @app.get("/api/config", dependencies=[Depends(auth)])
     async def get_config():
         return svc().cfgs.config.public()
@@ -546,6 +559,62 @@ def retrain_due(done_s: float, now: datetime, hour: int) -> bool:
     return done_s < now.replace(minute=0, second=0, microsecond=0).timestamp()
 
 
+def compare_tariffs(s, days: int) -> dict:
+    """The household's use over the last days (every phase measured), at the prices paid
+    then, and at each tariff to compare, with the monthly fees for the days covered."""
+    from .inputs import tariff_price_at
+
+    cfg = s.cfgs.config
+    p = s.planner
+    tz = p.tz()
+    layout, _ = p.model()
+    end = time.time() * 1000
+    start = end - days * 864e5
+    ex = s.store.export(tracked_entities(cfg.mapping), int(start - 864e5), int(end), s.collector.meta,
+                        {**p.location(), "tz": str(tz)})
+    g = build_grid(parse_rows(ex), layout, p.mapping(), min_hours=1)
+    base = g.phase_all if g.phase_all is not None else g.phase
+    if base is None or not np.isfinite(base).any():
+        raise ValueError("no phase recorded: set the phase with the outdoor unit (and the other phases) in Settings")
+    house = base + (np.sum(g.others, axis=0) if g.others else 0.0)
+    ph = s.store.get("price_history") or {}
+    prices = sorted((int(k), v[0], v[1]) for k, v in ph.items())
+    starts = [a for a, _, _ in prices]
+
+    def paid_at(t):
+        i = bisect.bisect_right(starts, t) - 1
+        return prices[i][2] if i >= 0 and prices[i][0] <= t < prices[i][1] else math.nan
+
+    paid = np.array([paid_at(t + 1) for t in g.t])
+    ok = (g.t >= start) & np.isfinite(house) & np.isfinite(paid)  # the same steps for every tariff
+    if not ok.any():
+        raise ValueError("no time with every phase and the price recorded yet")
+    kwh = np.clip(house[ok], 0.0, None) * g.dt_h
+    local = [datetime.fromtimestamp(t / 1000, tz) for t in g.t[ok]]
+    covered = ok.sum() * g.dt_h / 24.0
+    month = 365.25 / 12
+    total = float(kwh.sum())
+    night = np.array([d.hour >= 22 or d.hour < 6 for d in local])
+
+    def row(name, energy, fee, current=False):
+        tot = energy + fee
+        return {"name": name, "current": current, "energy_eur": round(energy, 2), "fee_eur": round(fee, 2),
+                "total_eur": round(tot, 2), "ct_per_kwh": round(100 * tot / total, 2) if total > 0 else None,
+                "month_eur": round(tot / covered * month, 2)}
+
+    rows = [row("Now (" + {"tibber_prices": "Tibber", "attributes": "dynamic", "fixed": "fixed"}.get(cfg.prices.source, "now") + ")",
+                float(np.dot(kwh, paid[ok])), cfg.prices.monthly_fee * covered / month, True)]
+    for tf in cfg.tariffs:
+        pr = np.array([tariff_price_at(tf.price, tf.periods, d) for d in local])
+        rows.append(row(tf.name, float(np.dot(kwh, pr)), tf.monthly_fee * covered / month))
+    for r in rows:
+        r["diff_month_eur"] = round(r["month_eur"] - rows[0]["month_eur"], 2)
+    unit_phase = float(np.nansum(np.clip(base[ok], 0.0, None)) * g.dt_h)
+    return {"days": round(covered, 1), "asked_days": days, "coverage": round(float(ok.sum() / max(1, (g.t >= start).sum())), 3),
+            "kwh": round(total, 1), "kwh_per_day": round(total / covered, 1), "night_share": round(float(kwh[night].sum() / total), 3) if total else None,
+            "outdoor_phase_kwh": round(unit_phase, 1), "phases": 1 + len(g.others or []), "tariffs": rows}
+
+
 def energy_days(s, days: int) -> list[dict]:
     """Per day: the units' electricity as the day's first plan expected it, and as
     measured (the outdoor unit's phase, less what it draws with every unit off, plus
@@ -562,6 +631,17 @@ def energy_days(s, days: int) -> list[dict]:
     prices = sorted((int(k), v[0], v[1]) for k, v in ph.items())
     # measured, from the 5-minute grid; other loads on the phase from all-off times, by hour of day
     meas, other_h = {}, {}
+    p_starts = [a for a, _, _ in prices]
+
+    def price_at(t):
+        i = bisect.bisect_right(p_starts, t) - 1
+        return prices[i][2] if i >= 0 and prices[i][0] <= t < prices[i][1] else None
+
+    def hour_price(h):
+        """The hour's mean price (quarter-hour prices differ within it)."""
+        ps = [x for q in range(4) if (x := price_at(h + q * 900_000 + 1)) is not None]
+        return sum(ps) / len(ps) if ps else None
+
     try:
         ex = s.store.export(tracked_entities(cfg.mapping), int(start - 7 * 864e5), end, s.collector.meta, {**p.location(), "tz": str(tz)})
         g = build_grid(parse_rows(ex), layout, p.mapping(), min_hours=1)
@@ -580,18 +660,17 @@ def energy_days(s, days: int) -> list[dict]:
                 continue
             a = datetime.fromtimestamp(g.t[k] / 1000, tz)
             h = int(a.replace(minute=0, second=0, microsecond=0).timestamp() * 1000)
-            m = meas.setdefault(h, [0.0, 0.0, 0.0, 0])  # phase, heaters, other loads (kWh), steps
+            m = meas.setdefault(h, [0.0, 0.0, 0.0, 0, 0.0, 0.0])  # phase, heaters, other loads (kWh), steps, € and kWh priced
             m[0] += float(g.phase[k]) * g.dt_h
             m[1] += float(np.nan_to_num(heat[k])) * g.dt_h
             m[2] += prof[hod[k]] * g.dt_h
             m[3] += 1
+            pk = price_at(g.t[k])
+            if pk is not None:  # each step at its own price
+                w = max(0.0, float(g.phase[k]) - prof[hod[k]] + float(np.nan_to_num(heat[k]))) * g.dt_h
+                m[4] += w * pk
+                m[5] += w
         other_h = {h: v[2] for h, v in meas.items()}
-
-    p_starts = [a for a, _, _ in prices]
-
-    def price_at(t):
-        i = bisect.bisect_right(p_starts, t) - 1
-        return prices[i][2] if i >= 0 and prices[i][0] <= t < prices[i][1] else None
 
     out = []
     for i in range(days):
@@ -608,7 +687,9 @@ def energy_days(s, days: int) -> list[dict]:
             whole = m is not None and m[3] >= 0.8 * 3600 / (g.dt_h * 3600) and h + 3_600_000 <= end  # a finished, recorded hour
             units = max(0.0, m[0] - m[2]) + m[1] if whole else None
             planned = (f or {}).get("hours", {}).get(str(h))
-            rows.append([h, planned, None if units is None else round(units, 4), price_at(h)])
+            hp = hour_price(h)
+            paid = m[4] / m[5] if whole and m[5] > 1e-9 else hp  # what the hour's use paid on average
+            rows.append([h, planned, None if units is None else round(units, 4), hp, paid])
         covered = [r for r in rows if r[1] is not None and r[2] is not None]
         measured = [r for r in rows if r[2] is not None]
         out.append({
@@ -620,7 +701,7 @@ def energy_days(s, days: int) -> list[dict]:
             "measured_day_kwh": round(sum(r[2] for r in measured), 3) if measured else None,
             "measured_hours": len(measured), "compared_hours": len(covered),
             "planned_eur": round(sum(r[1] * r[3] for r in covered if r[3] is not None), 3) if covered else None,
-            "measured_eur": round(sum(r[2] * r[3] for r in measured if r[3] is not None), 3) if measured else None,
+            "measured_eur": round(sum(r[2] * r[4] for r in measured if r[4] is not None), 3) if measured else None,
             "other_kwh": round(sum(other_h.get(r[0], 0.0) for r in rows), 3),
             "hours": rows,
         })

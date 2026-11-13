@@ -14,6 +14,7 @@ does not lose one half way.
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -111,9 +112,19 @@ def find_unit(layout: Layout, mapping: dict, name: str) -> str | None:
     return None
 
 
+def _locked(f):
+    """Changed from the API (event loop) and while planning (a worker thread): one at a time."""
+    def g(self, *a, **k):
+        with self.lock:
+            return f(self, *a, **k)
+    g.__doc__ = f.__doc__
+    return g
+
+
 class Overrides:
     def __init__(self, store):
         self.store = store
+        self.lock = threading.RLock()
         self.items: list[Override] = []
         for d in store.get("overrides") or []:
             try:
@@ -127,6 +138,7 @@ class Overrides:
     def list(self) -> list[dict]:
         return [o.to_dict() for o in self.items]
 
+    @_locked
     def add_target(self, zone: str, target: float, now_ms: float, temp_now: float | None, ready_at: int | None = None,
                    hold_min: float = 0.0, until: int | None = None, source: str = "ui") -> Override:
         """One per room: a new one replaces the one before."""
@@ -139,6 +151,7 @@ class Overrides:
         self.save()
         return o
 
+    @_locked
     def add_run(self, unit: str, minutes: float, now_ms: float, source: str = "ui") -> Override:
         o = Override(id=uuid.uuid4().hex[:8], kind="run", created=int(now_ms), unit=unit,
                      end=int(now_ms + minutes * MIN), source=source)
@@ -146,6 +159,7 @@ class Overrides:
         self.save()
         return o
 
+    @_locked
     def cancel(self, id: str | None = None, zone: str | None = None, unit: str | None = None) -> list[Override]:
         gone = [o for o in self.items if (id and o.id == id) or (zone and o.kind == "target" and o.zone == zone)
                 or (unit and o.kind == "run" and o.unit == unit)]
@@ -158,6 +172,7 @@ class Overrides:
         # a minute's slack at the start: a proxy's clock, or the demo's, may run a little behind
         return next((o for o in self.items if o.kind == "run" and o.unit == unit and o.created - MIN <= now_ms < (o.end or 0)), None)
 
+    @_locked
     def tick(self, now_ms: float, temps: dict[str, float]) -> list[tuple[Override, str]]:
         """Note what was reached, and drop what is over; returns those, with why."""
         done, changed = [], False

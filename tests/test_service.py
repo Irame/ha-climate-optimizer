@@ -711,3 +711,67 @@ def test_planning_with_a_fixed_tariff(client):
             {"start": "22:00", "end": "6", "price": 0.2}]}}).status_code == 422
     finally:
         client.put("/api/config", json={"prices": old})
+
+
+def test_a_training_keeps_the_model_it_replaces(client, monkeypatch):
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    from climate_optimizer import trainer as trainer_mod
+
+    p, store = client.svc.planner, client.svc.store
+    store.put("models", [])
+    old = p.params.to_dict()
+    new = json.loads(json.dumps(old))
+    new["units"]["living"]["heat"] = [7.0 for _ in new["units"]["living"]["heat"]]
+    p.report = p.report or {"finished": 1.0}
+    monkeypatch.setattr(trainer_mod, "train_job", lambda *a, **k: {"params": new, "checked": new, "report": {"rmse_val": [0.5]}})
+    t = trainer_mod.Trainer(p)
+    t._pool = ThreadPoolExecutor(1)
+    asyncio.run(t.run())
+    assert t.error is None, t.error
+    hist = store.get("models")
+    assert hist[0]["params"]["units"]["living"]["heat"] == new["units"]["living"]["heat"]
+    assert hist[1]["params"]["units"]["living"]["heat"] == old["units"]["living"]["heat"]  # the one before, kept
+    p.params = Params.from_dict(old)
+    store.put("params", old)
+    store.put("models", [])
+
+
+def test_a_new_home_assistant_address_needs_its_token_again(client):
+    cfgs = client.svc.cfgs
+    old = cfgs.config.ha.model_dump()
+    try:
+        cfgs.config.ha.token = "secret"
+        url = cfgs.config.ha.url
+        client.put("/api/config", json={"ha": {"url": url, "token": "********"}})  # the same address: kept
+        assert cfgs.config.ha.token == "secret"
+        client.put("/api/config", json={"ha": {"url": "http://elsewhere.example:8123", "token": "********"}})
+        assert cfgs.config.ha.token == ""  # not sent to another address
+    finally:
+        client.put("/api/config", json={"ha": old})
+
+
+def test_an_empty_setting_keeps_its_default(client):
+    from climate_optimizer import mpc
+
+    assert mpc.Settings.from_dict({"min_run_min": None}).min_run_min == mpc.Settings().min_run_min
+
+
+def test_tariffs_compared(client):
+    old = client.get("/api/config").json()
+    r = client.put("/api/config", json={"prices": {**old["prices"], "monthly_fee": 10.0}, "tariffs": [
+        {"name": "Fixed", "price": 0.30, "monthly_fee": 12.0},
+        {"name": "Day and night", "price": 0.34, "periods": [{"start": "22:00", "end": "06:00", "price": 0.24}]}]})
+    assert r.status_code == 200, r.text
+    try:
+        res = client.get("/api/tariffs/compare?days=7").json()
+        assert res["days"] > 1 and res["kwh"] > 0 and res["phases"] >= 1
+        now, fixed, dn = res["tariffs"]
+        assert now["current"] and fixed["name"] == "Fixed" and now["diff_month_eur"] == 0
+        assert abs(fixed["energy_eur"] - 0.30 * res["kwh"]) < 0.05 * res["kwh"] * 0.30 + 0.01  # one price: the kWh at it
+        assert abs(fixed["fee_eur"] - 12.0 * res["days"] / (365.25 / 12)) < 0.05
+        assert 24 <= dn["ct_per_kwh"] <= 34
+        assert abs(fixed["month_eur"] - fixed["total_eur"] / res["days"] * 365.25 / 12) < 0.01 * fixed["month_eur"]
+    finally:
+        client.put("/api/config", json={"prices": old["prices"], "tariffs": []})

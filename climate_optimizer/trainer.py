@@ -109,19 +109,33 @@ class Trainer:
         try:
             now = int(time.time() * 1000)
             ents = tracked_entities(cfg.mapping)
-            start, note = power_window(now - cfg.history_days * 864e5, p.power_switch(), now)
-            export = await asyncio.to_thread(p.store.export, ents, int(start), now,
-                                             p.collector.meta, {**p.location(), "tz": str(p.tz())})
+            full = now - cfg.history_days * 864e5
+            start, note = power_window(full, p.power_switch(), now)
             if self._pool is None:
                 self._pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
             # start from the last checked model: the one planning has seen the days now checked
             initial = (p.store.get("params_checked") or p.params.to_dict()) if (use_current and p.params) else None
             loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(self._pool, train_job, export, cfg.layout, p.mapping(), initial, self.progress_path)
+
+            async def job(since):
+                export = await asyncio.to_thread(p.store.export, ents, int(since), now,
+                                                 p.collector.meta, {**p.location(), "tz": str(p.tz())})
+                return await loop.run_in_executor(self._pool, train_job, export, cfg.layout, p.mapping(), initial, self.progress_path)
+
+            try:
+                res = await job(start)
+            except ValueError as e:
+                if start <= full:
+                    raise
+                # the days since the change of control are too few to learn from yet: all of them
+                log.info("training on the days since the change of control failed (%s); on all days", e)
+                note = f"too little since the change of power control to learn from it alone ({e}); trained on all days"
+                res = await job(full)
             from .model.layout import Params
+            report = {**res["report"], "finished": time.time() * 1000, **({"power_note": note} if note else {})}
+            p.remember_model(res["params"], res["checked"], report)  # before it replaces the model planning with now
             p.params = Params.from_dict(res["params"])
-            p.report = {**res["report"], "finished": time.time() * 1000, **({"power_note": note} if note else {})}
-            p.remember_model(res["params"], res["checked"], p.report)
+            p.report = report
             p.store.put("params", res["params"])
             p.store.put("params_checked", res["checked"])
             p.store.put("report", p.report)
