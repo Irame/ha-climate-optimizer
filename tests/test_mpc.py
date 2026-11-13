@@ -392,3 +392,33 @@ def test_heat_left_at_the_end_follows_the_rooms_function_then():
     office = lambda p: float(np.sum(np.abs(p.heat["office"]) * dt))
     assert office(b) < 0.5 * office(a)  # frost: no stocking up for the end
     assert b.temp["office"][-1] < a.temp["office"][-1] - 2
+
+
+def test_a_fixed_tariff_with_a_night_rate():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from climate_optimizer.config import PriceConfig
+    from climate_optimizer.inputs import fixed_price_at, fixed_prices
+
+    tz = ZoneInfo("Europe/Berlin")
+    cfg = PriceConfig.model_validate({"source": "fixed", "fixed_price": 0.32, "fixed_periods": [
+        {"start": "22:00", "end": "06:00", "price": 0.24},
+        {"start": "00:00", "end": "24:00", "price": 0.20, "days": ["Sa", "su"]},
+    ]})
+    at = lambda *a: fixed_price_at(cfg, datetime(*a, tzinfo=tz))
+    assert at(2026, 11, 12, 12, 0) == 0.32 and at(2026, 11, 12, 22, 0) == 0.24 and at(2026, 11, 13, 5, 59) == 0.24
+    assert at(2026, 11, 13, 6, 0) == 0.32  # Friday morning
+    assert at(2026, 11, 14, 12, 0) == 0.20 and at(2026, 11, 15, 23, 0) == 0.20  # the weekend, listed later, wins
+    assert at(2026, 11, 16, 3, 0) == 0.24  # Sunday night into Monday: the night rate
+    now = datetime(2026, 11, 12, 10, 7, tzinfo=tz).timestamp() * 1000
+    iv = fixed_prices(cfg, now, tz)
+    assert iv[0][0] <= now - 864e5 and iv[-1][1] >= now + 3 * 864e5
+    assert all(b == c for (_, b, _), (c, _, _) in zip(iv, iv[1:]))  # no gaps
+    assert all(e - s <= 3_600_000 for s, e, _ in iv)
+    night = [p for s, e, p in iv if datetime.fromtimestamp(s / 1000, tz).hour == 23 and datetime.fromtimestamp(s / 1000, tz).weekday() < 4]
+    assert night and set(night) == {0.24}
+    with pytest.raises(Exception):
+        PriceConfig.model_validate({"fixed_periods": [{"start": "25:00", "end": "06:00", "price": 0.2}]})
+    with pytest.raises(Exception):
+        PriceConfig.model_validate({"fixed_periods": [{"start": "22:00", "end": "06:00", "price": 0.2, "days": ["xx"]}]})

@@ -229,6 +229,7 @@ The file is an export: Settings, "Load an export" reads it back in.
 
 - `tibber_prices`: the `tibber_prices.get_price` action of the Tibber Prices integration.
 - `a sensor's attributes`: any sensor that lists coming prices in an attribute, such as Nord Pool, EPEX Spot or Tibber. Any list of entries with a start time and a price is understood. Cents are recognised.
+- `a fixed tariff`: one price (€/kWh) at all hours, and optionally times with a price of their own, for a day and night rate or a cheaper weekend: 22:00 to 06:00 at the night price (a time ending before it starts runs past midnight, on the nights it starts), 00:00 to 24:00 on Sa and Su. Where times overlap, the later one in the list wins. With one price at all hours the plan has no cheap hours to heat ahead into, but still saves energy: it bundles heating, heats when the heat pump works best (in the warmer afternoon), and keeps rooms no warmer than wanted.
 
 Beyond the known prices, the plan assumes the same price as 24 hours earlier. It plans at least 30 hours ahead (Settings), so its end, where it lets rooms cool because heat there is of no use to it any more, lies past the day it plans for.
 

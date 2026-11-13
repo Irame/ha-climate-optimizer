@@ -290,7 +290,7 @@ class Planner:
         states = self.collector.states
         out: dict = {"errors": []}
         try:
-            out["prices"] = await fetch_prices(self.ha, cfg.prices, states, now_ms)
+            out["prices"] = await fetch_prices(self.ha, cfg.prices, states, now_ms, self.tz())
         except Exception as e:
             out["errors"].append(f"prices: {e}")
             out["prices"] = self.store.get("last_prices") or []

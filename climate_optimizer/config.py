@@ -24,13 +24,44 @@ class HAConfig(BaseModel):
     verify_ssl: bool = True
 
 
+WEEKDAYS = ("mo", "tu", "we", "th", "fr", "sa", "su")
+
+
+class PricePeriod(BaseModel):
+    """A time of a fixed tariff with a price of its own (night rate, weekend)."""
+    model_config = ConfigDict(extra="ignore")
+    start: str = "22:00"
+    end: str = "06:00"  # before the start: runs past midnight (on the days it starts)
+    price: float = Field(0.25, ge=-1, le=5)  # €/kWh
+    days: list[str] = []  # mo .. su; empty: every day
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hm(cls, v):
+        h, _, m = str(v).partition(":")
+        if not (h.isdigit() and m.isdigit() and 0 <= int(h) <= 24 and 0 <= int(m) < 60 and int(h) * 60 + int(m) <= 1440):
+            raise ValueError(f"{v}: a time as HH:MM")
+        return f"{int(h):02d}:{int(m):02d}"
+
+    @field_validator("days")
+    @classmethod
+    def _days(cls, v):
+        v = [str(d).lower()[:2] for d in v]
+        if set(v) - set(WEEKDAYS):
+            raise ValueError(f"days: some of {', '.join(WEEKDAYS)}")
+        return v
+
+
 class PriceConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
     # tibber_prices: the action tibber_prices.get_price; attributes: a sensor that lists the
-    # coming prices in an attribute (Nord Pool, EPEX Spot, Tibber and similar)
-    source: Literal["tibber_prices", "attributes"] = "tibber_prices"
+    # coming prices in an attribute (Nord Pool, EPEX Spot, Tibber and similar); fixed: a tariff
+    # with one price, or prices by time (day and night rate)
+    source: Literal["tibber_prices", "attributes", "fixed"] = "tibber_prices"
     entry_id: str = ""  # tibber_prices config entry, if there is more than one
     sensor: str = ""  # for source attributes; also the price history shown in the UI
+    fixed_price: float = Field(0.30, ge=-1, le=5)  # €/kWh, whenever no period below holds
+    fixed_periods: list[PricePeriod] = []  # later ones win where they overlap
 
 
 class AiringConfig(BaseModel):

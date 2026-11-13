@@ -697,3 +697,17 @@ def test_a_window_counts_once_open_a_moment(client):
     finally:
         world.windows["office"] = False
         _see(svc)
+
+
+def test_planning_with_a_fixed_tariff(client):
+    old = client.get("/api/config").json()["prices"]
+    r = client.put("/api/config", json={"prices": {**old, "source": "fixed", "fixed_price": 0.31,
+                                                   "fixed_periods": [{"start": "22:00", "end": "06:00", "price": 0.22}]}})
+    assert r.status_code == 200, r.text
+    try:
+        plan = client.post("/api/plan").json()["plan"]
+        assert set(round(p, 3) for p in plan["price"]) == {0.31, 0.22} and plan["t"][-1] - plan["t"][0] >= 24 * 3.6e6
+        assert client.put("/api/config", json={"prices": {**old, "source": "fixed", "fixed_periods": [
+            {"start": "22:00", "end": "6", "price": 0.2}]}}).status_code == 422
+    finally:
+        client.put("/api/config", json={"prices": old})

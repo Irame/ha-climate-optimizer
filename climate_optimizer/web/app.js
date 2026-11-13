@@ -1143,10 +1143,17 @@ pages.settings = async () => {
     <label class="field">On that phase, metered on their own (taken off it): energy (kWh) or power (W)${entityMulti('mapping.phase_subtract', 'power', M.phase_subtract)}</label>
     <label class="field">Other phases: energy (kWh) or power (W)${entityMulti('mapping.phases_other', 'power', M.phases_other)}</label>
     ${field('Car charger: energy (kWh) or power (W), optional', 'mapping.car', 'power')}
-    <label class="field">Prices from<select data-path="prices.source"><option value="tibber_prices" ${C.prices.source === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${C.prices.source === 'attributes' ? 'selected' : ''}>a sensor's attributes</option></select></label>
+    <label class="field">Prices from<select data-path="prices.source"><option value="tibber_prices" ${C.prices.source === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${C.prices.source === 'attributes' ? 'selected' : ''}>a sensor's attributes</option><option value="fixed" ${C.prices.source === 'fixed' ? 'selected' : ''}>a fixed tariff (below)</option></select></label>
     <label class="field">tibber_prices entry id (if several)<input data-path="prices.entry_id" value="${esc(C.prices.entry_id || '')}"></label>
     ${field('Price sensor', 'prices.sensor', 'price')}
-    </div><p class="hint">For the phases, the car and the heater an energy meter (kWh) is the better choice where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, where a power sensor's reports miss what happens between them. Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
+    </div>
+    <h4 style="margin:14px 0 6px">Fixed tariff</h4>
+    <div class="fields"><label class="field">Price (€/kWh)<input type="number" step="0.001" data-path="prices.fixed_price" value="${C.prices.fixed_price ?? 0.3}"></label></div>
+    <div class="table-wrap"><table id="tariff"><tr><th>From</th><th>To</th><th>€/kWh</th><th>Days (none: every day)</th><th></th></tr>
+      ${(C.prices.fixed_periods || []).map(tariffRow).join('')}</table></div>
+    <button id="tariff-add" type="button">Add a time with its own price</button>
+    <p class="hint">With "a fixed tariff", the price above holds whenever none of the times below does: for a day and night rate, the day price above and 22:00 to 06:00 at the night price; for a cheaper weekend, add one from 00:00 to 24:00 on Sa and Su. A time ending before it starts runs past midnight, on the nights it starts. Where times overlap, the lower one in the list wins. With one price at all hours, the plan still saves energy and heats when the heat pump works best, but has no cheap hours to heat ahead into.</p>
+    <p class="hint">For the phases, the car and the heater an energy meter (kWh) is the better choice where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, where a power sensor's reports miss what happens between them. Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
   html += `<div class="card"><h3>Optimizer</h3><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
     <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
     <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents (its electricity, the spike when it comes on, is learned with the model). Heaters have no compressor to spare: no cost to a start, and their own, short minimum run and pause. On/off is decided as such for the first quarter hour; after that the plan counts what share of each step a unit runs.</p></div>`;
@@ -1183,6 +1190,10 @@ pages.settings = async () => {
       $('#import-msg').textContent = `${r.rows} rows loaded. Retrain on the Model page.`;
     } catch (err) { $('#import-msg').textContent = 'Failed: ' + err.message; }
   };
+  const tariff = $('#tariff');
+  const tariffDel = () => tariff.querySelectorAll('[data-tariff-del]').forEach(b => b.onclick = () => b.closest('tr').remove());
+  $('#tariff-add').onclick = () => { tariff.insertAdjacentHTML('beforeend', tariffRow()); tariffDel(); };
+  tariffDel();
   $('#st-save').onclick = async () => {
     const msg = $('#st-msg');
     root.querySelectorAll('[data-path]').forEach(inp => {
@@ -1200,6 +1211,11 @@ pages.settings = async () => {
       const al = root.querySelector(`[data-alias="${z.id}"]`);
       if (al) z.aliases = al.value.split(',').map(x => x.trim()).filter(Boolean);
     }
+    C.prices.fixed_periods = [...root.querySelectorAll('[data-tariff]')].map(r => {
+      const end = r.querySelector('[data-k="end"]').value;
+      return { start: r.querySelector('[data-k="start"]').value, end: end === '23:59' ? '24:00' : end,
+               price: +r.querySelector('[data-k="price"]').value, days: [...r.querySelectorAll('[data-day]')].filter(b => b.checked).map(b => b.dataset.day) };
+    });
     C.shadow_units = [...root.querySelectorAll('[data-shadow-unit]')].filter(b => b.checked).map(b => b.dataset.shadowUnit);
     C.shadow_comfort = Object.fromEntries([...root.querySelectorAll('[data-shadow-comfort]')].filter(i => i.value !== '').map(i => [i.dataset.shadowComfort, +i.value]));
     const lat = $('#lat').value, lon = $('#lon').value;
@@ -1211,6 +1227,15 @@ pages.settings = async () => {
     } catch (e) { msg.textContent = 'Not saved: ' + e.message; }
   };
 };
+
+const WEEKDAYS = ['mo', 'tu', 'we', 'th', 'fr', 'sa', 'su'];
+function tariffRow(p = {}) {
+  const days = p.days || [];
+  return `<tr data-tariff><td><input type="time" data-k="start" value="${esc(p.start || '22:00')}"></td><td><input type="time" data-k="end" value="${esc(p.end === '24:00' ? '23:59' : (p.end || '06:00'))}"></td>
+    <td><input type="number" step="0.001" data-k="price" value="${p.price ?? 0.25}" style="width:80px"></td>
+    <td>${WEEKDAYS.map(d => `<label class="check" style="margin-right:6px"><input type="checkbox" data-day="${d}" ${days.includes(d) ? 'checked' : ''}>${d[0].toUpperCase() + d[1]}</label>`).join('')}</td>
+    <td><button type="button" data-tariff-del>✕</button></td></tr>`;
+}
 
 function get(o, path) { return path.split('.').reduce((a, k) => a?.[k], o); }
 function set(o, path, v) {

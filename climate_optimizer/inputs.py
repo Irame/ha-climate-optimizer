@@ -95,7 +95,45 @@ def parse_prices(obj, unit_hint: str = "") -> list[tuple[int, int, float]]:
     return [(s, e, float(v)) for (s, e, _), v in zip(out, vals)]
 
 
-async def fetch_prices(ha: HomeAssistant, cfg, states: dict, now_ms: float) -> list[tuple[int, int, float]]:
+def fixed_price_at(cfg, d: datetime) -> float:
+    """A fixed tariff's price at a local time: its periods over its one price, the last that holds."""
+    days = ("mo", "tu", "we", "th", "fr", "sa", "su")
+    m = d.hour * 60 + d.minute
+    price = float(cfg.fixed_price)
+    for p in cfg.fixed_periods:
+        a = int(p.start[:2]) * 60 + int(p.start[3:])
+        b = int(p.end[:2]) * 60 + int(p.end[3:])
+        today, yesterday = days[d.weekday()], days[(d.weekday() - 1) % 7]
+        if a < b:
+            hit = a <= m < b and (not p.days or today in p.days)
+        elif a > b:  # past midnight: the night belongs to the day it starts
+            hit = (m >= a and (not p.days or today in p.days)) or (m < b and (not p.days or yesterday in p.days))
+        else:
+            hit = False
+        if hit:
+            price = float(p.price)
+    return price
+
+
+def fixed_prices(cfg, now_ms: float, tz, days_before: float = 1, days_after: float = 3) -> list[tuple[int, int, float]]:
+    """A fixed tariff as [(start ms, end ms, €/kWh)], a quarter hour at a time, runs of one price joined."""
+    q = 900_000
+    t = int((now_ms - days_before * 864e5) // q * q)
+    end = int(now_ms + days_after * 864e5)
+    out: list[list] = []
+    while t < end:
+        p = fixed_price_at(cfg, datetime.fromtimestamp(t / 1000, tz))
+        if out and out[-1][2] == p and out[-1][1] == t and out[-1][1] - out[-1][0] < 3_600_000:
+            out[-1][1] = t + q
+        else:
+            out.append([t, t + q, p])
+        t += q
+    return [tuple(x) for x in out]
+
+
+async def fetch_prices(ha: HomeAssistant, cfg, states: dict, now_ms: float, tz=None) -> list[tuple[int, int, float]]:
+    if cfg.source == "fixed":
+        return fixed_prices(cfg, now_ms, tz or timezone.utc)
     if cfg.source == "tibber_prices":
         start = datetime.fromtimestamp(now_ms / 1000, timezone.utc) - timedelta(days=1)
         data = {"start_time": start.isoformat(), "end_time": (start + timedelta(days=3)).isoformat()}
