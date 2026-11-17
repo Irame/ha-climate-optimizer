@@ -997,12 +997,14 @@ pages.model = async () => {
     for (const w of rep.warnings || []) html += `<div class="msg">${esc(w)}</div>`;
     if (rep.power_note) html += `<div class="msg">${esc(rep.power_note)}</div>`;
     if (m.kept) html += `<div class="msg">Planning with an earlier model, chosen ${ago(m.kept)}. Nightly training waits until you retrain by hand.</div>`;
-    html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th></tr>`;
+    const corr = S.status?.correction || {};
+    html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th><th class="num">Plans an hour on</th><th class="num">Correction</th></tr>`;
     L.zones.forEach((z, i) => {
-      const zs = rep.zones?.[z.id] || {};
-      html += `<tr><td>${esc(z.name)}</td><td class="num">${num(rep.rmse_val?.[i], 2)} K</td><td class="num">${num(rep.bias_val?.[i], 2)} K</td><td class="num">${num(zs.C, 1)} kWh/K</td><td class="num">${num((zs.Hloss || 0) * 1000, 0)} W/K</td><td class="num">${num(zs.tau_h, 0)} h</td></tr>`;
+      const zs = rep.zones?.[z.id] || {}, c = corr[z.id];
+      html += `<tr><td>${esc(z.name)}</td><td class="num">${num(rep.rmse_val?.[i], 2)} K</td><td class="num">${num(rep.bias_val?.[i], 2)} K</td><td class="num">${num(zs.C, 1)} kWh/K</td><td class="num">${num((zs.Hloss || 0) * 1000, 0)} W/K</td><td class="num">${num(zs.tau_h, 0)} h</td>
+        <td class="num">${c ? (c.err > 0 ? '+' : '') + num(c.err, 2) + ' K' : '–'}</td><td class="num">${c ? (c.kw > 0 ? '+' : '') + num(c.kw * 1000, 0) + ' W' : '–'}</td></tr>`;
     });
-    html += `</table></div><p class="hint">Error: how far whole days predicted from midnight, from nothing but weather and what the units did, stayed from the thermometers.</p></div>`;
+    html += `</table></div><p class="hint">Error: how far whole days predicted from midnight, from nothing but weather and what the units did, stayed from the thermometers. Plans an hour on: how much warmer (+) than measured the plans lately expected each room an hour later. Correction: the heat the plans add for it, beyond the model (minus: the room loses more than the model knows), taken up within a couple of hours and fading within a day once the misses stop (Settings).</p></div>`;
     html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Heat per fan level</th></tr>`;
     for (const u of L.units) {
       const p = m.params.units[u.id] || {};
@@ -1214,7 +1216,7 @@ pages.settings = async () => {
     <button id="tariff-add" type="button">Add a time with its own price</button>
     <p class="hint">With "a fixed tariff", the price above holds whenever none of the times below does: for a day and night rate, the day price above and 22:00 to 06:00 at the night price; for a cheaper weekend, add one from 00:00 to 00:00 (the whole day) on Sa and Su. A time ending before it starts runs past midnight, on the nights it starts. Where times overlap, the lower one in the list wins. With one price at all hours, the plan still saves energy and heats when the heat pump works best, but has no cheap hours to heat ahead into.</p>
     <p class="hint">For the phases, the car and the heater an energy meter (kWh) is the better choice where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, where a power sensor's reports miss what happens between them. Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
-  html += `<div class="card"><h3>Optimizer</h3><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
+  html += `<div class="card"><h3>Optimizer</h3><label class="check"><input type="checkbox" data-path="settings.plan_correction" ${C.settings.plan_correction !== false ? 'checked' : ''}> Correct the plans by their recent misses (an hour on, per room)</label><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
     <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
     <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents (its electricity, the spike when it comes on, is learned with the model). Heaters have no compressor to spare: no cost to a start, and their own, short minimum run and pause. On/off is decided as such for the first quarter hour; after that the plan counts what share of each step a unit runs.</p></div>`;
   html += `<div class="card"><h3>Training</h3><div class="fields">

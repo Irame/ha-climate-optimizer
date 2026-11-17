@@ -775,3 +775,40 @@ def test_tariffs_compared(client):
         assert abs(fixed["month_eur"] - fixed["total_eur"] / res["days"] * 365.25 / 12) < 0.01 * fixed["month_eur"]
     finally:
         client.put("/api/config", json={"prices": old["prices"], "tariffs": []})
+
+
+def test_plans_are_corrected_by_their_misses(client):
+    import time as _t
+
+    p, store = client.svc.planner, client.svc.store
+    layout, params = p.model()
+    th = p.cfg.mapping["zones"]["living"]["thermometer"]
+    store.put("correction", {})
+    t0 = _t.time() * 1000 + 30 * 864e5  # days ahead: clear of what the demo records
+    MIN_ = 60_000
+    zones = {}
+    for i in range(40):
+        now = t0 + i * 5 * MIN_
+        ago = now - 60 * MIN_
+        store.add_plan(int(ago), {"times": [int(ago), int(now + 30 * MIN_)], "temp": {"living": [20.3, 20.3]},
+                                  "mode": "heat", "cost": {}, "on": {}})
+        store.add_rows(th, [[int(now - 3 * MIN_), 20.0]])  # the room is 0.3 K cooler than planned an hour before
+        zones = p.update_correction(now, layout, params)
+    kw = zones["living"]["kw"]
+    assert -0.5 <= kw < -0.05 and zones["living"]["err"] > 0.2
+    assert abs(zones["office"]["kw"]) < 1e-6  # no plan for it: nothing to correct
+    again = p.update_correction(now + MIN_, layout, params)  # within five minutes: no new step
+    assert again["living"]["kw"] == kw
+    # a window open: the miss is the window's, the correction only fades
+    w = (p.cfg.mapping["zones"]["office"].get("windows") or [None])[0]
+    saved = dict(client.svc.collector.states.get(w) or {})
+    client.svc.collector.states[w] = {**saved, "state": "on"}
+    try:
+        now2 = now + 5 * MIN_
+        store.add_plan(int(now2 - 60 * MIN_), {"times": [int(now2 - 60 * MIN_), int(now2 + 30 * MIN_)], "temp": {"living": [20.3, 20.3]},
+                                              "mode": "heat", "cost": {}, "on": {}})
+        z2 = p.update_correction(now2, layout, params)
+        assert kw <= z2["living"]["kw"] < kw * 0.99  # faded a little, not pushed further
+    finally:
+        client.svc.collector.states[w] = saved
+    store.put("correction", {})

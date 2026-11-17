@@ -399,19 +399,103 @@ class Planner:
                 return [int(r[0]), v]
         return None
 
+    # ---- correcting the plans by their misses ----
+    CORR_LIMIT_KW = 0.5  # no more than this either way, per room
+    CORR_LIMIT_K = 0.6  # nor more than moves the room this much in an hour
+    CORR_GAIN = 0.03  # of the miss taken up per update (every 5 minutes): most of it within a few hours, calmly
+    # (the miss shows only an hour after a correction: a quicker one would swing)
+    CORR_LEAK = 0.5 ** (5 / 1440)  # and back towards nothing, half in a day, when the misses stop
+
+    def correction(self) -> dict:
+        return (self.store.get("correction") or {}).get("zones") or {}
+
+    def _hour_response(self, layout: Layout, params: Params, z: str) -> float:
+        """How much warmer a room's air is after an hour of 1 kW more into it (K)."""
+        p = Params.from_dict(json.loads(json.dumps(params.to_dict())))
+        for zz in p.zones:
+            p.zones[zz].update(q=1.0 if zz == z else 0.0, qc=0.0, qs=0.0)
+        sysm = build(layout, p)
+        Ad, Bd = sysm.discretize(5 / 60)
+        u = np.zeros(Bd.shape[1])
+        u[len(layout.units) + DIST.index("one")] = 1.0
+        x = np.zeros(Ad.shape[0])
+        for _ in range(12):
+            x = Ad @ x + Bd @ u
+        return float(x[layout.zone_index(z)])
+
+    def update_correction(self, now_ms: float, layout: Layout, params: Params) -> dict:
+        """Each room's plans, an hour on, against what the thermometer says now: what they
+        kept missing by is put into the plan as heat the room gains or loses beyond what
+        the model knows (it cools faster than the model thinks, say). Once every five minutes;
+        not while windows are or were just open (that miss is the window's)."""
+        cur = self.store.get("correction") or {}
+        zones = dict(cur.get("zones") or {})
+        if now_ms - float(cur.get("t") or 0) < 4.5 * MIN:
+            return zones
+        zmap = self.cfg.mapping.get("zones") or {}
+        recent_window = any(
+            (s := self.collector.states.get(w) or {}).get("state") == "on" or now_ms - self._changed_ms(s) < 60 * MIN
+            for z in layout.window_zones for w in (zmap.get(z) or {}).get("windows") or [])
+        old = self.store.plans(int(now_ms - 65 * MIN), int(now_ms - 55 * MIN))
+        ref = min(old, key=lambda r: abs(r["t"] - (now_ms - 60 * MIN))) if old else None
+        for z in layout.zone_ids:
+            c = zones.get(z) or {"kw": 0.0, "err": 0.0}
+            c["kw"] = float(c.get("kw", 0.0)) * self.CORR_LEAK
+            th = (zmap.get(z) or {}).get("thermometer")
+            meas = [v for r in self.store.rows(th, int(now_ms - 10 * MIN), int(now_ms) + 1, before=False)
+                    if math.isfinite(v := _num(r[1]))] if th else []
+            pred = None
+            if ref is not None and z in (ref.get("temp") or {}) and len(ref.get("times") or []) > 1:
+                tt, vv = ref["times"], ref["temp"][z]
+                if tt[0] <= now_ms <= tt[-1]:
+                    pred = float(np.interp(now_ms, tt, vv))
+            if meas and pred is not None and not recent_window:
+                err = pred - float(np.mean(meas))  # > 0: the plan expected it warmer than it is
+                r = self._hour_response(layout, params, z)
+                if r > 1e-6:
+                    lim = min(self.CORR_LIMIT_KW, self.CORR_LIMIT_K / r)
+                    c["kw"] = float(np.clip(c["kw"] - self.CORR_GAIN * err / r, -lim, lim))
+                c["err"] = round(0.9 * float(c.get("err", 0.0)) + 0.1 * err, 3)
+            c["kw"] = round(c["kw"], 4)
+            zones[z] = c
+        self.store.put("correction", {"t": int(now_ms), "zones": zones})
+        return zones
+
+    @staticmethod
+    def _changed_ms(s: dict) -> float:
+        try:
+            return datetime.fromisoformat(str(s.get("last_changed")).replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            return 0.0
+
     def build_problem(self, now_ms: float, inputs: dict, hold: bool = False) -> tuple[mpc.Problem, dict]:
         """hold: the step under way stays as the units run now (a plan on the clock); a plan
         someone asked for may change it at once."""
         cfg = self.cfg
         layout, params = self.model()
-        sysm = build(layout, params)
         st = cfg.settings_obj()
+        corr = {}
+        if st.plan_correction:
+            try:
+                corr = self.update_correction(now_ms, layout, params)
+            except Exception:  # a correction that fails must not stop the plan
+                log.exception("plan correction")
+            for z, c in corr.items():
+                if z in params.zones and abs(c.get("kw", 0.0)) > 1e-4:
+                    params.zones[z]["q"] = params.zones[z].get("q", 0.0) + c["kw"]  # a copy: the model stays
+        sysm = build(layout, params)
         tz = self.tz()
         loc = self.location()
         mapping = cfg.mapping
         zmap = mapping.get("zones") or {}
         umap = mapping.get("units") or {}
         info: dict = {"notes": list(inputs.get("errors", []))}
+        info["correction"] = corr
+        for z, c in corr.items():
+            if abs(c.get("kw", 0.0)) >= 0.02:
+                name = next((x.name for x in layout.zones if x.id == z), z)
+                info["notes"].append(f"{name}: planned with {c['kw'] * 1000:+.0f} W beyond the model "
+                                     f"(its plans have lately been {abs(c.get('err', 0.0)):.1f} K too {'warm' if c.get('err', 0.0) > 0 else 'cold'} an hour on)")
 
         prices = inputs.get("prices") or []
         if not prices:
