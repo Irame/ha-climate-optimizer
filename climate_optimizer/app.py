@@ -23,7 +23,7 @@ from .collector import Collector, tracked_entities
 from .comfort import resolve
 from .config import DATA, ConfigStore
 from .ha import HomeAssistant
-from .model.dataset import build_grid, parse_rows
+from .model.dataset import build_grid, parse_rows, power_kw
 from .planner import Planner
 from .store import Store
 from .trainer import Trainer
@@ -33,6 +33,32 @@ WEB = Path(__file__).parent / "web"
 # when these files were last changed: on the Settings page, to see which version runs
 BUILD = max(f.stat().st_mtime for f in Path(__file__).parent.rglob("*") if f.suffix in (".py", ".js", ".html", ".css")) * 1000
 MIN = 60_000
+
+
+class Computed:
+    """Results that take a while (a month of minutes read and reckoned), kept a few minutes:
+    the History page asks for them each time it is shown. Asked for again while being
+    worked out, the one answer serves both. A changed setting asks anew (it is in the key)."""
+
+    def __init__(self, ttl_s: float = 300.0, keep: int = 16):
+        self.ttl, self.keep = ttl_s, keep
+        self.done: dict = {}  # key -> (when, value)
+        self.locks: dict = {}
+
+    async def get(self, key, fn):
+        hit = self.done.get(key)
+        if hit and time.time() - hit[0] < self.ttl:
+            return hit[1]
+        async with self.locks.setdefault(key, asyncio.Lock()):
+            hit = self.done.get(key)
+            if hit and time.time() - hit[0] < self.ttl:
+                return hit[1]
+            val = await asyncio.to_thread(fn)
+            self.done[key] = (time.time(), val)
+            for k in sorted(self.done, key=lambda k: self.done[k][0])[:-self.keep]:
+                self.done.pop(k, None)
+                self.locks.pop(k, None)
+            return val
 
 
 class Service:
@@ -50,6 +76,7 @@ class Service:
         self.stop = asyncio.Event()
         self.tasks: list[asyncio.Task] = []
         self.started = time.time()
+        self.computed = Computed()
 
     async def on_connect(self) -> None:
         hc = await self.ha.ha_config()
@@ -388,7 +415,9 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
     async def energy(days: int = 14):
         s = svc()
         days = max(1, min(days, 60))
-        return _json(await asyncio.to_thread(energy_days, s, days))
+        # the day's first plans' expectations are in it: one kept anew asks anew
+        key = ("energy_days", days, s.cfgs.config.model_dump_json(), json.dumps(s.store.get("forecasts") or {}, sort_keys=True))
+        return _json(await s.computed.get(key, lambda: energy_days(s, days)))
 
     @app.get("/api/tariffs/compare", dependencies=[Depends(auth)])
     async def tariffs_compare(days: int = 30):
@@ -397,7 +426,8 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         s = svc()
         days = max(1, min(days, 90))
         try:
-            return _json(await asyncio.to_thread(compare_tariffs, s, days))
+            key = ("tariffs", days, s.cfgs.config.model_dump_json())
+            return _json(await s.computed.get(key, lambda: compare_tariffs(s, days)))
         except ValueError as e:
             raise HTTPException(422, str(e))
 
@@ -579,16 +609,22 @@ def compare_tariffs(s, days: int) -> dict:
     cfg = s.cfgs.config
     p = s.planner
     tz = p.tz()
-    layout, _ = p.model()
+    m = p.mapping()
     end = time.time() * 1000
     start = end - days * 864e5
-    ex = s.store.export(tracked_entities(cfg.mapping), int(start - 864e5), int(end), s.collector.meta,
-                        {**p.location(), "tz": str(tz)})
-    g = build_grid(parse_rows(ex), layout, p.mapping(), min_hours=1)
-    base = g.phase_all if g.phase_all is not None else g.phase
-    if base is None or not np.isfinite(base).any():
+    # only the phases: read and reckoned on their own, not with the rooms and units (a month of minutes)
+    phase = m.get("phase") or ""
+    others = [e for e in m.get("phases_other") or [] if e and e != phase]
+    step = 5 * 60_000
+    t0 = math.ceil(start / step) * step
+    K = max(0, int((end - t0) // step))
+    t = t0 + step * np.arange(K, dtype=float)
+    dt_h = step / 3.6e6
+    parsed = parse_rows(s.store.export([e for e in [phase, *others] if e], int(start - 3.6e6), int(end), s.collector.meta, None))
+    base = power_kw(parsed, phase, t0, step, K)
+    if not np.isfinite(base).any():
         raise ValueError("no phase recorded: set the phase with the outdoor unit (and the other phases) in Settings")
-    house = base + (np.sum(g.others, axis=0) if g.others else 0.0)
+    house = base + (np.sum([power_kw(parsed, e, t0, step, K) for e in others], axis=0) if others else 0.0)
     ph = s.store.get("price_history") or {}
     prices = sorted((int(k), v[0], v[1]) for k, v in ph.items())
     starts = [a for a, _, _ in prices]
@@ -597,13 +633,13 @@ def compare_tariffs(s, days: int) -> dict:
         i = bisect.bisect_right(starts, t) - 1
         return prices[i][2] if i >= 0 and prices[i][0] <= t < prices[i][1] else math.nan
 
-    paid = np.array([paid_at(t + 1) for t in g.t])
-    ok = (g.t >= start) & np.isfinite(house) & np.isfinite(paid)  # the same steps for every tariff
+    paid = np.array([paid_at(x + 1) for x in t])
+    ok = np.isfinite(house) & np.isfinite(paid)  # the same steps for every tariff
     if not ok.any():
         raise ValueError("no time with every phase and the price recorded yet")
-    kwh = np.clip(house[ok], 0.0, None) * g.dt_h
-    local = [datetime.fromtimestamp(t / 1000, tz) for t in g.t[ok]]
-    covered = ok.sum() * g.dt_h / 24.0
+    kwh = np.clip(house[ok], 0.0, None) * dt_h
+    local = [datetime.fromtimestamp(x / 1000, tz) for x in t[ok]]
+    covered = ok.sum() * dt_h / 24.0
     month = 365.25 / 12
     total = float(kwh.sum())
     night = np.array([d.hour >= 22 or d.hour < 6 for d in local])
@@ -621,10 +657,10 @@ def compare_tariffs(s, days: int) -> dict:
         rows.append(row(tf.name, float(np.dot(kwh, pr)), tf.monthly_fee * covered / month))
     for r in rows:
         r["diff_month_eur"] = round(r["month_eur"] - rows[0]["month_eur"], 2)
-    unit_phase = float(np.nansum(np.clip(base[ok], 0.0, None)) * g.dt_h)
-    return {"days": round(covered, 1), "asked_days": days, "coverage": round(float(ok.sum() / max(1, (g.t >= start).sum())), 3),
+    unit_phase = float(np.nansum(np.clip(base[ok], 0.0, None)) * dt_h)
+    return {"days": round(covered, 1), "asked_days": days, "coverage": round(float(ok.sum() / max(1, K)), 3),
             "kwh": round(total, 1), "kwh_per_day": round(total / covered, 1), "night_share": round(float(kwh[night].sum() / total), 3) if total else None,
-            "outdoor_phase_kwh": round(unit_phase, 1), "phases": 1 + len(g.others or []), "tariffs": rows}
+            "outdoor_phase_kwh": round(unit_phase, 1), "phases": 1 + len(others), "tariffs": rows}
 
 
 def energy_days(s, days: int) -> list[dict]:

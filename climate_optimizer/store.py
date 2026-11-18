@@ -11,6 +11,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import numpy as np
+
 
 class Store:
     def __init__(self, path: Path | str):
@@ -47,8 +49,8 @@ class Store:
             r = self.db.execute("SELECT MIN(t) FROM rows WHERE eid = ?", (eid,)).fetchone()
         return r[0] if r and r[0] is not None else None
 
-    def rows(self, eid: str, start: int, end: int, before: bool = True) -> list[list]:
-        """Rows in [start, end), and the last one before start (the state at start)."""
+    def _raw(self, eid: str, start: int, end: int, before: bool) -> tuple[list, list]:
+        """Times and decoded data of the rows in [start, end), and of the last one before start."""
         with self.lock:
             out = []
             if before:
@@ -58,15 +60,40 @@ class Store:
                     out.append(r)
             out += self.db.execute("SELECT t, data FROM rows WHERE eid = ? AND t >= ? AND t < ? ORDER BY t",
                                    (eid, start, end)).fetchall()
-        return [[t] + json.loads(d) for t, d in out]
+        # all of them in one go: a month of minutes is some 40 000 rows an entity, read row by row ten times slower
+        return [t for t, _ in out], json.loads("[" + ",".join(d for _, d in out) + "]")
+
+    def rows(self, eid: str, start: int, end: int, before: bool = True) -> list[list]:
+        """Rows in [start, end), and the last one before start (the state at start)."""
+        ts, vals = self._raw(eid, start, end, before)
+        return [[t] + v for t, v in zip(ts, vals)]
+
+    def series(self, eid: str, start: int, end: int, before: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+        """A numeric sensor's rows as times (ms) and values (nan where none), without a list
+        per row; None when there are none, or a value is not a number."""
+        ts, vals = self._raw(eid, start, end, before)
+        if not ts:
+            return None
+        try:
+            v = np.array([d[0] if d else None for d in vals], dtype=float)
+        except (TypeError, ValueError):
+            return None
+        return np.array(ts, dtype=float), v
 
     def export(self, eids: list[str], start: int, end: int, meta: dict, location: dict | None) -> dict:
-        history = {}
+        """The rows in the export format; numeric sensors' as arrays under "series"."""
+        from .collector import kind_of
+
+        history, series = {}, {}
         for e in sorted(set(eids)):
+            if kind_of(e) == "numeric" and (s := self.series(e, start, end)) is not None:
+                series[e] = s
+                continue
             r = self.rows(e, start, end)
             if r:
                 history[e] = r
-        return {"meta": {e: meta.get(e, {}) for e in eids}, "location": location, "stats_5min": {}, "history": history}
+        return {"meta": {e: meta.get(e, {}) for e in eids}, "location": location, "stats_5min": {}, "history": history,
+                "series": series}
 
     def prune(self, before: int) -> None:
         with self.lock:

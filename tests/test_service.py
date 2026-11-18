@@ -875,3 +875,49 @@ def test_a_plan_under_way_shows(client):
         mpc.solve = real
     st = client.get("/api/status").json()["plan"]
     assert st["running"] is None and st["took_s"] is not None and p.waiting == 0
+
+
+def test_store_reads_numeric_sensors_as_arrays(tmp_path):
+    from climate_optimizer.model.dataset import parse_rows
+    from climate_optimizer.store import Store
+
+    st = Store(tmp_path / "s.db")
+    st.add_rows("sensor.temp", [[1_000_000_000_000 + k * 60_000, 20.0 + k / 10] for k in range(50)] + [[1_000_000_000_000 + 50 * 60_000, None]])
+    st.add_rows("sensor.odd", [[1_000_000_600_000, "unavailable"], [1_000_000_660_000, 3.0], [1_000_000_720_000, 4.0]])
+    st.add_rows("climate.x", [[1_000_000_000_000, "heat", 21.0, 20.5, "heating", "auto", None]])
+    a, b = 1_000_000_000_000 + 5 * 60_000, 1_000_000_000_000 + 60 * 60_000
+    ex = st.export(["sensor.temp", "sensor.odd", "climate.x"], a, b, {}, None)
+    assert set(ex["series"]) == {"sensor.temp"} and set(ex["history"]) == {"sensor.odd", "climate.x"}
+    t, v = ex["series"]["sensor.temp"]
+    assert t[0] == 1_000_000_000_000 + 4 * 60_000 and np.isnan(v[-1])  # the row before, and none as nan
+    # read as arrays or row by row, the same
+    rows = {"sensor.temp": st.rows("sensor.temp", a, b)}
+    p1 = parse_rows({**ex, "history": {**ex["history"]}})
+    p2 = parse_rows({"meta": {}, "history": {**ex["history"], **rows}})
+    for e in ("sensor.temp", "sensor.odd"):
+        assert np.array_equal(p1.num[e][0], p2.num[e][0]) and np.allclose(p1.num[e][1], p2.num[e][1], equal_nan=True)
+
+
+def test_slow_results_are_kept_a_while():
+    import asyncio
+
+    from climate_optimizer.app import Computed
+
+    import time as _t
+
+    calls = []
+
+    def work():
+        _t.sleep(0.05)
+        calls.append(1)
+        return len(calls)
+
+    async def go():
+        c = Computed(ttl_s=60)
+        a, b = await asyncio.gather(c.get("k", work), c.get("k", work))  # asked twice at once: worked out once
+        assert a == b == 1 and await c.get("k", work) == 1
+        assert await c.get("other", work) == 2
+        c.ttl = 0
+        assert await c.get("k", work) == 3
+
+    asyncio.run(go())

@@ -49,6 +49,21 @@ def _num(v) -> float:
     return x if np.isfinite(x) else float("nan")
 
 
+def _num_series(rows) -> tuple[np.ndarray, np.ndarray]:
+    """Times (ms) and values of [t, value, ...] rows, in time order; nan where a value is
+    not a number. All at once where every row is plainly numbers (a month of minutes)."""
+    try:
+        t = np.array([r[0] for r in rows], dtype=float)
+        v = np.array([r[1] for r in rows], dtype=float)  # None: nan; "21.5": 21.5; "unavailable": ValueError
+    except (TypeError, ValueError, IndexError):
+        pts = sorted((_ts(r[0]), _num(r[1])) for r in rows)
+        return np.array([x[0] for x in pts], dtype=float), np.array([x[1] for x in pts], dtype=float)
+    t = np.where(t > 1e11, t, t * 1000.0)  # seconds or milliseconds, as _ts
+    v[~np.isfinite(v)] = np.nan
+    o = np.argsort(t, kind="stable")
+    return t[o], v[o]
+
+
 @dataclass
 class Parsed:
     meta: dict
@@ -71,6 +86,15 @@ def parse_rows(export: dict) -> Parsed:
             pts.sort()
             p.num[eid] = (np.array([x[0] for x in pts]), np.array([x[1] for x in pts]))
             p.kind[eid] = "mean5"
+    for eid, (t, v) in (export.get("series") or {}).items():  # numeric sensors as arrays (from the store)
+        if eid in p.num:
+            continue
+        t, v = np.asarray(t, dtype=float), np.array(v, dtype=float)
+        v[~np.isfinite(v)] = np.nan
+        if np.isfinite(v).sum() > 1:
+            o = np.argsort(t, kind="stable")
+            p.num[eid] = (t[o], v[o])
+            p.kind[eid] = "state"
     for eid, rows in (export.get("history") or {}).items():
         dom = eid.split(".")[0]
         if dom == "climate":
@@ -95,9 +119,9 @@ def parse_rows(export: dict) -> Parsed:
             if pts:
                 p.binary[eid] = (np.array([x[0] for x in pts]), np.array([x[1] for x in pts]))
         elif eid not in p.num:
-            pts = sorted((_ts(r[0]), _num(r[1])) for r in rows)
-            if sum(np.isfinite(v) for _, v in pts) > 1:
-                p.num[eid] = (np.array([x[0] for x in pts]), np.array([x[1] for x in pts]))
+            t, v = _num_series(rows)
+            if np.isfinite(v).sum() > 1:
+                p.num[eid] = (t, v)
                 p.kind[eid] = "state"
     return p
 
@@ -232,6 +256,18 @@ class Grid:
         return (self.heater_kw[uid] > 0.05).astype(float)
 
 
+def power_kw(parsed: Parsed, eid: str, t0, step, K) -> np.ndarray:
+    """kW over each step, from an energy meter's readings or a power sensor's mean."""
+    if not eid or eid not in parsed.num:
+        return np.full(K, np.nan)
+    if is_counter(parsed.meta, eid):
+        pt, pv = parsed.num[eid]
+        unit = str((parsed.meta.get(eid) or {}).get("unit") or "kWh").lower()
+        return counter_power(pt, pv, t0, step, K, ENERGY_UNITS.get(unit, 1.0))
+    # a power sensor's last value holds a while (it reports on change), not through an outage
+    return resample(parsed, eid, t0, step, K, 30 * 60e3) * _unit_w(parsed.meta, eid)
+
+
 def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, start=None, end=None,
                min_hours: float = 24, stuck_h: float | None = 3.0) -> Grid:
     """mapping: {"zones": {zid: {"thermometer": eid, "windows": [eid]}},
@@ -289,15 +325,7 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
     hc, hs = np.cos(2 * np.pi * hours / 24), np.sin(2 * np.pi * hours / 24)
 
     def kw(eid):
-        """kW over each step, from an energy meter's readings or a power sensor's mean."""
-        if not eid or eid not in parsed.num:
-            return np.full(K, np.nan)
-        if is_counter(parsed.meta, eid):
-            pt, pv = parsed.num[eid]
-            unit = str((parsed.meta.get(eid) or {}).get("unit") or "kWh").lower()
-            return counter_power(pt, pv, t0, step, K, ENERGY_UNITS.get(unit, 1.0))
-        # a power sensor's last value holds a while (it reports on change), not through an outage
-        return resample(parsed, eid, t0, step, K, 30 * 60e3) * _unit_w(parsed.meta, eid)
+        return power_kw(parsed, eid, t0, step, K)
 
     units = mapping.get("units", {})
     ac_frac, heater_kw = {}, {}
