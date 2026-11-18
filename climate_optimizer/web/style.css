@@ -260,3 +260,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 .dot.pulse { animation: dotpulse 1.2s ease-in-out infinite; }
 @keyframes dotpulse { 50% { opacity: 0.25; } }
 @media (prefers-reduced-motion: reduce) { .dot.pulse { animation: none; } }
+.steps-sum { margin-top: 4px; grid-column: 1 / -1; }
+.steps-sum table { max-width: 640px; }
+.steps-sum td.num, .steps-sum th.num { white-space: nowrap; }
+.steps-sum td .hint { font-size: 12px; }

@@ -609,7 +609,7 @@ function drawPlanTook(h) {
     marks: P.map(p => p[4] ? 'ring' : hit(p) ? 'big' : null),
     labels: P.map(p => {
       const parts = p[3].map(x => `${what(x[0])} ${num(x[1], 1)} s${x[2] === 'optimal' ? '' : ' (' + x[2] + ')'}`);
-      return `${num(p[1], 1)} s${p[4] ? ' · failed: ' + p[4] : ''}${parts.length ? ' · ' + parts.join(', ') : ''}`;
+      return `${num(p[1], 1)} s${p[5] ? ` · ${p[5][0]} steps, ${p[5][1]} on/off` : ''}${p[4] ? ' · failed: ' + p[4] : ''}${parts.length ? ' · ' + parts.join(', ') : ''}`;
     }),
   });
   pp.line({ name: "Solver's limit per solve", color: css('--muted'), t: P.map(p => p[0]), y: P.map(p => p[2] ?? null), step: true, tEnd: g.x1, dash: true, width: 1, fmt: v => v.toFixed(0) });
@@ -1222,7 +1222,9 @@ const PLAN_GROUPS = () => [
     ['terminal_quantile', 'Value heat left at the end at this price quantile', 0.05, 'Heat still in the rooms where the plan ends is worth what electricity costs at this quantile of the plan’s prices (0.25: a cheap hour), so the plan neither empties the rooms towards its end nor stocks them up.'],
   ]],
   ['How exactly, and when', [
-    ['binary_h', 'On/off planned exactly for (h)', 0.05, 'For this long the plan decides each unit on or off at every step; after that, what share of each step it runs (a third, say), which the units do in pulses, so the plan shows the average and the room swings around it. Longer shows the pulses in the plan, but every plan takes longer, and only its first step is ever done: the next plan decides anew. 0.25 by default.'],
+    ['fine_h', '5-minute steps for (h)', 0.25, 'From now the plan goes in five-minute steps for this long, then in 15-minute steps, then in 30-minute steps to its end. Finer steps follow the prices and the rooms more closely, but each step is more for the solver to decide: the plans take longer. 2 by default.'],
+    ['mid_h', '15-minute steps up to (h)', 0.5, 'After the five-minute steps, 15-minute steps up to this many hours from now; after that, 30-minute steps to the end of the plan. 6 by default.'],
+    ['binary_h', 'On/off planned exactly for (h)', 0.05, 'For this long the plan decides each unit on or off at every step; after that, what share of each step it runs (a third, say), which the units do in pulses, so the plan shows the average and the room swings around it. Longer shows the pulses in the plan, but every plan takes longer, and only its first step is ever done: the next plan decides anew. Reaching past the five-minute steps, a unit runs a whole 15- or 30-minute step there or not at all. 0.25 by default.'],
     ['plan_lead_s', 'Start each plan before the 5-minute mark (s)', 5, `Each plan on the clock decides the step from the next five-minute mark and starts this long before it. 0: by itself, as long before as the slower plans of late took, half as much again and half a minute (1 to 4.5 minutes; now ${num(S.status?.plan_lead_s, 0)} s). Sooner, it decides on older readings; later, it may not be done in time.`],
     ['time_limit_s', 'Solver time limit (s)', 1, 'The most each solve may take; the best plan found by then is used, and the overview says "time limit". A plan solves several times (heating, maybe cooling, a check per unit whether to start now), so it can take a few times this long.'],
   ]],
@@ -1245,6 +1247,42 @@ const PLAN_GROUPS = () => [
     ['cool_above_outdoor', 'Cool only if warmer outside than (°C)', 0.5, 'With the season on auto: cooling is considered only when it gets warmer than this outside within a day.'],
   ]],
 ];
+
+// A plan's steps as the planner makes them (mpc.step_grid), for the next plan on the clock
+// (it starts its lead before the next 5-minute mark): where each starts (h from the plan's
+// start), and which are decided on or off rather than as a share.
+function planSteps(v, hours, t0 = Math.ceil(Date.now() / (5 * MIN)) * 5 * MIN - (S.status?.plan_lead_s || 150) * 1000) {
+  const M5 = 5 * MIN, end = t0 + hours * H;
+  const t = [t0, Math.ceil((t0 + MIN) / M5) * M5];
+  for (const [span, step] of [[v.fine_h, 5], [v.mid_h, 15], [null, 30]]) {
+    const g = step * MIN;
+    const lim = span === null ? Math.ceil(end / g) * g : Math.min(end, t0 + span * H);
+    while (t.at(-1) < lim) {
+      const nxt = Math.ceil((t.at(-1) + 1) / g) * g;
+      if (nxt > lim) break;
+      t.push(nxt);
+    }
+    if (t.at(-1) >= end) break;
+  }
+  return t.slice(0, -1).map(x => ({ h: (x - t0) / H, onoff: x - t0 < v.binary_h * H }));
+}
+function stepsSummary(v, last) {
+  const lo = Math.min(v.horizon_min_h, v.horizon_max_h), hi = v.horizon_max_h;
+  const row = hours => {
+    const st = planSteps(v, hours), on = st.filter(x => x.onoff).length;
+    const n5 = st.filter(x => x.h < v.fine_h).length, n15 = st.filter(x => x.h >= v.fine_h && x.h < v.mid_h).length;
+    return `<tr><td>${num(hours, 0)} h${hi > lo ? (hours === lo ? ' <span class="hint">(no later prices)</span>' : ' <span class="hint">(more known)</span>') : ''}</td>
+      <td class="num"><b>${st.length}</b></td><td class="num">${n5} / ${n15} / ${st.length - n5 - n15}</td><td class="num"><b>${on}</b></td><td class="num">${st.length - on}</td></tr>`;
+  };
+  const st = planSteps(v, hi), on = st.filter(x => x.onoff), coarse = on.filter(x => x.h >= v.fine_h).length;
+  let html = `<div class="table-wrap"><table class="steps-table"><tr><th>Next plan</th><th class="num">Steps</th><th class="num">5 / 15 / 30 min</th><th class="num">On/off</th><th class="num">As shares</th></tr>
+    ${row(lo)}${hi > lo ? row(hi) : ''}</table></div>`;
+  const notes = [];
+  if (coarse) notes.push(`${coarse} of the on/off steps are past the 5-minute steps: there a unit runs a whole step or not at all.`);
+  if (last) notes.push(`The last plan: ${last[0]} steps, ${last[1]} on/off.`);
+  if (notes.length) html += `<p class="hint">${notes.join(' ')}</p>`;
+  return html;
+}
 
 pages.settings = async () => {
   const root = $('#page-settings');
@@ -1356,6 +1394,7 @@ pages.settings = async () => {
   const st = C.settings;
   html += section('planning', `<div class="card">
     ${PLAN_GROUPS().map(([title, rows]) => group(title, `<div class="fields">${rows.map(([k, label, step, info]) => numIn(label, `settings.${k}`, step, info)).join('')}
+      ${title === 'How exactly, and when' ? '<div class="steps-sum" id="steps-sum" aria-live="polite"></div>' : ''}
       ${title === 'Heating or cooling' ? `<label class="field">${lab('Season', 'auto: heating or cooling as the coming day needs (see the two temperatures); heat or cool: only that.')}<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${st.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>` : ''}</div>`)).join('')}
     ${group('Corrections', `<label class="check"><input type="checkbox" data-path="settings.plan_correction" ${st.plan_correction !== false ? 'checked' : ''}> Correct the plans by what the model kept getting wrong</label>`, 'Every five minutes the model is run again over the last hour with what the units really did, and held against the thermometers; what it keeps missing a room by goes into the plans as heat the room gains or loses beyond the model. The Model page shows it per room.')}
   </div>`);
@@ -1381,6 +1420,18 @@ pages.settings = async () => {
     root.querySelectorAll('section.set-tab').forEach(sec => { sec.hidden = sec.dataset.tab !== b.dataset.tab; });
     b.scrollIntoView({ block: 'nearest', inline: 'center' });
   });
+  // how many steps a plan made now has, with the step settings as typed
+  const stepInputs = ['fine_h', 'mid_h', 'binary_h', 'horizon_min_h', 'horizon_max_h'];
+  const showSteps = () => {
+    const v = {};
+    for (const k of stepInputs) {
+      const x = parseFloat(root.querySelector(`[data-path="settings.${k}"]`)?.value);
+      v[k] = isFinite(x) ? x : st[k];
+    }
+    $('#steps-sum').innerHTML = stepsSummary(v, S.status?.plan?.steps);
+  };
+  stepInputs.forEach(k => root.querySelector(`[data-path="settings.${k}"]`)?.addEventListener('input', showSteps));
+  showSteps();
   const showSrc = () => root.querySelectorAll('[data-when-src]').forEach(el => { el.hidden = el.dataset.whenSrc !== $('#price-src').value; });
   $('#price-src').addEventListener('change', showSrc);
   showSrc();

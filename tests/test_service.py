@@ -86,8 +86,10 @@ def test_schedule_preview_and_history(client):
 def test_history_shows_how_long_plans_took(client):
     client.post("/api/plan")
     took = client.get("/api/history?hours=24").json()["plan_took"]
-    t, secs, limit, solves, failed = took[-1]
+    t, secs, limit, solves, failed, steps = took[-1]
     assert secs >= 0 and limit > 0 and failed is None
+    assert steps[0] > steps[1] >= 1  # every step, those of them on/off
+    assert client.get("/api/status").json()["plan"]["steps"] == steps
     assert solves and all(len(x) == 3 and x[1] >= 0 for x in solves)
     assert {x[0] for x in solves} & {"heat", "cool"}
 
@@ -850,7 +852,11 @@ def test_a_plan_under_way_shows(client):
     from climate_optimizer import mpc
 
     p = client.svc.planner
-    st = client.get("/api/status").json()["plan"]
+    for _ in range(600):  # the plan made on starting may still be under way
+        st = client.get("/api/status").json()["plan"]
+        if st["running"] is None:
+            break
+        _t.sleep(0.05)
     assert st["running"] is None and st["time_limit_s"] > 0
     real = mpc.solve
     gate = threading.Event()

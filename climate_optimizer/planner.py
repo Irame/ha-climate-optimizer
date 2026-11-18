@@ -1038,6 +1038,9 @@ class Planner:
             self.planning["stage"] = "building"
             pr, info = await asyncio.to_thread(self.build_problem, now, inputs, not fresh)
             took["limit"] = float(pr.settings.time_limit_s)
+            # how many steps, and how many of them decided on or off (the rest as shares)
+            took["steps"] = [int(pr.N), int(((pr.t[:-1] - pr.t[0]) < pr.settings.binary_h * 3.6e6).sum())]
+            info["steps"] = took["steps"]
             self.planning["stage"] = "solving"
             t_solve = time.time()
             plan = await asyncio.to_thread(mpc.solve, pr, solves)
