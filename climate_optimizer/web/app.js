@@ -231,7 +231,7 @@ pages.dashboard = async (redraw) => {
       <div class="stat"><div class="k">Starts</div><div class="v">${num(c.starts, 2)} €</div><div class="s">compressor wear</div></div>
       ${airTile(P, info)}
       ${todayTile(P)}
-      <div class="stat"><div class="k">Heat missing at the end</div><div class="v">${num(c.terminal, 2)} €</div><div class="s">solved in ${num(P.seconds, 1)} s · ${esc(P.status)}</div></div>
+      <div class="stat"><div class="k">Heat missing at the end</div><div class="v">${num(c.terminal, 2)} €</div><div class="s">planned in ${num(S.plan?.info?.solve_seconds ?? P.seconds, 1)} s · ${esc(P.status)}</div></div>
     </div>`;
   }
   html += `<div class="card"><div class="toolbar"><h3 style="margin:0">Next hours</h3><span class="spacer"></span><div class="chips" id="zone-chips"></div></div><div id="dash-chart"></div></div>`;
@@ -997,15 +997,14 @@ pages.model = async () => {
     for (const w of rep.warnings || []) html += `<div class="msg">${esc(w)}</div>`;
     if (rep.power_note) html += `<div class="msg">${esc(rep.power_note)}</div>`;
     if (m.kept) html += `<div class="msg">Planning with an earlier model, chosen ${ago(m.kept)}. Nightly training waits until you retrain by hand.</div>`;
-    const corr = S.status?.correction || {}, upl = S.status?.uplift || {};
-    html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th><th class="num">Model an hour on</th><th class="num">Correction</th><th class="num">Aim higher</th></tr>`;
+    const corr = S.status?.correction || {};
+    html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th><th class="num">Model an hour on</th><th class="num">Correction</th></tr>`;
     L.zones.forEach((z, i) => {
       const zs = rep.zones?.[z.id] || {}, c = corr[z.id];
       html += `<tr><td>${esc(z.name)}</td><td class="num">${num(rep.rmse_val?.[i], 2)} K</td><td class="num">${num(rep.bias_val?.[i], 2)} K</td><td class="num">${num(zs.C, 1)} kWh/K</td><td class="num">${num((zs.Hloss || 0) * 1000, 0)} W/K</td><td class="num">${num(zs.tau_h, 0)} h</td>
-        <td class="num">${c && c.miss !== undefined ? (c.miss > 0 ? '+' : '') + num(c.miss, 2) + ' K' : '–'}</td><td class="num">${c ? (c.kw > 0 ? '+' : '') + num(c.kw * 1000, 0) + ' W' : '–'}</td>
-        <td class="num" title="${upl[z.id] ? `from ${upl[z.id].n || 0} counted plans` : ''}">${upl[z.id] ? (upl[z.id].k > 0 ? '+' : '') + num(upl[z.id].k, 2) + ' K' : '–'}</td></tr>`;
+        <td class="num">${c && c.miss !== undefined ? (c.miss > 0 ? '+' : '') + num(c.miss, 2) + ' K' : '–'}</td><td class="num">${c ? (c.kw > 0 ? '+' : '') + num(c.kw * 1000, 0) + ' W' : '–'}</td></tr>`;
     });
-    html += `</table></div><p class="hint">Error: how far whole days predicted from midnight, from nothing but weather and what the units did, stayed from the thermometers. Model an hour on: run over the last hour from where each room was, with what the units really did and the weather as it was, how much warmer (+) than measured the model ends it, lately. Correction: the heat the plans add for it, beyond the model (minus: the room loses more than the model knows), taken up within a couple of hours and fading within a day once the misses stop (Settings). What was planned or decided meanwhile (a comfort temperature changed, a run, a rule) plays no part. Aim higher: where the plans held a room at the edge of its comfort, how far what was then done (the units starting later than planned, plan after plan) left it below what they planned, lately; the plans aim that much higher. Hours with something decided anew (a comfort temperature changed, an override, a run, a rule), a window open or a proxy not in auto do not count; changes by schedule do.</p></div>`;
+    html += `</table></div><p class="hint">Error: how far whole days predicted from midnight, from nothing but weather and what the units did, stayed from the thermometers. Model an hour on: run over the last hour from where each room was, with what the units really did and the weather as it was, how much warmer (+) than measured the model ends it, lately. Correction: the heat the plans add for it, beyond the model (minus: the room loses more than the model knows), taken up within a couple of hours and fading within a day once the misses stop (Settings). What was planned or decided meanwhile (a comfort temperature changed, a run, a rule) plays no part.</p></div>`;
     html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Heat per fan level</th></tr>`;
     for (const u of L.units) {
       const p = m.params.units[u.id] || {};
@@ -1145,7 +1144,7 @@ const SETTING_FIELDS = [
   ['window_assume_open_min', 'An open window closes after (min)', 1],
   ['window_open_after_min', 'An opened window counts once open (min)', 0.5],
   ['heat_below_outdoor', 'Heat only if colder outside than (°C)', 0.5], ['cool_above_outdoor', 'Cool only if warmer outside than (°C)', 0.5],
-  ['time_limit_s', 'Solver time limit (s)', 1], ['binary_h', 'On/off decided as such for (h)', 0.05],
+  ['time_limit_s', 'Solver time limit (s)', 1], ['binary_h', 'On/off planned exactly for (h); after that as shares of each step', 0.05],
 ];
 
 pages.settings = async () => {
@@ -1219,7 +1218,7 @@ pages.settings = async () => {
     <p class="hint">For the phases, the car and the heater an energy meter (kWh) is the better choice where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, where a power sensor's reports miss what happens between them. Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
   html += `<div class="card"><h3>Optimizer</h3><label class="check"><input type="checkbox" data-path="settings.plan_correction" ${C.settings.plan_correction !== false ? 'checked' : ''}> Correct the plans by their recent misses (an hour on, per room)</label><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
     <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
-    <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents (its electricity, the spike when it comes on, is learned with the model). Heaters have no compressor to spare: no cost to a start, and their own, short minimum run and pause. On/off is decided as such for the first quarter hour; after that the plan counts what share of each step a unit runs.</p></div>`;
+    <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents (its electricity, the spike when it comes on, is learned with the model). Heaters have no compressor to spare: no cost to a start, and their own, short minimum run and pause. On/off is planned exactly for the first quarter hour by default; after that the plan counts what share of each step a unit runs (a third, say), which the units do in pulses, so the plan shows the average and the room swings around it. Planning on/off exactly for longer shows the pulses in the plan, but every plan takes longer (the overview shows how long: "planned in … s"; it has to stay well under two minutes) and only its first step is ever done: the next plan, five minutes later, decides anew.</p></div>`;
   html += `<div class="card"><h3>Training</h3><div class="fields">
     <label class="field">Retrain every night at (hour)<input type="number" min="0" max="23" data-path="retrain_hour" value="${C.retrain_hour}"></label>
     <label class="field">History kept and trained on (days)<input type="number" min="3" max="365" data-path="history_days" value="${C.history_days}"></label></div>

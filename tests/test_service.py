@@ -809,24 +809,3 @@ def test_plans_are_corrected_by_their_misses(client):
     stale = p.update_correction(now + 60 * 60_000, layout, params, recent)  # readings an hour old: only fades
     assert zones["living"]["kw"] <= stale["living"]["kw"] < 0
     store.put("correction", {})
-
-
-
-def test_the_plan_aims_higher_where_the_doing_fell_short(client):
-    import time as _t
-
-    store = client.svc.store
-    try:
-        store.put("uplift", {"t": int(_t.time() * 1000), "zones": {}})
-        a = client.post("/api/plan").json()
-        store.put("uplift", {"t": int(_t.time() * 1000), "zones": {"living": {"k": 0.3, "n": 12}}})
-        b = client.post("/api/plan").json()
-        ca, cb = np.array(a["plan"]["comfort"]["living"], float), np.array(b["plan"]["comfort"]["living"], float)
-        assert np.nanmax(np.abs(cb - ca - 0.3)) < 1e-6
-        assert any("aims +0.3 K" in n for n in b["info"]["notes"])
-        learn = b["info"]["learn"]
-        assert learn["comfort"]["living"][0] == round(float(ca[0]), 2)  # kept as asked, not as aimed
-        assert learn["auto"]["living"] in (True, False) and len(learn["t"]) >= 12
-        assert store.plans(0, int(_t.time() * 1000) + 1)[-1]["learn"]["t"] == learn["t"]
-    finally:
-        store.put("uplift", {})

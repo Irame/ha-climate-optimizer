@@ -464,47 +464,6 @@ class Planner:
         self.store.put("correction", {"t": int(now_ms), "zones": zones})
         return zones
 
-    # ---- aiming a little higher where the doing falls short of the plan ----
-    UPLIFT_ALPHA = 0.03  # of each hour's gap taken in (a counted one every five minutes): over a few hours
-    UPLIFT_LEAK = 0.5 ** (5 / 1440)  # without counted hours, back towards nothing: half in a day
-    UPLIFT_RANGE = (-0.3, 0.8)  # K
-
-    def uplift(self) -> dict[str, float]:
-        return {z: float(c.get("k", 0.0)) for z, c in ((self.store.get("uplift") or {}).get("zones") or {}).items()}
-
-    def update_uplift(self, now_ms: float, layout: Layout, params: Params, recent: dict) -> dict[str, float]:
-        """The plan of an hour ago against what was then really done (correction.exec_gaps):
-        where the doing kept falling short of the planning, the plans aim that much higher.
-        Once every five minutes."""
-        from .model.correction import exec_gaps
-        cur = self.store.get("uplift") or {}
-        zones = dict(cur.get("zones") or {})
-        if now_ms - float(cur.get("t") or 0) < 4.5 * MIN:
-            return self.uplift()
-        gaps: dict[str, float] = {}
-        grid = recent.get("grid")
-        if grid is not None:
-            plans = [p for p in self.store.plans(int(now_ms - 66 * MIN), int(now_ms) + 1) if p.get("learn")]
-            near = [p for p in plans if abs(p["t"] - (now_ms - 60 * MIN)) <= 5 * MIN]
-            if near:
-                ref = min(near, key=lambda p: abs(p["t"] - (now_ms - 60 * MIN)))
-                gaps = exec_gaps(layout, params, grid, (recent["Tm"], recent["Tw"]), ref,
-                                 [p for p in plans if p["t"] > ref["t"]])
-        lo, hi = self.UPLIFT_RANGE
-        for z in set(zones) | set(gaps):
-            c = dict(zones.get(z) or {"k": 0.0, "n": 0})
-            g = gaps.get(z)
-            if g is None:
-                c["k"] = float(c.get("k", 0.0)) * self.UPLIFT_LEAK
-            else:
-                c["k"] = float(np.clip((1 - self.UPLIFT_ALPHA) * float(c.get("k", 0.0)) + self.UPLIFT_ALPHA * g, lo, hi))
-                c["gap"] = round(g, 3)
-                c["n"] = int(c.get("n", 0)) + 1
-            c["k"] = round(c["k"], 4)
-            zones[z] = c
-        self.store.put("uplift", {"t": int(now_ms), "zones": zones})
-        return {z: c["k"] for z, c in zones.items()}
-
     def build_problem(self, now_ms: float, inputs: dict, hold: bool = False) -> tuple[mpc.Problem, dict]:
         """hold: the step under way stays as the units run now (a plan on the clock); a plan
         someone asked for may change it at once."""
@@ -512,17 +471,12 @@ class Planner:
         layout, params = self.model()
         st = cfg.settings_obj()
         recent = self.recent(layout, params, now_ms)  # the state now, and what the model got wrong lately
-        corr, upl = {}, {}
+        corr = {}
         if st.plan_correction:
             try:
                 corr = self.update_correction(now_ms, layout, params, recent)
             except Exception:  # a correction that fails must not stop the plan
                 log.exception("plan correction")
-            try:
-                from .model.correction import with_correction
-                upl = self.update_uplift(now_ms, layout, with_correction(params, {z: c.get("kw", 0.0) for z, c in corr.items()}), recent)
-            except Exception:
-                log.exception("plan uplift")
             for z, c in corr.items():
                 if z in params.zones and abs(c.get("kw", 0.0)) > 1e-4:
                     params.zones[z]["q"] = params.zones[z].get("q", 0.0) + c["kw"]  # a copy: the model stays
@@ -734,31 +688,6 @@ class Planner:
                 info.setdefault("no_comfort", {})[z] = proxies[here[0]]["note"]
                 for uid in here:
                     proxies[uid]["comfort"] = None
-        # the plan aims a little higher where what is done keeps falling short of it (not over an override's target)
-        raw_comfort = {z: np.asarray(v, float).copy() for z, v in comfort.items()}
-        for z in comfort:
-            u_ = float(upl.get(z, 0.0))
-            if abs(u_) > 1e-3:
-                ov = np.array([str(f.id).startswith("override") for f in functions[z]])
-                comfort[z] = np.where(ov, comfort[z], comfort[z] + u_)
-                if abs(u_) >= 0.05:
-                    name = next((x.name for x in layout.zones if x.id == z), z)
-                    info["notes"].append(f"{name}: aims {u_:+.1f} K (lately the heating as done stayed that far "
-                                         f"{'below' if u_ > 0 else 'above'} the plans)")
-        info["uplift"] = {z: round(float(v), 3) for z, v in upl.items()}
-        # what the plans an hour on hold this one against (correction.exec_gaps)
-        kh = int(np.searchsorted(t, now_ms + 65 * MIN))
-        fin = lambda a: [None if not math.isfinite(float(v)) else round(float(v), 2) for v in a]
-        learn = {"t": [int(x) for x in t[:kh]], "comfort": {}, "edge": {}, "override": {}, "forced": {}, "auto": {}}
-        for z in comfort:
-            dead = np.array([f.below.deadband for f in functions[z][:kh]], float)
-            learn["comfort"][z] = fin(raw_comfort[z][:kh])
-            learn["edge"][z] = fin(np.asarray(comfort[z][:kh], float) - dead)
-            learn["override"][z] = any(str(f.id).startswith("override") for f in functions[z][:kh])
-            here = [x for x in units if x.zone == z]
-            learn["forced"][z] = any(x.forced is not None and bool(np.asarray(x.forced)[:kh].any()) for x in here)
-            learn["auto"][z] = bool(here) and all(x.id not in uncontrolled for x in here)
-        info["learn"] = learn
         airing = None
         if cfg.airing.enabled and layout.window_zones:
             airing, info["airing"] = self.airing_spec(now_ms, t, comfort, x0, layout, tz, events)
@@ -1072,7 +1001,9 @@ class Planner:
             try:
                 inputs = await self.fetch(now)
                 pr, info = await asyncio.to_thread(self.build_problem, now, inputs, not fresh)
+                t_solve = time.time()
                 plan = await asyncio.to_thread(mpc.solve, pr)
+                info["solve_seconds"] = round(time.time() - t_solve, 1)  # every solve of this plan, not only the chosen one
             except Exception as e:
                 log.exception("planning failed")
                 self.state.error = str(e)
@@ -1094,9 +1025,9 @@ class Planner:
                 "mode": plan.mode, "cost": plan.cost, "times": [int(x) for x in plan.t[:k1 + 1]],
                 "temp": {z: [round(float(v), 2) for v in a[:k1 + 1]] for z, a in plan.temp.items()},
                 "on": {u: bool(a[0]) for u, a in plan.on.items()},
-                "learn": info.get("learn"),
             })
-            log.info("plan: %s, %.2f € over %.0f h, %.1f s", plan.mode, plan.cost["total"], (plan.t[-1] - plan.t[0]) / 3.6e6, plan.seconds)
+            log.info("plan: %s, %.2f € over %.0f h, %.1f s (%s)", plan.mode, plan.cost["total"], (plan.t[-1] - plan.t[0]) / 3.6e6,
+                     info.get("solve_seconds", plan.seconds), plan.status)
 
     # ---- overrides ----
     def _levels_now(self, uid: str, unit, k: int | None) -> tuple[int, int]:
