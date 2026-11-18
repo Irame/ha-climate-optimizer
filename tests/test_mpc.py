@@ -479,3 +479,16 @@ def test_each_solve_is_logged():
     except RuntimeError:
         pass
     assert any(x[2].startswith("time limit") for x in log2), log2
+
+
+def test_a_start_is_weighed_at_the_end_of_the_on_off_steps():
+    """Weighed against a start just after the on/off steps: a minimum run at their end, not
+    one through all of them (with them two hours long, that was never the cheaper)."""
+    t0 = ms(2026, 1, 14, 13, 2, 30)
+    pr = problem(lambda h: 0.3, t0=t0)
+    nf, ks = mpc.start_window(pr)
+    assert ks == 0 and nf == 4  # a quarter of an hour: a start now, as ever
+    pr = problem(lambda h: 0.3, t0=t0, settings=dataclasses.replace(mpc.Settings(), binary_h=2.0))
+    nf, ks = mpc.start_window(pr)
+    end = (pr.t[nf] - pr.t[0]) / MIN
+    assert (end - (pr.t[ks] - pr.t[0]) / MIN) == 15.0  # the last 15 minutes (the minimum run)

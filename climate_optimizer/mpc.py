@@ -795,29 +795,48 @@ def _forced_at(u: UnitSpec, k: int) -> bool:
     return u.forced is not None and float(np.asarray(u.forced)[k]) > 0
 
 
-def start_now_or_later(pr: Problem, plan: Plan, obj: float) -> Plan:
-    """A plan that has a unit off now but on right after the on/off steps may only be putting
-    off a start: after them a step is a share, and a start there is counted by its share, so
-    a start a little later always looks cheaper than one now, plan after plan. Weigh starting
-    now, with the later start counted whole, and take the cheaper."""
+def start_window(pr: Problem) -> tuple[int, int]:
+    """The on/off steps (how many), and the step from which a start counted whole is weighed:
+    the latest from which a minimum run still fits in them (now, when they are hardly longer
+    than one: with the default quarter of an hour, a start now)."""
     s = pr.settings
     fine = (pr.t[:-1] - pr.t[0]) < s.binary_h * 3.6e6
     nf = int(fine.sum())
+    if nf == 0 or nf >= pr.N:
+        return nf, 0
+    starts = (pr.t[:-1] - pr.t[0]) / MIN
+    end = (pr.t[nf] - pr.t[0]) / MIN  # where the on/off steps end
+    fits = np.flatnonzero(fine & (end - starts >= s.min_run_min - 1e-9))
+    ks = int(fits[-1]) if len(fits) else 0
+    return nf, (0 if starts[ks] < 5 else ks)
+
+
+def start_now_or_later(pr: Problem, plan: Plan, obj: float) -> Plan:
+    """A plan that has a unit off through the on/off steps but on right after them may only be
+    putting off a start: after them a step is a share, and a start there is counted by its share,
+    so a start a little later always looks cheaper than one within them, plan after plan. Weigh
+    a start within them, a minimum run at their end (with the default quarter of an hour: now),
+    counted whole, and take the cheaper."""
+    s = pr.settings
+    nf, ks = start_window(pr)
+    fine = np.arange(pr.N) < nf
     soon = (pr.t[:-1] - pr.t[0]) < s.binary_h * 3.6e6 + 15 * MIN
+    starts = (pr.t[:-1] - pr.t[0]) / MIN
     e_start = pr.sys.params.plant.get("Estart", 0.0)
     for u in pr.units:
         sh = plan.share[u.id]
-        if u.kind != "ac" or u.forced is not None or sh[:nf].max() > 0.5 or nf >= pr.N:
+        if u.kind != "ac" or u.forced is not None or nf == 0 or sh[:nf].max() > 0.5 or nf >= pr.N:
             continue
         later = [k for k in np.flatnonzero(soon & ~fine) if sh[k] > 0.05]
         if not later or sh[later[0]] > 0.99:
             continue
         allowed = np.ones(pr.N, bool) if u.allowed is None else np.asarray(u.allowed, bool)
-        if not allowed[:nf].all() or (not u.on and u.since_min < s.min_off_min) or plan.mode not in u.modes:
+        if not allowed[ks:nf].all() or (not u.on and starts[ks] < s.min_off_min - u.since_min) or plan.mode not in u.modes:
             continue
         k = later[0]
         discount = (1.0 - sh[k]) * (s.start_cost + e_start * float(pr.price[k]))  # the part of the start not counted
-        f = np.where(fine, 1.0, 0.0)
+        f = np.zeros(pr.N)
+        f[ks:nf] = 1.0
         if u.hold:
             f[0] = 0.0  # the step under way stays as it is: from the next
         now = dataclasses.replace(u, forced=f)
