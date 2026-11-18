@@ -105,6 +105,9 @@ class Panel {
     g.container.insertBefore(this.wrap, g.tip);
   }
   line(s) { this.series.push(s); return this; }     // {name, color, t, y, step, dash, width}
+  // points, not a line: {name, color, t, y, colors, marks ('big' | 'ring' per point), labels (tooltip text per point)}
+  dots(s) { this.series.push({ ...s, dots: true }); return this; }
+  legendItem(name, color) { this.series.push({ name, color, t: [], y: [], legendOnly: true }); return this; }
   band(b) { this.bands.push(b); return this; }      // {t, lo, hi, color} (step-wise)
   gantt(rows) { this.rows = rows; return this; }    // [{name, color, spans:[{t0,t1,v,label}]}]
 
@@ -120,7 +123,7 @@ class Panel {
     if (!this.rows) {
       let lo = Infinity, hi = -Infinity;
       const see = v => { if (v !== null && isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); } };
-      for (const s of this.series) if (!s.tipOnly) s.t.forEach((t, i) => { if (t >= g.x0 && t <= g.x1) see(s.y[i]); });
+      for (const s of this.series) if (!s.tipOnly && !s.legendOnly) s.t.forEach((t, i) => { if (t >= g.x0 && t <= g.x1) see(s.y[i]); });
       for (const b of this.bands) b.t.forEach((t, i) => { if (t >= g.x0 && t <= g.x1) { see(b.lo[i]); see(b.hi[i]); } });
       if (!isFinite(lo)) { lo = 0; hi = 1; }
       if (this.yMin !== undefined) lo = Math.min(lo, this.yMin);
@@ -149,7 +152,7 @@ class Panel {
     }
     if (this.rows) this._drawRows(svg, top);
     for (const b of this.bands) this._drawBand(svg, b);
-    for (const s of this.series) if (!s.tipOnly) this._drawLine(svg, s);
+    for (const s of this.series) if (!s.tipOnly && !s.legendOnly) (s.dots ? this._drawDots(svg, s) : this._drawLine(svg, s));
     if (g.now > g.x0 && g.now < g.x1) {
       el('line', { x1: g.x(g.now), x2: g.x(g.now), y1: top, y2: plotB, class: 'now' }, svg);
     }
@@ -211,6 +214,18 @@ class Panel {
     }
     el('path', { d: this._path(s), class: 'series', stroke: s.color, 'stroke-width': s.width || 2,
       'stroke-dasharray': s.dash ? '5 4' : null, opacity: s.opacity }, svg);
+  }
+  _drawDots(svg, s) {
+    const g = this.g;
+    s.t.forEach((t, i) => {
+      const v = s.y[i];
+      if (t < g.x0 || t > g.x1 || v === null || v === undefined || !isFinite(v)) return;
+      const c = s.colors?.[i] || s.color, m = s.marks?.[i];
+      const at = { cx: g.x(t).toFixed(1), cy: this.y(v).toFixed(1) };
+      if (m === 'ring') el('circle', { ...at, r: 4.5, fill: 'none', stroke: c, 'stroke-width': 2 }, svg);
+      else if (m === 'big') el('circle', { ...at, r: 4.5, fill: c, stroke: 'var(--surface)', 'stroke-width': 1 }, svg);
+      else el('circle', { ...at, r: 2.4, fill: c, opacity: 0.75 }, svg);
+    });
   }
   _drawBand(svg, b) {
     const g = this.g;
@@ -274,9 +289,14 @@ class Panel {
       return out;
     }
     for (const s of this.series) {
-      if (!s.name || s.noTip) continue;
+      if (!s.name || s.noTip || s.legendOnly) continue;
       const i = idxAt(s.t, t, s.step);
       if (i === null) continue;
+      if (s.dots) {
+        if (Math.abs(s.t[i] - t) > (s.near || 6e5)) continue;  // only a point near the pointer
+        out.push({ name: s.name, color: s.colors?.[i] || s.color, text: s.labels?.[i] ?? (s.fmt || this.fmt)(s.y[i]) });
+        continue;
+      }
       if (!s.step && (t < s.t[0] || t > s.t[s.t.length - 1])) continue;
       if (s.step && s.tEnd && t > s.tEnd) continue;
       const v = s.y[i];

@@ -540,6 +540,7 @@ pages.history = async (redraw) => {
     <div class="chips" id="hist-zones"></div></div>
     ${h.error ? `<div class="msg err">${esc(h.error)}</div>` : ''}
     <div class="card"><div id="hist-chart"></div></div>
+    <div class="card"><h3>How long the plans took</h3><div id="took-chart"></div></div>
     <div class="card"><h3>Energy and cost</h3><div id="hist-sum"></div></div>
     <div class="card"><h3>Electricity per day: expected and measured</h3><div id="energy-days"><p class="hint">Loading…</p></div></div>
     <div class="card"><div class="toolbar"><h3 style="margin:0">Tariffs compared</h3><span class="spacer"></span><div class="chips" id="tariff-days">${[14, 30, 60].map(x => `<button class="chip ${(S.tariffDays || 30) === x ? 'active' : ''}" data-d="${x}">${x} days</button>`).join('')}</div></div><div id="tariffs"><p class="hint">Loading…</p></div></div>`;
@@ -548,6 +549,7 @@ pages.history = async (redraw) => {
   api('energy/days?days=14').then(drawEnergyDays).catch(e => { const b = $('#energy-days'); if (b) b.innerHTML = `<p class="hint">${esc(e.message)}</p>`; });
   root.querySelectorAll('#tariff-days button').forEach(b => b.onclick = () => { S.tariffDays = +b.dataset.d; root.querySelectorAll('#tariff-days button').forEach(x => x.classList.toggle('active', x === b)); drawTariffs(); });
   drawTariffs();
+  drawPlanTook(h);
   if (!h.t) { $('#hist-sum').innerHTML = '<p class="hint">Nothing recorded for this time yet.</p>'; return; }
   const g = new ChartGroup($('#hist-chart'), { x0: h.start, x1: h.end, now: h.end, tz: S.tz });
   const zones = S.config.layout.zones.filter(z => S.zoneSel === 'all' || z.id === S.zoneSel);
@@ -583,6 +585,39 @@ pages.history = async (redraw) => {
     <div class="stat"><div class="k">Heaters</div><div class="v">${num(heaterKwh, 1)} kWh</div><div class="s">from their plugs</div></div>
   </div>`;
 };
+
+// How long each plan took, all in: a dot per plan, big where a solve ran into the solver's
+// limit (it took what it had found by then), a ring where no plan came of it.
+function drawPlanTook(h) {
+  const box = $('#took-chart');
+  const P = (h.plan_took || []).filter(p => p[0] >= h.start);
+  if (!P.length) { box.innerHTML = '<p class="hint">No plan recorded how long it took in this time yet (they do from this version on).</p>'; return; }
+  const g = new ChartGroup(box, { x0: h.start, x1: h.end, now: h.end, tz: S.tz });
+  const unitName = id => S.config.layout.units.find(u => u.id === id)?.name || id;
+  const what = w => w.startsWith('start ') ? 'start ' + unitName(w.slice(6)) + ' now' : w;
+  const hit = p => p[3].some(x => String(x[2]).startsWith('time limit'));
+  const bad = css('--critical'), ok = css('--accent');
+  const secs = P.map(p => p[1]).sort((a, b) => a - b);
+  const q = f => secs[Math.min(secs.length - 1, Math.floor(f * secs.length))];
+  const nHit = P.filter(hit).length, nFail = P.filter(p => p[4]).length;
+  const title = `Seconds per plan: median ${num(q(0.5), 1)} s, 95 % within ${num(q(0.95), 1)} s, slowest ${num(secs.at(-1), 1)} s`
+    + ` · ${nHit ? `${nHit} of ${P.length} ran into the solver's limit` : `none of ${P.length} ran into the solver's limit`}${nFail ? ` · ${nFail} failed` : ''}`;
+  const pp = g.add({ title, unit: 's', height: 130, yMin: 0, fmt: v => v.toFixed(0) });
+  pp.dots({
+    name: 'Plan', color: ok, t: P.map(p => p[0]), y: P.map(p => p[1]),
+    colors: P.map(p => hit(p) || p[4] ? bad : ok),
+    marks: P.map(p => p[4] ? 'ring' : hit(p) ? 'big' : null),
+    labels: P.map(p => {
+      const parts = p[3].map(x => `${what(x[0])} ${num(x[1], 1)} s${x[2] === 'optimal' ? '' : ' (' + x[2] + ')'}`);
+      return `${num(p[1], 1)} s${p[4] ? ' · failed: ' + p[4] : ''}${parts.length ? ' · ' + parts.join(', ') : ''}`;
+    }),
+  });
+  pp.line({ name: "Solver's limit per solve", color: css('--muted'), t: P.map(p => p[0]), y: P.map(p => p[2] ?? null), step: true, tEnd: g.x1, dash: true, width: 1, fmt: v => v.toFixed(0) });
+  pp.legendItem('Ran into the limit (bigger)', bad);
+  if (nFail) pp.legendItem('No plan came of it (ring)', bad);
+  pp.draw();
+  box.insertAdjacentHTML('beforeend', `<p class="hint">Each dot is a plan, from fetching prices and forecast to the last solve. A plan solves a few times (heating, cooling, starting a unit now rather than later, the airing's cost); the solver's limit holds for each solve, so a plan can take longer than the limit without any of them running into it. One that does plans with what it had found by then, which may be a worse plan. Hover or tap a dot for its solves.</p>`);
+}
 
 // Per day: what the day's first plan expected the units to draw, against what they drew, over
 // the same hours; the bars side by side, the numbers beside them (a table, readable without color).

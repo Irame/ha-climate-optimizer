@@ -32,6 +32,7 @@ import math
 import os
 import sys
 import threading
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -367,11 +368,15 @@ def _quiet_stdout():
             os.close(saved)
 
 
+_solves = threading.local()  # the solves of the plan under way in this thread: [what, seconds, status]
+
+
 def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = None,
-               relax_airing: bool = False) -> tuple[Plan | None, float]:
+               relax_airing: bool = False, what: str | None = None) -> tuple[Plan | None, float]:
     """One MILP with the AC units in `mode`. Returns the plan and its objective.
     fix_on: the on/off of the first steps, as given (to compare plans that differ
-    in something else); relax_airing: airing candidates as shares, an LP for them."""
+    in something else); relax_airing: airing candidates as shares, an LP for them;
+    what: what this solve is for, in the plan's list of solves (the mode by default)."""
     t_start = time.time()
     s = pr.settings
     sys = pr.sys
@@ -645,6 +650,10 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
                    constraints=LinearConstraint(A, np.array(R.lo), np.array(R.hi)),
                    options={"time_limit": s.time_limit_s, "mip_rel_gap": s.mip_gap, "disp": False})
     seconds = time.time() - t_start
+    status = {0: "optimal", 1: "time limit"}.get(res.status, res.message)
+    log = getattr(_solves, "log", None)
+    if log is not None:
+        log.append([what or mode, round(seconds, 2), status if res.x is not None else f"{status}, nothing found"])
     if res.x is None:
         return None, math.inf
     x = res.x
@@ -679,7 +688,6 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
         starts_cost += float(np.dot(np.clip(x[ostart], 0.0, 1.0), lag_kwh * pr.price))
     comfort_cost = float(np.dot(x[seg_vars], np.array(V.c)[seg_vars])) if seg_vars else 0.0
     term_cost = float(np.dot(x[term_vars], np.array(V.c)[term_vars])) if term_vars else 0.0
-    status = {0: "optimal", 1: "time limit"}.get(res.status, res.message)
     plan = Plan(
         mode=mode, t=pr.t, on=on, share=share, heat=heat,
         temp={z: temps[:, i] for i, z in enumerate(zid)},
@@ -749,12 +757,24 @@ def airing_cost(pr: Problem, plan: Plan) -> float | None:
     so no solver tolerance gets into the difference."""
     n = len(plan.airing)
     only = dataclasses.replace(pr.airing, cand=list(plan.airing), groups=[(list(range(n)), n)])
-    _, w = solve_mode(dataclasses.replace(pr, airing=only), plan.mode, fix_on=plan.share)
-    _, wo = solve_mode(dataclasses.replace(pr, airing=None), plan.mode, fix_on=plan.share)
+    _, w = solve_mode(dataclasses.replace(pr, airing=only), plan.mode, fix_on=plan.share, what="airing")
+    _, wo = solve_mode(dataclasses.replace(pr, airing=None), plan.mode, fix_on=plan.share, what="airing")
     return w - wo if math.isfinite(w) and math.isfinite(wo) else None
 
 
-def solve(pr: Problem) -> Plan:
+def solve(pr: Problem, log: list | None = None) -> Plan:
+    """The cheapest plan over the modes that may run. log: each solve it took is added
+    to it, [what for, seconds, status] (also when no plan comes of them)."""
+    if log is None:
+        return _solve(pr)
+    _solves.log = log
+    try:
+        return _solve(pr)
+    finally:
+        _solves.log = None
+
+
+def _solve(pr: Problem) -> Plan:
     best, best_obj, objs = None, math.inf, {}
     for mode in candidate_modes(pr):
         plan, obj = solve_mode(pr, mode)
@@ -762,7 +782,7 @@ def solve(pr: Problem) -> Plan:
         if plan is not None and obj < best_obj:
             best, best_obj = plan, obj
     if best is None and pr.airing is not None:  # airing as asked does not fit: plan without
-        return solve(dataclasses.replace(pr, airing=None))
+        return _solve(dataclasses.replace(pr, airing=None))
     if best is None:
         raise RuntimeError("no feasible plan")
     best.alternatives = {m: o for m, o in objs.items() if m != best.mode}
@@ -803,7 +823,7 @@ def start_now_or_later(pr: Problem, plan: Plan, obj: float) -> Plan:
             f[0] = 0.0  # the step under way stays as it is: from the next
         now = dataclasses.replace(u, forced=f)
         alt = dataclasses.replace(pr, units=[now if x.id == u.id else x for x in pr.units])
-        p2, o2 = solve_mode(alt, plan.mode)
+        p2, o2 = solve_mode(alt, plan.mode, what=f"start {u.id}")
         if p2 is not None and o2 < obj + discount:
             p2.alternatives = plan.alternatives
             plan, obj = p2, o2

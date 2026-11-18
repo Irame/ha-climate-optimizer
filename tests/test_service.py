@@ -83,6 +83,15 @@ def test_schedule_preview_and_history(client):
     assert h["prices"]
 
 
+def test_history_shows_how_long_plans_took(client):
+    client.post("/api/plan")
+    took = client.get("/api/history?hours=24").json()["plan_took"]
+    t, secs, limit, solves, failed = took[-1]
+    assert secs >= 0 and limit > 0 and failed is None
+    assert solves and all(len(x) == 3 and x[1] >= 0 for x in solves)
+    assert {x[0] for x in solves} & {"heat", "cool"}
+
+
 def test_ui_is_served(client):
     assert "Climate optimizer" in client.get("/").text
     r = client.get("/static/app.js")
@@ -846,9 +855,9 @@ def test_a_plan_under_way_shows(client):
     real = mpc.solve
     gate = threading.Event()
 
-    def slow(pr):
+    def slow(pr, *a):
         gate.wait(10)
-        return real(pr)
+        return real(pr, *a)
 
     mpc.solve = slow
     try:

@@ -327,7 +327,10 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         out["decisions"] = s.store.decisions(start, now + 1)
         # what the plans predicted an hour ahead, against what came
         pred: dict = {}
+        took: list = []  # how long each plan took: [t, seconds, solver limit, [[what, s, status], ...], failed]
         for rec in s.store.plans(start - 3_600_000, now):
+            if rec["t"] >= start and isinstance(rec.get("seconds"), (int, float)):
+                took.append([rec["t"], rec["seconds"], rec.get("limit"), rec.get("solves") or [], rec.get("failed")])
             times = rec.get("times")
             if not isinstance(times, list) or len(times) < 2:
                 continue
@@ -337,6 +340,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
             for z, a in (rec.get("temp") or {}).items():
                 pred.setdefault(z, []).append([times[k], a[k]])
         out["predicted_1h"] = pred
+        out["plan_took"] = took
         return _json(out)
 
     @app.post("/api/airing/skip", dependencies=[Depends(auth)])

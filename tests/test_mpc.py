@@ -458,3 +458,24 @@ def test_a_tariff_time_from_midnight_to_midnight_is_the_whole_day():
     cfg = PriceConfig.model_validate({"fixed_price": 0.3, "fixed_periods": [{"start": "00:00", "end": "00:00", "price": 0.2, "days": ["sa"]}]})
     assert fixed_price_at(cfg, datetime(2026, 11, 14, 13, 0, tzinfo=tz)) == 0.2
     assert fixed_price_at(cfg, datetime(2026, 11, 15, 13, 0, tzinfo=tz)) == 0.3
+
+
+def test_each_solve_is_logged():
+    import dataclasses
+
+    pr = problem(lambda h: 0.3, Ta=(19.0, 17.0, 19.0, 21.0, 19.0))
+    log = []
+    mpc.solve(pr, log)
+    assert log and all(x[2] == "optimal" and x[1] >= 0 for x in log)
+    assert {x[0] for x in log} & {"heat", "cool"}
+    n = len(log)
+    mpc.solve(pr)
+    assert len(log) == n  # a solve without a log adds nothing to an earlier one
+    # a solve stopped by the limit says so
+    tight = dataclasses.replace(pr, settings=dataclasses.replace(pr.settings, time_limit_s=1e-4))
+    log2 = []
+    try:
+        mpc.solve(tight, log2)
+    except RuntimeError:
+        pass
+    assert any(x[2].startswith("time limit") for x in log2), log2

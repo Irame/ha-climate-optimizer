@@ -1031,19 +1031,24 @@ class Planner:
         now = time.time() * 1000
         t_begin = time.time()
         self.planning = {"since": int(now), "stage": "fetching", "asked": fresh}
+        solves: list = []  # [what for, seconds, status] of each solve
+        took = {"limit": float(self.cfg.settings_obj().time_limit_s), "solves": solves}  # how long it took, kept with the plan
         try:
             inputs = await self.fetch(now)
             self.planning["stage"] = "building"
             pr, info = await asyncio.to_thread(self.build_problem, now, inputs, not fresh)
+            took["limit"] = float(pr.settings.time_limit_s)
             self.planning["stage"] = "solving"
             t_solve = time.time()
-            plan = await asyncio.to_thread(mpc.solve, pr)
+            plan = await asyncio.to_thread(mpc.solve, pr, solves)
             info["solve_seconds"] = round(time.time() - t_solve, 1)  # every solve of this plan, not only the chosen one
             info["plan_seconds"] = round(time.time() - t_begin, 1)  # and fetching and building it
+            info["solves"] = solves
             self._plan_took.append(info["plan_seconds"])
         except Exception as e:
             log.exception("planning failed")
             self.state.error = str(e)
+            self.store.add_plan(int(now), {"failed": str(e)[:300], "seconds": round(time.time() - t_begin, 1), **took})
             return
         info["forecast"] = {"t": inputs["forecast"]["t"].tolist(), "temp": inputs["forecast"]["temp"].tolist(),
                             "cloud": inputs["forecast"]["cloud"].tolist()}
@@ -1062,6 +1067,7 @@ class Planner:
             "mode": plan.mode, "cost": plan.cost, "times": [int(x) for x in plan.t[:k1 + 1]],
             "temp": {z: [round(float(v), 2) for v in a[:k1 + 1]] for z, a in plan.temp.items()},
             "on": {u: bool(a[0]) for u, a in plan.on.items()},
+            "seconds": info["plan_seconds"], **took,
         })
         log.info("plan: %s, %.2f € over %.0f h, %.1f s (%s)", plan.mode, plan.cost["total"], (plan.t[-1] - plan.t[0]) / 3.6e6,
                  info.get("solve_seconds", plan.seconds), plan.status)
