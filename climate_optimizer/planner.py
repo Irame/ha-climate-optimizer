@@ -402,71 +402,108 @@ class Planner:
     # ---- correcting the plans by their misses ----
     CORR_LIMIT_KW = 0.5  # no more than this either way, per room
     CORR_LIMIT_K = 0.6  # nor more than moves the room this much in an hour
-    CORR_GAIN = 0.03  # of the miss taken up per update (every 5 minutes): most of it within a few hours, calmly
-    # (the miss shows only an hour after a correction: a quicker one would swing)
+    CORR_GAIN = 0.05  # of the miss taken up per update (every 5 minutes): most of it within a couple of hours
     CORR_LEAK = 0.5 ** (5 / 1440)  # and back towards nothing, half in a day, when the misses stop
 
     def correction(self) -> dict:
         return (self.store.get("correction") or {}).get("zones") or {}
 
-    def _hour_response(self, layout: Layout, params: Params, z: str) -> float:
-        """How much warmer a room's air is after an hour of 1 kW more into it (K)."""
-        p = Params.from_dict(json.loads(json.dumps(params.to_dict())))
-        for zz in p.zones:
-            p.zones[zz].update(q=1.0 if zz == z else 0.0, qc=0.0, qs=0.0)
-        sysm = build(layout, p)
-        Ad, Bd = sysm.discretize(5 / 60)
-        u = np.zeros(Bd.shape[1])
-        u[len(layout.units) + DIST.index("one")] = 1.0
-        x = np.zeros(Ad.shape[0])
-        for _ in range(12):
-            x = Ad @ x + Bd @ u
-        return float(x[layout.zone_index(z)])
+    def recent(self, layout: Layout, params: Params, now_ms: float) -> dict:
+        """The last days on the five-minute grid, with surfaces and structure estimated
+        from them: for the state now, and for what the model got wrong lately."""
+        from .collector import tracked_entities
+        cfg = self.cfg
+        ents = tracked_entities(cfg.mapping)
+        ex = self.store.export(ents, int(now_ms - 4 * 864e5), int(now_ms), self.collector.meta,
+                               {**self.location(), "tz": str(self.tz())})
+        try:
+            grid = build_grid(parse_rows(ex), layout, self.mapping(), min_hours=6)
+        except ValueError as e:
+            return {"grid": None, "how": str(e)}
+        Tm, Tw = estimate_hidden(build(layout, params), grid.T, grid.tout, grid.sol, grid.dt_h)
+        return {"grid": grid, "Tm": Tm, "Tw": Tw, "how": f"from {grid.K} steps"}
 
-    def update_correction(self, now_ms: float, layout: Layout, params: Params) -> dict:
-        """Each room's plans, an hour on, against what the thermometer says now: what they
-        kept missing by is put into the plan as heat the room gains or loses beyond what
-        the model knows (it cools faster than the model thinks, say). Once every five minutes;
-        not while windows are or were just open (that miss is the window's)."""
+    def hidden_state(self, layout: Layout, params: Params, now_ms: float) -> tuple[np.ndarray, np.ndarray, str]:
+        """Surfaces and structure from the last days of air temperatures."""
+        r = self.recent(layout, params, now_ms)
+        if r.get("grid") is None:
+            return None, None, r["how"]
+        return r["Tm"][-1], r["Tw"][-1], r["how"]
+
+    def update_correction(self, now_ms: float, layout: Layout, params: Params, recent: dict) -> dict:
+        """The model run again over the last hour, with what the units really did, against
+        what the thermometers say now (correction.hour_misses): what it keeps missing a room
+        by goes into the plans as heat that room gains or loses beyond the model. Once every
+        five minutes; not over an hour with a window open, nor on readings older than a while."""
+        from .model.correction import hour_misses, hour_response, step, with_correction
         cur = self.store.get("correction") or {}
         zones = dict(cur.get("zones") or {})
         if now_ms - float(cur.get("t") or 0) < 4.5 * MIN:
             return zones
-        zmap = self.cfg.mapping.get("zones") or {}
-        recent_window = any(
-            (s := self.collector.states.get(w) or {}).get("state") == "on" or now_ms - self._changed_ms(s) < 60 * MIN
-            for z in layout.window_zones for w in (zmap.get(z) or {}).get("windows") or [])
-        old = self.store.plans(int(now_ms - 65 * MIN), int(now_ms - 55 * MIN))
-        ref = min(old, key=lambda r: abs(r["t"] - (now_ms - 60 * MIN))) if old else None
+        grid = recent.get("grid")
+        misses = {}
+        if grid is not None and grid.K and now_ms - (grid.t[-1] + grid.step_min * MIN) < 15 * MIN:
+            kw_now = {z: float((zones.get(z) or {}).get("kw", 0.0)) for z in layout.zone_ids}
+            # the model as the plans have it, the correction in: the misses are what is left over
+            misses = hour_misses(layout, with_correction(params, kw_now), grid, (recent["Tm"], recent["Tw"]), grid.K - 1)
         for z in layout.zone_ids:
-            c = zones.get(z) or {"kw": 0.0, "err": 0.0}
-            c["kw"] = float(c.get("kw", 0.0)) * self.CORR_LEAK
-            th = (zmap.get(z) or {}).get("thermometer")
-            meas = [v for r in self.store.rows(th, int(now_ms - 10 * MIN), int(now_ms) + 1, before=False)
-                    if math.isfinite(v := _num(r[1]))] if th else []
-            pred = None
-            if ref is not None and z in (ref.get("temp") or {}) and len(ref.get("times") or []) > 1:
-                tt, vv = ref["times"], ref["temp"][z]
-                if tt[0] <= now_ms <= tt[-1]:
-                    pred = float(np.interp(now_ms, tt, vv))
-            if meas and pred is not None and not recent_window:
-                err = pred - float(np.mean(meas))  # > 0: the plan expected it warmer than it is
-                r = self._hour_response(layout, params, z)
-                if r > 1e-6:
-                    lim = min(self.CORR_LIMIT_KW, self.CORR_LIMIT_K / r)
-                    c["kw"] = float(np.clip(c["kw"] - self.CORR_GAIN * err / r, -lim, lim))
-                c["err"] = round(0.9 * float(c.get("err", 0.0)) + 0.1 * err, 3)
+            c = dict(zones.get(z) or {"kw": 0.0, "err": 0.0})
+            err = misses.get(z)
+            if err is None:
+                c["kw"] = float(c.get("kw", 0.0)) * self.CORR_LEAK
+            else:
+                r = hour_response(layout, params, z)
+                lim = min(self.CORR_LIMIT_KW, self.CORR_LIMIT_K / r) if r > 1e-6 else 0.0
+                kw0 = float(c.get("kw", 0.0))
+                c["kw"] = step(kw0, err, r, self.CORR_GAIN, self.CORR_LEAK, lim)
+                c["err"] = round(0.9 * float(c.get("err", 0.0)) + 0.1 * err, 3)  # left over, with the correction
+                # what the model alone misses an hour on (shown): the leftover, and what the correction made up
+                c["miss"] = round(0.9 * float(c.get("miss", err)) + 0.1 * (err + r * kw0), 3)
             c["kw"] = round(c["kw"], 4)
             zones[z] = c
         self.store.put("correction", {"t": int(now_ms), "zones": zones})
         return zones
 
-    @staticmethod
-    def _changed_ms(s: dict) -> float:
-        try:
-            return datetime.fromisoformat(str(s.get("last_changed")).replace("Z", "+00:00")).timestamp() * 1000
-        except ValueError:
-            return 0.0
+    # ---- aiming a little higher where the doing falls short of the plan ----
+    UPLIFT_ALPHA = 0.03  # of each hour's gap taken in (a counted one every five minutes): over a few hours
+    UPLIFT_LEAK = 0.5 ** (5 / 1440)  # without counted hours, back towards nothing: half in a day
+    UPLIFT_RANGE = (-0.3, 0.8)  # K
+
+    def uplift(self) -> dict[str, float]:
+        return {z: float(c.get("k", 0.0)) for z, c in ((self.store.get("uplift") or {}).get("zones") or {}).items()}
+
+    def update_uplift(self, now_ms: float, layout: Layout, params: Params, recent: dict) -> dict[str, float]:
+        """The plan of an hour ago against what was then really done (correction.exec_gaps):
+        where the doing kept falling short of the planning, the plans aim that much higher.
+        Once every five minutes."""
+        from .model.correction import exec_gaps
+        cur = self.store.get("uplift") or {}
+        zones = dict(cur.get("zones") or {})
+        if now_ms - float(cur.get("t") or 0) < 4.5 * MIN:
+            return self.uplift()
+        gaps: dict[str, float] = {}
+        grid = recent.get("grid")
+        if grid is not None:
+            plans = [p for p in self.store.plans(int(now_ms - 66 * MIN), int(now_ms) + 1) if p.get("learn")]
+            near = [p for p in plans if abs(p["t"] - (now_ms - 60 * MIN)) <= 5 * MIN]
+            if near:
+                ref = min(near, key=lambda p: abs(p["t"] - (now_ms - 60 * MIN)))
+                gaps = exec_gaps(layout, params, grid, (recent["Tm"], recent["Tw"]), ref,
+                                 [p for p in plans if p["t"] > ref["t"]])
+        lo, hi = self.UPLIFT_RANGE
+        for z in set(zones) | set(gaps):
+            c = dict(zones.get(z) or {"k": 0.0, "n": 0})
+            g = gaps.get(z)
+            if g is None:
+                c["k"] = float(c.get("k", 0.0)) * self.UPLIFT_LEAK
+            else:
+                c["k"] = float(np.clip((1 - self.UPLIFT_ALPHA) * float(c.get("k", 0.0)) + self.UPLIFT_ALPHA * g, lo, hi))
+                c["gap"] = round(g, 3)
+                c["n"] = int(c.get("n", 0)) + 1
+            c["k"] = round(c["k"], 4)
+            zones[z] = c
+        self.store.put("uplift", {"t": int(now_ms), "zones": zones})
+        return {z: c["k"] for z, c in zones.items()}
 
     def build_problem(self, now_ms: float, inputs: dict, hold: bool = False) -> tuple[mpc.Problem, dict]:
         """hold: the step under way stays as the units run now (a plan on the clock); a plan
@@ -474,12 +511,18 @@ class Planner:
         cfg = self.cfg
         layout, params = self.model()
         st = cfg.settings_obj()
-        corr = {}
+        recent = self.recent(layout, params, now_ms)  # the state now, and what the model got wrong lately
+        corr, upl = {}, {}
         if st.plan_correction:
             try:
-                corr = self.update_correction(now_ms, layout, params)
+                corr = self.update_correction(now_ms, layout, params, recent)
             except Exception:  # a correction that fails must not stop the plan
                 log.exception("plan correction")
+            try:
+                from .model.correction import with_correction
+                upl = self.update_uplift(now_ms, layout, with_correction(params, {z: c.get("kw", 0.0) for z, c in corr.items()}), recent)
+            except Exception:
+                log.exception("plan uplift")
             for z, c in corr.items():
                 if z in params.zones and abs(c.get("kw", 0.0)) > 1e-4:
                     params.zones[z]["q"] = params.zones[z].get("q", 0.0) + c["kw"]  # a copy: the model stays
@@ -495,7 +538,8 @@ class Planner:
             if abs(c.get("kw", 0.0)) >= 0.02:
                 name = next((x.name for x in layout.zones if x.id == z), z)
                 info["notes"].append(f"{name}: planned with {c['kw'] * 1000:+.0f} W beyond the model "
-                                     f"(its plans have lately been {abs(c.get('err', 0.0)):.1f} K too {'warm' if c.get('err', 0.0) > 0 else 'cold'} an hour on)")
+                                     f"(run over an hour with what the units really did, the model alone ends the room "
+                                     f"{abs(c.get('miss', 0.0)):.1f} K too {'warm' if c.get('miss', 0.0) > 0 else 'cold'})")
 
         prices = inputs.get("prices") or []
         if not prices:
@@ -537,7 +581,7 @@ class Planner:
                     Ta[i] = last[1]
                     info["notes"].append(f"{layout.zones[i].name}: thermometer not reporting since "
                                          f"{datetime.fromtimestamp(last[0] / 1000, tz).strftime('%H:%M')}; planned from its last reading, {last[1]:.1f} °C")
-        Tm, Tw, how = self.hidden_state(layout, params, now_ms)
+        Tm, Tw, how = (recent["Tm"][-1], recent["Tw"][-1], recent["how"]) if recent.get("grid") is not None else (None, None, recent["how"])
         if Tm is None:
             info["notes"].append(f"state estimate: {how}; assuming surfaces at room temperature")
         if (ex := self.exploring(now_ms)) is not None:
@@ -690,6 +734,31 @@ class Planner:
                 info.setdefault("no_comfort", {})[z] = proxies[here[0]]["note"]
                 for uid in here:
                     proxies[uid]["comfort"] = None
+        # the plan aims a little higher where what is done keeps falling short of it (not over an override's target)
+        raw_comfort = {z: np.asarray(v, float).copy() for z, v in comfort.items()}
+        for z in comfort:
+            u_ = float(upl.get(z, 0.0))
+            if abs(u_) > 1e-3:
+                ov = np.array([str(f.id).startswith("override") for f in functions[z]])
+                comfort[z] = np.where(ov, comfort[z], comfort[z] + u_)
+                if abs(u_) >= 0.05:
+                    name = next((x.name for x in layout.zones if x.id == z), z)
+                    info["notes"].append(f"{name}: aims {u_:+.1f} K (lately the heating as done stayed that far "
+                                         f"{'below' if u_ > 0 else 'above'} the plans)")
+        info["uplift"] = {z: round(float(v), 3) for z, v in upl.items()}
+        # what the plans an hour on hold this one against (correction.exec_gaps)
+        kh = int(np.searchsorted(t, now_ms + 65 * MIN))
+        fin = lambda a: [None if not math.isfinite(float(v)) else round(float(v), 2) for v in a]
+        learn = {"t": [int(x) for x in t[:kh]], "comfort": {}, "edge": {}, "override": {}, "forced": {}, "auto": {}}
+        for z in comfort:
+            dead = np.array([f.below.deadband for f in functions[z][:kh]], float)
+            learn["comfort"][z] = fin(raw_comfort[z][:kh])
+            learn["edge"][z] = fin(np.asarray(comfort[z][:kh], float) - dead)
+            learn["override"][z] = any(str(f.id).startswith("override") for f in functions[z][:kh])
+            here = [x for x in units if x.zone == z]
+            learn["forced"][z] = any(x.forced is not None and bool(np.asarray(x.forced)[:kh].any()) for x in here)
+            learn["auto"][z] = bool(here) and all(x.id not in uncontrolled for x in here)
+        info["learn"] = learn
         airing = None
         if cfg.airing.enabled and layout.window_zones:
             airing, info["airing"] = self.airing_spec(now_ms, t, comfort, x0, layout, tz, events)
@@ -1025,6 +1094,7 @@ class Planner:
                 "mode": plan.mode, "cost": plan.cost, "times": [int(x) for x in plan.t[:k1 + 1]],
                 "temp": {z: [round(float(v), 2) for v in a[:k1 + 1]] for z, a in plan.temp.items()},
                 "on": {u: bool(a[0]) for u, a in plan.on.items()},
+                "learn": info.get("learn"),
             })
             log.info("plan: %s, %.2f € over %.0f h, %.1f s", plan.mode, plan.cost["total"], (plan.t[-1] - plan.t[0]) / 3.6e6, plan.seconds)
 

@@ -997,14 +997,15 @@ pages.model = async () => {
     for (const w of rep.warnings || []) html += `<div class="msg">${esc(w)}</div>`;
     if (rep.power_note) html += `<div class="msg">${esc(rep.power_note)}</div>`;
     if (m.kept) html += `<div class="msg">Planning with an earlier model, chosen ${ago(m.kept)}. Nightly training waits until you retrain by hand.</div>`;
-    const corr = S.status?.correction || {};
-    html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th><th class="num">Plans an hour on</th><th class="num">Correction</th></tr>`;
+    const corr = S.status?.correction || {}, upl = S.status?.uplift || {};
+    html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th class="num">Error on check days</th><th class="num">Bias</th><th class="num">Heat stored</th><th class="num">Heat loss</th><th class="num">Time constant</th><th class="num">Model an hour on</th><th class="num">Correction</th><th class="num">Aim higher</th></tr>`;
     L.zones.forEach((z, i) => {
       const zs = rep.zones?.[z.id] || {}, c = corr[z.id];
       html += `<tr><td>${esc(z.name)}</td><td class="num">${num(rep.rmse_val?.[i], 2)} K</td><td class="num">${num(rep.bias_val?.[i], 2)} K</td><td class="num">${num(zs.C, 1)} kWh/K</td><td class="num">${num((zs.Hloss || 0) * 1000, 0)} W/K</td><td class="num">${num(zs.tau_h, 0)} h</td>
-        <td class="num">${c ? (c.err > 0 ? '+' : '') + num(c.err, 2) + ' K' : '–'}</td><td class="num">${c ? (c.kw > 0 ? '+' : '') + num(c.kw * 1000, 0) + ' W' : '–'}</td></tr>`;
+        <td class="num">${c && c.miss !== undefined ? (c.miss > 0 ? '+' : '') + num(c.miss, 2) + ' K' : '–'}</td><td class="num">${c ? (c.kw > 0 ? '+' : '') + num(c.kw * 1000, 0) + ' W' : '–'}</td>
+        <td class="num" title="${upl[z.id] ? `from ${upl[z.id].n || 0} counted plans` : ''}">${upl[z.id] ? (upl[z.id].k > 0 ? '+' : '') + num(upl[z.id].k, 2) + ' K' : '–'}</td></tr>`;
     });
-    html += `</table></div><p class="hint">Error: how far whole days predicted from midnight, from nothing but weather and what the units did, stayed from the thermometers. Plans an hour on: how much warmer (+) than measured the plans lately expected each room an hour later. Correction: the heat the plans add for it, beyond the model (minus: the room loses more than the model knows), taken up within a couple of hours and fading within a day once the misses stop (Settings).</p></div>`;
+    html += `</table></div><p class="hint">Error: how far whole days predicted from midnight, from nothing but weather and what the units did, stayed from the thermometers. Model an hour on: run over the last hour from where each room was, with what the units really did and the weather as it was, how much warmer (+) than measured the model ends it, lately. Correction: the heat the plans add for it, beyond the model (minus: the room loses more than the model knows), taken up within a couple of hours and fading within a day once the misses stop (Settings). What was planned or decided meanwhile (a comfort temperature changed, a run, a rule) plays no part. Aim higher: where the plans held a room at the edge of its comfort, how far what was then done (the units starting later than planned, plan after plan) left it below what they planned, lately; the plans aim that much higher. Hours with something decided anew (a comfort temperature changed, an override, a run, a rule), a window open or a proxy not in auto do not count; changes by schedule do.</p></div>`;
     html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Heat per fan level</th></tr>`;
     for (const u of L.units) {
       const p = m.params.units[u.id] || {};

@@ -322,3 +322,96 @@ def test_a_stopped_thermometer_is_not_checked_against_but_keeps_the_day():
     k = int(np.searchsorted(g.t, rows[150][0]))
     zi = layout.zone_index("office")
     assert np.isnan(g.T[k, zi]) and g.valid[k]  # masked for the check, the day still counts
+
+
+def _grid_and_hidden(truth, layout, seed=4, days=3):
+    from climate_optimizer.model.thermal import build, estimate_hidden
+
+    r = synthetic.run(days=days, seed=seed, realism=False, layout=layout, params=truth)
+    g = build_grid(parse_rows(json.loads(json.dumps(synthetic.to_export(r)))), layout, synthetic.mapping_for(layout))
+    return g, estimate_hidden(build(layout, default_params(layout)), g.T, g.tout, g.sol, g.dt_h)
+
+
+def test_the_correction_learns_what_the_model_misses():
+    """The living room loses 0.3 kW more than the model knows: run over each past hour with
+    what the units really did, the misses lead the correction there; the other rooms stay."""
+    from climate_optimizer.model.correction import hour_misses, hour_response, step, with_correction
+
+    layout = default_layout()
+    model = default_params(layout)
+    g, hidden = _grid_and_hidden(with_correction(model, {"living": -0.3}), layout)
+    kw = {z: 0.0 for z in layout.zone_ids}
+    r = {z: hour_response(layout, model, z) for z in layout.zone_ids}
+    for k1 in range(30 * 12, 60 * 12):
+        miss = hour_misses(layout, with_correction(model, kw), g, hidden, k1)
+        for z, e in miss.items():
+            if e is not None:
+                kw[z] = step(kw[z], e, r[z], 0.05, 0.5 ** (5 / 1440), 0.5)
+    assert -0.4 < kw["living"] < -0.2
+    assert all(abs(kw[z]) < 0.1 for z in ("office", "bedroom", "bath"))
+
+
+def test_the_correction_stays_put_without_a_model_error():
+    """No model error: whatever the units did (the synthetic thermostat, not any plan), nothing to correct."""
+    from climate_optimizer.model.correction import hour_misses
+
+    layout = default_layout()
+    g, hidden = _grid_and_hidden(default_params(layout), layout, seed=7)
+    misses = [e for k1 in range(30 * 12, 48 * 12, 6) for e in hour_misses(layout, default_params(layout), g, hidden, k1).values()
+              if e is not None]
+    assert misses and abs(float(np.mean(misses))) < 0.05
+
+
+def test_no_correction_over_an_hour_with_a_window_open():
+    from climate_optimizer.model.correction import hour_misses
+
+    layout = default_layout()
+    g, hidden = _grid_and_hidden(default_params(layout), layout)
+    g.open[30 * 12 - 3, 0] = 1.0
+    assert hour_misses(layout, default_params(layout), g, hidden, 30 * 12) == {}
+
+
+def _plan_like(g, layout, k0, rise, edge_above=0.1, comfort=21.0, z="living"):
+    """A plan made at step k0 that expects room z to warm by rise over the hour (its own
+    temperatures just under its edge, so held at it), with what plans keep for the check."""
+    t = [int(g.t[k0] + 60_000 * 5 * i) for i in range(14)]
+    T0 = float(np.nan_to_num(g.T[k0, layout.zone_index(z)], nan=20.0))
+    temps = [T0 + rise * i / 12 for i in range(14)]
+    edge = max(temps) - edge_above
+    return {"t": t[0], "times": t, "temp": {z: temps},
+            "learn": {"t": t[:13], "comfort": {z: [comfort] * 13}, "edge": {z: [edge] * 13},
+                      "override": {z: False}, "forced": {z: False}, "auto": {z: True}}}
+
+
+def test_the_gap_between_plan_and_doing():
+    """The plan expected the room to warm 0.3 K more than what was then done gives; a plan
+    expecting just what was done has no gap; a comfort changed meanwhile or a window keeps
+    the hour out; a change by schedule (in every plan alike) does not."""
+    from climate_optimizer.model.correction import exec_gaps
+    from climate_optimizer.model.fit import simulate_windows
+
+    layout = default_layout()
+    model = default_params(layout)
+    g, hidden = _grid_and_hidden(model, layout)
+    zi = layout.zone_index("living")
+    k0 = 36 * 12
+    while g.open[k0:k0 + 13].any() or not g.valid[k0:k0 + 13].all():
+        k0 += 1
+    Ta, _ = simulate_windows(layout, model, g, np.array([k0]), 12, hidden=hidden)
+    done = float(Ta[0, 12, zi] - Ta[0, 0, zi])
+    ref = _plan_like(g, layout, k0, done + 0.3)
+    gap = exec_gaps(layout, model, g, hidden, ref, [])["living"]
+    assert abs(gap - 0.3) < 0.03
+    assert abs(exec_gaps(layout, model, g, hidden, _plan_like(g, layout, k0, done), [])["living"]) < 0.03
+    later = _plan_like(g, layout, k0 + 2, 0.0, comfort=22.0)  # the comfort temperature raised meanwhile
+    assert "living" not in exec_gaps(layout, model, g, hidden, ref, [later])
+    same = _plan_like(g, layout, k0 + 2, 0.0)  # nothing new: counts
+    assert "living" in exec_gaps(layout, model, g, hidden, ref, [same])
+    sched_ref, sched_later = _plan_like(g, layout, k0, done + 0.3), _plan_like(g, layout, k0 + 2, 0.0)
+    sched_ref["learn"]["comfort"]["living"] = [21.0] * 6 + [19.0] * 7  # a rule from half past: both plans have it
+    sched_later["learn"]["comfort"]["living"] = [21.0] * 4 + [19.0] * 9
+    assert "living" in exec_gaps(layout, model, g, hidden, sched_ref, [sched_later])
+    away = _plan_like(g, layout, k0, done + 0.3, edge_above=1.0)  # the plan let it rise past its edge: not held there
+    assert "living" not in exec_gaps(layout, model, g, hidden, away, [])
+    g.open[k0 + 5, 0] = 1.0
+    assert exec_gaps(layout, model, g, hidden, ref, []) == {}

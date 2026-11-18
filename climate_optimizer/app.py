@@ -205,6 +205,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
             "backfill": s.collector.backfill_status, "units": units, "zones": zones,
             "outdoor": p.live(cfg.mapping.get("outdoor")), "uptime_s": time.time() - s.started, "tz": str(p.tz()),
             "build": BUILD, "overrides": p.overrides.list(), "correction": p.correction(),
+            "uplift": (s.store.get("uplift") or {}).get("zones") or {},
         })
 
     # ---- overrides: a room to a temperature, a unit to run a while ----

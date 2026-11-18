@@ -3,6 +3,7 @@
 import json
 from datetime import datetime
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -778,37 +779,54 @@ def test_tariffs_compared(client):
 
 
 def test_plans_are_corrected_by_their_misses(client):
-    import time as _t
+    """The planner's side: the misses over the last hour of its recent grid move the stored
+    correction (once per five minutes), and the plan carries it."""
+    import sys as _sys
+
+    _sys.path.insert(0, "tests")
+    from test_model import _grid_and_hidden
+
+    from climate_optimizer.model.correction import with_correction
 
     p, store = client.svc.planner, client.svc.store
     layout, params = p.model()
-    th = p.cfg.mapping["zones"]["living"]["thermometer"]
+    g, (Tm, Tw) = _grid_and_hidden(with_correction(params, {"living": -0.4}), layout)
     store.put("correction", {})
-    t0 = _t.time() * 1000 + 30 * 864e5  # days ahead: clear of what the demo records
-    MIN_ = 60_000
-    zones = {}
-    for i in range(40):
-        now = t0 + i * 5 * MIN_
-        ago = now - 60 * MIN_
-        store.add_plan(int(ago), {"times": [int(ago), int(now + 30 * MIN_)], "temp": {"living": [20.3, 20.3]},
-                                  "mode": "heat", "cost": {}, "on": {}})
-        store.add_rows(th, [[int(now - 3 * MIN_), 20.0]])  # the room is 0.3 K cooler than planned an hour before
-        zones = p.update_correction(now, layout, params)
-    kw = zones["living"]["kw"]
-    assert -0.5 <= kw < -0.05 and zones["living"]["err"] > 0.2
-    assert abs(zones["office"]["kw"]) < 1e-6  # no plan for it: nothing to correct
-    again = p.update_correction(now + MIN_, layout, params)  # within five minutes: no new step
-    assert again["living"]["kw"] == kw
-    # a window open: the miss is the window's, the correction only fades
-    w = (p.cfg.mapping["zones"]["office"].get("windows") or [None])[0]
-    saved = dict(client.svc.collector.states.get(w) or {})
-    client.svc.collector.states[w] = {**saved, "state": "on"}
+    k = 40 * 12
+    while g.open[k - 13:k + 1].any():  # an hour without a window open
+        k += 1
+    cut = {f: (getattr(g, f)[:k + 1] if isinstance(getattr(g, f), np.ndarray) and len(getattr(g, f)) == g.K else getattr(g, f))
+           for f in g.__dataclass_fields__}
+    cut["ac_frac"] = {u: a[:k + 1] for u, a in g.ac_frac.items()}
+    cut["heater_kw"] = {u: a[:k + 1] for u, a in g.heater_kw.items()}
+    cut["others"] = [a[:k + 1] for a in g.others]
+    g2 = type(g)(**cut)
+    recent = {"grid": g2, "Tm": Tm[:k + 1], "Tw": Tw[:k + 1], "how": ""}
+    now = float(g2.t[-1]) + 6 * 60_000
+    zones = p.update_correction(now, layout, params, recent)
+    assert zones["living"]["kw"] < -0.005 and zones["living"]["miss"] > 0  # the model ends it too warm: less heat
+    assert p.update_correction(now + 60_000, layout, params, recent) == zones  # not again within five minutes
+    stale = p.update_correction(now + 60 * 60_000, layout, params, recent)  # readings an hour old: only fades
+    assert zones["living"]["kw"] <= stale["living"]["kw"] < 0
+    store.put("correction", {})
+
+
+
+def test_the_plan_aims_higher_where_the_doing_fell_short(client):
+    import time as _t
+
+    store = client.svc.store
     try:
-        now2 = now + 5 * MIN_
-        store.add_plan(int(now2 - 60 * MIN_), {"times": [int(now2 - 60 * MIN_), int(now2 + 30 * MIN_)], "temp": {"living": [20.3, 20.3]},
-                                              "mode": "heat", "cost": {}, "on": {}})
-        z2 = p.update_correction(now2, layout, params)
-        assert kw <= z2["living"]["kw"] < kw * 0.99  # faded a little, not pushed further
+        store.put("uplift", {"t": int(_t.time() * 1000), "zones": {}})
+        a = client.post("/api/plan").json()
+        store.put("uplift", {"t": int(_t.time() * 1000), "zones": {"living": {"k": 0.3, "n": 12}}})
+        b = client.post("/api/plan").json()
+        ca, cb = np.array(a["plan"]["comfort"]["living"], float), np.array(b["plan"]["comfort"]["living"], float)
+        assert np.nanmax(np.abs(cb - ca - 0.3)) < 1e-6
+        assert any("aims +0.3 K" in n for n in b["info"]["notes"])
+        learn = b["info"]["learn"]
+        assert learn["comfort"]["living"][0] == round(float(ca[0]), 2)  # kept as asked, not as aimed
+        assert learn["auto"]["living"] in (True, False) and len(learn["t"]) >= 12
+        assert store.plans(0, int(_t.time() * 1000) + 1)[-1]["learn"]["t"] == learn["t"]
     finally:
-        client.svc.collector.states[w] = saved
-    store.put("correction", {})
+        store.put("uplift", {})
