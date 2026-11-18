@@ -88,9 +88,11 @@ class Service:
 
     async def _plan_loop(self) -> None:
         while not self.stop.is_set():
-            # half way between the five-minute marks: the plan is there before the next step
-            # begins, and decides it once (a plan made at the mark would decide it again)
-            await _sleep_until(self.stop, 300, offset=150)
+            # a while before each five-minute mark: the plan is there before the next step begins,
+            # and decides it once (a plan made at the mark would decide it again); how long before,
+            # from how long plans take (or as set)
+            lead = self.planner.plan_lead(self.cfgs.config.settings_obj())
+            await _sleep_until(self.stop, 300, offset=300 - lead)
             if self.ha.connected.is_set():
                 await self.planner.replan()
 
@@ -205,6 +207,7 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
             "backfill": s.collector.backfill_status, "units": units, "zones": zones,
             "outdoor": p.live(cfg.mapping.get("outdoor")), "uptime_s": time.time() - s.started, "tz": str(p.tz()),
             "build": BUILD, "overrides": p.overrides.list(), "correction": p.correction(),
+            "plan_lead_s": round(p.plan_lead(), 0),
         })
 
     # ---- overrides: a room to a temperature, a unit to run a while ----

@@ -117,6 +117,8 @@ class Planner:
         self._published: dict[str, str] = {}  # override sensors as last set in Home Assistant
         self._run_over: dict[str, float] = {}  # unit -> when its run ended (by hand or by the clock)
         self._window_task: asyncio.Task | None = None
+        from collections import deque
+        self._plan_took: deque = deque(maxlen=24)  # seconds the last plans took, all in (for when to start them)
         self._answered: dict[str, list] = {}  # unit -> [on, since (ms), last answered (ms)], as told the proxy
         self._wake: asyncio.Task | None = None
         self._airing_sent = False
@@ -988,6 +990,22 @@ class Planner:
             log.warning("airing sensor: %s", e)
 
     # ---- planning ----
+    LEAD_DEFAULT_S = 150.0  # half a step, until a few plans have shown how long they take
+    LEAD_RANGE_S = (60.0, 270.0)
+
+    def plan_lead(self, st: mpc.Settings | None = None) -> float:
+        """How long before each five-minute mark the plan on the clock starts: as set, else
+        the slower plans of late and half as much again, and half a minute to spare.
+        Long enough that the plan is there when the step it decides begins, short enough
+        that it decides on readings as fresh as can be."""
+        st = st or self.cfg.settings_obj()
+        if st.plan_lead_s and st.plan_lead_s > 0:
+            return float(np.clip(st.plan_lead_s, 30.0, 290.0))
+        took = list(self._plan_took)
+        if len(took) < 3:
+            return self.LEAD_DEFAULT_S
+        return float(np.clip(1.5 * np.percentile(took, 90) + 30.0, *self.LEAD_RANGE_S))
+
     async def replan(self, fresh: bool = False) -> None:
         """Plan now. With one already running, its plan will do, unless fresh:
         then plan once more after it, from the state as it is now (a setting
@@ -998,12 +1016,15 @@ class Planner:
                 return
         async with self.lock:
             now = time.time() * 1000
+            t_begin = time.time()
             try:
                 inputs = await self.fetch(now)
                 pr, info = await asyncio.to_thread(self.build_problem, now, inputs, not fresh)
                 t_solve = time.time()
                 plan = await asyncio.to_thread(mpc.solve, pr)
                 info["solve_seconds"] = round(time.time() - t_solve, 1)  # every solve of this plan, not only the chosen one
+                info["plan_seconds"] = round(time.time() - t_begin, 1)  # and fetching and building it
+                self._plan_took.append(info["plan_seconds"])
             except Exception as e:
                 log.exception("planning failed")
                 self.state.error = str(e)

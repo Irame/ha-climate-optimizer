@@ -809,3 +809,26 @@ def test_plans_are_corrected_by_their_misses(client):
     stale = p.update_correction(now + 60 * 60_000, layout, params, recent)  # readings an hour old: only fades
     assert zones["living"]["kw"] <= stale["living"]["kw"] < 0
     store.put("correction", {})
+
+
+def test_when_plans_start(client):
+    from climate_optimizer import mpc
+
+    p = client.svc.planner
+    took = list(p._plan_took)
+    try:
+        p._plan_took.clear()
+        assert p.plan_lead(mpc.Settings()) == 150  # a few plans first
+        p._plan_took.extend([1.7, 2.0, 1.5])
+        assert p.plan_lead(mpc.Settings()) == 60  # quick plans: a minute ahead, on fresher readings
+        p._plan_took.extend([100.0] * 5)
+        assert p.plan_lead(mpc.Settings()) == 180  # slow ones: started earlier, done in time
+        p._plan_took.extend([400.0] * 5)
+        assert p.plan_lead(mpc.Settings()) == 270
+        assert p.plan_lead(mpc.Settings(plan_lead_s=200)) == 200  # as set
+        info = client.post("/api/plan").json()["info"]
+        assert info["plan_seconds"] >= info["solve_seconds"] >= 0
+        assert client.get("/api/status").json()["plan_lead_s"] > 0
+    finally:
+        p._plan_took.clear()
+        p._plan_took.extend(took)
