@@ -1242,28 +1242,40 @@ pages.settings = async () => {
       }).join('')}</div></details>`, 'In shadow mode the optimizer answers the proxies "follow: false". To watch it beside another automation that switches the units and moves their setpoints, it can plan units whose proxy is off, with comfort temperatures of its own instead of the proxies’ targets.')}
   </div>`);
 
-  // Rooms & units
-  let rooms = '';
+  // Rooms & units: a table (each setting in its column) on a wide screen, a block per row on a phone
+  const head = cols => `<thead><tr>${cols.map(([t, i]) => `<th>${lab(t, i)}</th>`).join('')}</tr></thead>`;
+  const cell = (label, info, body) => `<td><span class="cell-lab">${lab(label, info)}</span>${body}</td>`;
+  const I = {
+    thermo: 'The room’s air temperature.',
+    windows: 'Open, they let heat out (the model knows how much), and the units in the room stay off.',
+    facades: 'Where the room gets its sun from. Ticked, the model looks for direct sun only from those sides (north gets none), which it learns much sooner; none ticked, it looks everywhere. Retrain after changing it.',
+    aliases: 'Other names for the room in calendar events, comma separated, e.g. "Wohnzimmer, Küche".',
+    proxy: 'The proxy climate entity: the optimizer answers it.',
+    device: 'The device under the proxy: an AC’s own climate entity (its history tells the model what the unit did), or a heater’s switch or plug.',
+    fans: 'For an AC: the device’s fan modes the proxy uses (its source_fan_modes), quietest first, comma separated; level 0 is the first. Empty: the list the proxy sends. For a heater: its plug’s energy (kWh) or power (W), what it draws.',
+  };
+  let rooms = `<div class="table-wrap"><table class="set-table rooms">${head([['Room'], ['Thermometer', I.thermo], ['Window and door sensors', I.windows], ['Windows face', I.facades], ['Names in calendar events', I.aliases]])}<tbody>`;
   for (const z of L.zones) {
     M.zones[z.id] = M.zones[z.id] || {};
     const fac = z.facades || [];
-    rooms += `<div class="set-item"><h5>${esc(z.name)}</h5><div class="fields">
-      <label class="field">${lab('Thermometer', 'The room’s air temperature.')}${entitySelect(`mapping.zones.${z.id}.thermometer`, 'temp', M.zones[z.id].thermometer || '')}</label>
-      ${z.windows ? `<label class="field">${lab('Window and door sensors', 'Open, they let heat out (the model knows how much), and the units in the room stay off.')}${entityMulti(`mapping.zones.${z.id}.windows`, 'opening', M.zones[z.id].windows)}</label>` : ''}
-      ${z.solar === false ? '' : `<div class="field">${lab('Windows face', 'Where the room gets its sun from. Ticked, the model looks for direct sun only from those sides (north gets none), which it learns much sooner; none ticked, it looks everywhere. Retrain after changing it.')}<div class="days" style="flex-wrap:nowrap">${['N', 'E', 'S', 'W'].map(f => `<label><input type="checkbox" data-facade="${z.id}" value="${f}" ${fac.includes(f) ? 'checked' : ''}>${f}</label>`).join('')}</div></div>`}
-      <label class="field">${lab('Names in calendar events', 'Other names for the room in calendar events, comma separated, e.g. "Wohnzimmer, Küche".')}<input data-alias="${z.id}" value="${esc((z.aliases || []).join(', '))}" placeholder="${esc({ office: 'Büro', bedroom: 'Schlafzimmer', living: 'Wohnzimmer, Küche', bath: 'Bad', hall: 'Flur' }[z.id] || 'more names')}"></label>
-    </div></div>`;
+    rooms += `<tr><th scope="row">${esc(z.name)}</th>
+      ${cell('Thermometer', I.thermo, entitySelect(`mapping.zones.${z.id}.thermometer`, 'temp', M.zones[z.id].thermometer || ''))}
+      ${cell('Window and door sensors', I.windows, z.windows ? entityMulti(`mapping.zones.${z.id}.windows`, 'opening', M.zones[z.id].windows) : '<span class="hint">none in the layout</span>')}
+      ${cell('Windows face', I.facades, z.solar === false ? '<span class="hint">no windows</span>' : `<div class="days" style="flex-wrap:nowrap">${['N', 'E', 'S', 'W'].map(f => `<label><input type="checkbox" data-facade="${z.id}" value="${f}" ${fac.includes(f) ? 'checked' : ''}>${f}</label>`).join('')}</div>`)}
+      ${cell('Names in calendar events', I.aliases, `<input data-alias="${z.id}" value="${esc((z.aliases || []).join(', '))}" placeholder="${esc({ office: 'Büro', bedroom: 'Schlafzimmer', living: 'Wohnzimmer, Küche', bath: 'Bad', hall: 'Flur' }[z.id] || 'more names')}">`)}</tr>`;
   }
-  let units = '';
+  rooms += `</tbody></table></div>`;
+  let units = `<div class="table-wrap"><table class="set-table units">${head([['Unit'], ['Proxy', I.proxy], ['Device under the proxy', I.device], ['Fan modes, quietest first / heater power', I.fans]])}<tbody>`;
   for (const u of L.units) {
     M.units[u.id] = M.units[u.id] || {};
-    units += `<div class="set-item"><h5>${esc(u.name)} <span class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</span></h5><div class="fields">
-      <label class="field">${lab('Proxy', 'The proxy climate entity: the optimizer answers it.')}${entitySelect(`mapping.units.${u.id}.proxy`, 'climate', M.units[u.id].proxy || '')}</label>
-      <label class="field">${lab('Device under the proxy', u.kind === 'ac' ? 'The AC’s own climate entity: its history tells the model what the unit did.' : 'The heater’s switch or plug.')}${entitySelect(`mapping.units.${u.id}.source`, u.kind === 'ac' ? 'climate' : 'switch', M.units[u.id].source || '')}</label>
-      ${u.kind === 'ac' ? `<label class="field">${lab('Fan modes, quietest first', 'The device’s fan modes the proxy uses (its source_fan_modes), comma separated; level 0 is the first. Empty: the list the proxy sends.')}<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" data-fan-for="${u.id}" value="${esc((M.units[u.id].fan_modes || []).join(', '))}"><span class="hint" data-fan-hint="${u.id}"></span></label>` : ''}
-      ${u.kind === 'heater' ? `<label class="field">${lab('Energy (kWh) or power (W)', 'The heater’s plug: what it draws, for the model and the electricity charts.')}${entitySelect(`mapping.units.${u.id}.power`, 'power', M.units[u.id].power || '')}</label>` : ''}
-    </div></div>`;
+    units += `<tr><th scope="row">${esc(u.name)}<div class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</div></th>
+      ${cell('Proxy', I.proxy, entitySelect(`mapping.units.${u.id}.proxy`, 'climate', M.units[u.id].proxy || ''))}
+      ${cell('Device under the proxy', I.device, entitySelect(`mapping.units.${u.id}.source`, u.kind === 'ac' ? 'climate' : 'switch', M.units[u.id].source || ''))}
+      ${u.kind === 'ac'
+        ? cell('Fan modes, quietest first', I.fans, `<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" data-fan-for="${u.id}" value="${esc((M.units[u.id].fan_modes || []).join(', '))}"><div class="hint" data-fan-hint="${u.id}"></div>`)
+        : cell('Energy (kWh) or power (W)', I.fans, entitySelect(`mapping.units.${u.id}.power`, 'power', M.units[u.id].power || ''))}</tr>`;
   }
+  units += `</tbody></table></div>`;
   html += section('rooms', `<div class="card">${group('Rooms', rooms)}</div><div class="card">${group('Units', units)}</div>`);
 
   // Outside & power

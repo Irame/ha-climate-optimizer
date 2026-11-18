@@ -231,3 +231,28 @@ button:disabled { opacity: 0.5; cursor: default; }
   .set-row b { min-width: 0; width: 100%; }
   .fields.wide { grid-template-columns: 1fr; }
 }
+
+/* settings tables: one column per setting on a wide screen, a block per row on a phone */
+.set-table { table-layout: fixed; }
+.set-table thead th { white-space: nowrap; }
+.set-table tbody th { font-weight: 600; color: var(--ink); font-size: 13px; padding-top: 12px; }
+.set-table td { padding-top: 8px; padding-bottom: 8px; }
+.set-table td > select, .set-table td > input:not([type=checkbox]) { width: 100%; }
+.set-table .cell-lab { display: none; }
+.set-table td > .days, .set-table td > span.hint { display: flex; padding-top: 7px; }
+.set-table.rooms thead th:first-child { width: 12%; }
+.set-table.rooms thead th:nth-child(2) { width: 25%; }
+.set-table.rooms thead th:nth-child(3) { width: 32%; }
+.set-table.rooms thead th:nth-child(4) { width: 12%; }
+.set-table.units thead th:first-child { width: 14%; }
+.multi .chip { white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.multi .add { flex: 1 1 140px; }
+@media (max-width: 760px) {
+  .set-table, .set-table tbody, .set-table tr, .set-table td, .set-table tbody th { display: block; width: auto !important; }
+  .set-table thead { display: none; }
+  .set-table tr { padding: 10px 0; border-top: 1px dashed var(--border); }
+  .set-table tr:first-child { border-top: none; padding-top: 0; }
+  .set-table td, .set-table tbody th { border: none; padding: 4px 0; }
+  .set-table .cell-lab { display: flex; font-size: 12.5px; color: var(--ink-2); margin-bottom: 3px; }
+  .set-table td > .days, .set-table td > span.hint { padding-top: 0; }
+}
