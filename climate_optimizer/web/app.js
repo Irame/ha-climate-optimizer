@@ -142,6 +142,7 @@ window.addEventListener('resize', () => {
 
 async function loadBase() {
   [S.config, S.status] = await Promise.all([api('config'), api('status')]);
+  S.statusAt = Date.now();
   pills();
 }
 
@@ -152,7 +153,18 @@ function pills() {
   p.push(`<span class="pill"><span class="dot ${st.ha.connected ? 'good' : 'critical'}"></span>${st.ha.connected ? 'Home Assistant' : 'Not connected'}</span>`);
   p.push(`<span class="pill"><span class="dot ${st.shadow ? 'warning' : 'good'}"></span>${st.shadow ? 'Shadow mode' : 'Controlling'}</span>`);
   const age = st.plan.created ? (Date.now() - st.plan.created) / MIN : null;
-  p.push(`<span class="pill"><span class="dot ${st.plan.error ? 'critical' : age !== null && age < 11 ? 'good' : 'warning'}"></span>Plan ${st.plan.created ? ago(st.plan.created) : 'none'}</span>`);
+  const run = st.plan.running;
+  if (run) {
+    // the plan under way: how long so far (counted on here between polls), at what, and the solver's limit
+    const secs = Math.max(0, (Date.now() - (S.statusAt || Date.now())) / 1000 + (run.seconds || 0));
+    const stage = { fetching: 'fetching prices and forecast', building: 'building the problem', solving: 'solving' }[run.stage] || run.stage;
+    const tip = `${stage} · the solver may take up to ${num(st.plan.time_limit_s, 0)} s per solve, and a plan solves a few times (heating, cooling, a start check per unit)`
+      + (st.plan.took_s ? ` · the last plan took ${num(st.plan.took_s, 1)} s` : '') + (st.plan.waiting ? ` · ${st.plan.waiting} more asked for` : '')
+      + (st.plan.created ? ` · last plan ${ago(st.plan.created)}` : '');
+    p.push(`<span class="pill" title="${esc(tip)}"><span class="dot accent pulse"></span>Planning… ${num(secs, 0)} s · ${esc(run.stage)}${secs > st.plan.time_limit_s ? ` (limit ${num(st.plan.time_limit_s, 0)} s per solve)` : ''}</span>`);
+  } else {
+    p.push(`<span class="pill" title="${st.plan.took_s ? `took ${num(st.plan.took_s, 1)} s` : ''}"><span class="dot ${st.plan.error ? 'critical' : age !== null && age < 11 ? 'good' : 'warning'}"></span>Plan ${st.plan.created ? ago(st.plan.created) : 'none'}</span>`);
+  }
   p.push(`<span class="pill"><span class="dot ${st.model.trained ? 'good' : 'warning'}"></span>${st.model.training ? 'Training…' : st.model.trained ? 'Model trained' : 'Model untrained'}</span>`);
   $('#pills').innerHTML = p.join('');
 }
@@ -305,7 +317,7 @@ function overrideText(o) {
 }
 function afterOverride() {
   // the plan follows in a moment: show the override now, the plan when it is there
-  api('status').then(st => { S.status = st; pills(); if (current === 'dashboard') pages.dashboard(true); }).catch(() => { });
+  api('status').then(st => { S.status = st; S.statusAt = Date.now(); pills(); if (current === 'dashboard') pages.dashboard(true); }).catch(() => { });
   setTimeout(() => { if (current === 'dashboard') pages.dashboard(); }, 2500);
 }
 function dialog(html) {
@@ -1435,11 +1447,18 @@ function set(o, path, v) {
     } catch { }
   } catch (e) { console.error(e); }
   route();
+  // the status every 5 s (a plan under way shows), every 2 s while one is (its seconds counted on here each second)
+  let lastPoll = 0;
   setInterval(async () => {
+    const running = !!S.status?.plan?.running;
+    if (running) pills();
+    if (Date.now() - lastPoll < (running ? 2000 : 5000)) return;
+    lastPoll = Date.now();
     try {
       S.status = await api('status');
+      S.statusAt = Date.now();
       pills();
       if (current === 'dashboard' && S.plan && S.status.plan.created && S.status.plan.created !== S.plan.created) pages.dashboard();
     } catch { }
-  }, 30000);
+  }, 1000);
 })();

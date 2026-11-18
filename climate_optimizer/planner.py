@@ -119,6 +119,8 @@ class Planner:
         self._window_task: asyncio.Task | None = None
         from collections import deque
         self._plan_took: deque = deque(maxlen=24)  # seconds the last plans took, all in (for when to start them)
+        self.planning: dict | None = None  # the plan under way: since when, at what stage
+        self.waiting = 0  # plans asked for while one is under way
         self._answered: dict[str, list] = {}  # unit -> [on, since (ms), last answered (ms)], as told the proxy
         self._wake: asyncio.Task | None = None
         self._airing_sent = False
@@ -1014,41 +1016,55 @@ class Planner:
         if self.lock.locked() and not fresh:
             async with self.lock:
                 return
-        async with self.lock:
-            now = time.time() * 1000
-            t_begin = time.time()
-            try:
-                inputs = await self.fetch(now)
-                pr, info = await asyncio.to_thread(self.build_problem, now, inputs, not fresh)
-                t_solve = time.time()
-                plan = await asyncio.to_thread(mpc.solve, pr)
-                info["solve_seconds"] = round(time.time() - t_solve, 1)  # every solve of this plan, not only the chosen one
-                info["plan_seconds"] = round(time.time() - t_begin, 1)  # and fetching and building it
-                self._plan_took.append(info["plan_seconds"])
-            except Exception as e:
-                log.exception("planning failed")
-                self.state.error = str(e)
-                return
-            info["forecast"] = {"t": inputs["forecast"]["t"].tolist(), "temp": inputs["forecast"]["temp"].tolist(),
-                                "cloud": inputs["forecast"]["cloud"].tolist()}
-            info["tout"] = pr.dist[:, DIST.index("tout")].round(2).tolist()
-            info["sun"] = pr.dist[:, 1:5].sum(axis=1).round(3).tolist()
-            info["prices"] = inputs["prices"]
-            self.state = PlanState(plan=plan, created=now, error=None, info=info)
-            await self.publish_airing(plan, info)
-            await self.publish_windows(plan, info)
-            await self.publish_overrides()
-            self._arm()
-            self.record_forecast(plan, now)
-            self.store.put("plan", {"plan": plan.to_dict(), "info": info, "created": now})
-            k1 = min(len(plan.t) - 1, int(np.searchsorted(plan.t, now + 2 * 3.6e6)))
-            self.store.add_plan(int(now), {
-                "mode": plan.mode, "cost": plan.cost, "times": [int(x) for x in plan.t[:k1 + 1]],
-                "temp": {z: [round(float(v), 2) for v in a[:k1 + 1]] for z, a in plan.temp.items()},
-                "on": {u: bool(a[0]) for u, a in plan.on.items()},
-            })
-            log.info("plan: %s, %.2f € over %.0f h, %.1f s (%s)", plan.mode, plan.cost["total"], (plan.t[-1] - plan.t[0]) / 3.6e6,
-                     info.get("solve_seconds", plan.seconds), plan.status)
+        self.waiting += 1
+        try:
+            await self.lock.acquire()
+        finally:
+            self.waiting -= 1
+        try:
+            await self._replan_locked(fresh)
+        finally:
+            self.planning = None
+            self.lock.release()
+
+    async def _replan_locked(self, fresh: bool) -> None:
+        now = time.time() * 1000
+        t_begin = time.time()
+        self.planning = {"since": int(now), "stage": "fetching", "asked": fresh}
+        try:
+            inputs = await self.fetch(now)
+            self.planning["stage"] = "building"
+            pr, info = await asyncio.to_thread(self.build_problem, now, inputs, not fresh)
+            self.planning["stage"] = "solving"
+            t_solve = time.time()
+            plan = await asyncio.to_thread(mpc.solve, pr)
+            info["solve_seconds"] = round(time.time() - t_solve, 1)  # every solve of this plan, not only the chosen one
+            info["plan_seconds"] = round(time.time() - t_begin, 1)  # and fetching and building it
+            self._plan_took.append(info["plan_seconds"])
+        except Exception as e:
+            log.exception("planning failed")
+            self.state.error = str(e)
+            return
+        info["forecast"] = {"t": inputs["forecast"]["t"].tolist(), "temp": inputs["forecast"]["temp"].tolist(),
+                            "cloud": inputs["forecast"]["cloud"].tolist()}
+        info["tout"] = pr.dist[:, DIST.index("tout")].round(2).tolist()
+        info["sun"] = pr.dist[:, 1:5].sum(axis=1).round(3).tolist()
+        info["prices"] = inputs["prices"]
+        self.state = PlanState(plan=plan, created=now, error=None, info=info)
+        await self.publish_airing(plan, info)
+        await self.publish_windows(plan, info)
+        await self.publish_overrides()
+        self._arm()
+        self.record_forecast(plan, now)
+        self.store.put("plan", {"plan": plan.to_dict(), "info": info, "created": now})
+        k1 = min(len(plan.t) - 1, int(np.searchsorted(plan.t, now + 2 * 3.6e6)))
+        self.store.add_plan(int(now), {
+            "mode": plan.mode, "cost": plan.cost, "times": [int(x) for x in plan.t[:k1 + 1]],
+            "temp": {z: [round(float(v), 2) for v in a[:k1 + 1]] for z, a in plan.temp.items()},
+            "on": {u: bool(a[0]) for u, a in plan.on.items()},
+        })
+        log.info("plan: %s, %.2f € over %.0f h, %.1f s (%s)", plan.mode, plan.cost["total"], (plan.t[-1] - plan.t[0]) / 3.6e6,
+                 info.get("solve_seconds", plan.seconds), plan.status)
 
     # ---- overrides ----
     def _levels_now(self, uid: str, unit, k: int | None) -> tuple[int, int]:

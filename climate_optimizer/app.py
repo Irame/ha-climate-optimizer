@@ -200,6 +200,11 @@ def create_app(service: Service | None = None, data_dir: Path | None = None) -> 
         return _json({
             "ha": {"connected": s.ha.connected.is_set(), "error": s.ha.error, "version": s.ha.version, "url": s.ha.url},
             "shadow": cfg.shadow, "plan": {"created": p.state.created or None, "error": p.state.error,
+                                           "running": ({**p.planning, "seconds": round(now / 1000 - p.planning["since"] / 1000, 1)}
+                                                       if p.planning else None),
+                                           "waiting": p.waiting,
+                                           "time_limit_s": cfg.settings_obj().time_limit_s,
+                                           "took_s": (p.state.info or {}).get("plan_seconds"),
                                            "mode": p.state.plan.mode if p.state.plan else None,
                                            "cost": p.state.plan.cost if p.state.plan else None},
             "model": {"trained": p.params is not None, "finished": (p.report or {}).get("finished"),

@@ -256,3 +256,7 @@ button:disabled { opacity: 0.5; cursor: default; }
   .set-table .cell-lab { display: flex; font-size: 12.5px; color: var(--ink-2); margin-bottom: 3px; }
   .set-table td > .days, .set-table td > span.hint { padding-top: 0; }
 }
+.dot.accent { background: var(--accent); }
+.dot.pulse { animation: dotpulse 1.2s ease-in-out infinite; }
+@keyframes dotpulse { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) { .dot.pulse { animation: none; } }

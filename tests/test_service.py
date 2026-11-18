@@ -832,3 +832,37 @@ def test_when_plans_start(client):
     finally:
         p._plan_took.clear()
         p._plan_took.extend(took)
+
+
+def test_a_plan_under_way_shows(client):
+    import threading
+    import time as _t
+
+    from climate_optimizer import mpc
+
+    p = client.svc.planner
+    st = client.get("/api/status").json()["plan"]
+    assert st["running"] is None and st["time_limit_s"] > 0
+    real = mpc.solve
+    gate = threading.Event()
+
+    def slow(pr):
+        gate.wait(10)
+        return real(pr)
+
+    mpc.solve = slow
+    try:
+        done = threading.Thread(target=lambda: client.post("/api/plan"))
+        done.start()
+        for _ in range(100):
+            run = client.get("/api/status").json()["plan"]["running"]
+            if run and run["stage"] == "solving":
+                break
+            _t.sleep(0.05)
+        assert run and run["stage"] == "solving" and run["seconds"] >= 0 and run["since"] > 0
+    finally:
+        gate.set()
+        done.join(30)
+        mpc.solve = real
+    st = client.get("/api/status").json()["plan"]
+    assert st["running"] is None and st["took_s"] is not None and p.waiting == 0
