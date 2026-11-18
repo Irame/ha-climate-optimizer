@@ -309,7 +309,7 @@ def test_an_outdoor_gap_and_a_room_without_thermometer_do_not_stop_the_model():
     assert hall not in [z.get("thermometer") for z in m["zones"].values()]
 
 
-def test_a_stopped_thermometer_does_not_count_as_complete():
+def test_a_stopped_thermometer_is_not_checked_against_but_keeps_the_day():
     layout = default_layout()
     r = synthetic.run(days=2, seed=4, realism=False)
     ex = json.loads(json.dumps(synthetic.to_export(r)))
@@ -320,4 +320,5 @@ def test_a_stopped_thermometer_does_not_count_as_complete():
         x[1] = rows[100][1]
     g = build_grid(parse_rows(ex), layout, m)
     k = int(np.searchsorted(g.t, rows[150][0]))
-    assert not g.valid[k]
+    zi = layout.zone_index("office")
+    assert np.isnan(g.T[k, zi]) and g.valid[k]  # masked for the check, the day still counts

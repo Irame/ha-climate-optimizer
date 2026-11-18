@@ -172,17 +172,21 @@ def power_observation(grid: Grid) -> dict:
 def split_days(grid: Grid, val_share=0.25):
     per_day = int(round(24 * 60 / grid.step_min))
     tz = ZoneInfo(grid.tz)
-    days = []
+    full, part = [], []
     for k in range(0, grid.K - per_day + 1):
         d = datetime.fromtimestamp(grid.t[k] / 1000, tz)
         if d.hour or d.minute:
             continue
-        if grid.valid[k:k + per_day].mean() >= 0.95:
-            days.append(k)
-    if len(days) < 2:
-        return days, [], per_day
-    n_val = max(1, round(len(days) * val_share))
-    return days[:-n_val], days[-n_val:], per_day
+        share = grid.valid[k:k + per_day].mean()
+        if share >= 0.95:
+            full.append(k)
+        elif share >= 0.5:  # a few hours missing: still stretches to learn from, not a day to check on
+            part.append(k)
+    if len(full) < 2:
+        return sorted(full + part), [], per_day
+    n_val = max(1, round(len(full) * val_share))
+    val = full[-n_val:]  # checked on whole days, the latest
+    return sorted(full[:-n_val] + [k for k in part if k < val[0]]), val, per_day
 
 
 def windows_for(grid: Grid, days: list[int], per_day: int) -> list[int]:

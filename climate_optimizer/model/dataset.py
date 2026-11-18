@@ -329,10 +329,12 @@ def build_grid(parsed: Parsed, layout: Layout, mapping: dict, *, step_min=5, sta
     if mapping.get("price") and mapping["price"] in parsed.num:
         pt, pv = parsed.num[mapping["price"]]
         price = [(float(a_), float(b_)) for a_, b_ in zip(pt, pv) if np.isfinite(b_)]
-    T, stuck = mask_stuck(T, step_min, min_h=stuck_h) if stuck_h else (T, np.zeros(T.shape[1]))
     # complete where every room with a thermometer and the outside are known (a room without one is reckoned, not checked)
     seen = [i for i, z in enumerate(layout.zone_ids) if zones.get(z, {}).get("thermometer") in parsed.num]
     valid = np.isfinite(T[:, seen]).all(axis=1) & np.isfinite(tout) if seen else np.isfinite(tout)
+    # a reading that stands still for hours is not checked against, but leaves the day complete: a quiet
+    # hallway at night reads the same for hours and is right (and the model runs on through it either way)
+    T, stuck = mask_stuck(T, step_min, min_h=stuck_h) if stuck_h else (T, np.zeros(T.shape[1]))
     # the model runs on through a longer gap outside (filled straight across), it is only not checked there
     tout = bridge(tout)
     for i, z in enumerate(layout.zone_ids):
