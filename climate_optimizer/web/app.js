@@ -1134,18 +1134,69 @@ pages.model = async () => {
 };
 
 // ---- settings ---------------------------------------------------------------------
-const SETTING_FIELDS = [
-  ['horizon_min_h', 'Plan at least (h; past the known prices, those of the day before)', 1], ['horizon_max_h', 'Plan at most (h)', 1],
-  ['min_run_min', 'Compressor: minimum run (min)', 1], ['min_off_min', 'Compressor: minimum pause (min)', 1],
-  ['start_cost', 'Compressor: wear per start (€)', 0.01],
-  ['heater_min_run_min', 'Heaters: minimum run (min)', 1], ['heater_min_off_min', 'Heaters: minimum pause (min)', 1],
-  ['heater_off_after_run_min', 'Heaters: off after a run (min)', 0.5],
-  ['terminal_quantile', 'Value heat left at the end at this price quantile', 0.05],
-  ['window_assume_open_min', 'An open window closes after (min)', 1],
-  ['window_open_after_min', 'An opened window counts once open (min)', 0.5],
-  ['heat_below_outdoor', 'Heat only if colder outside than (°C)', 0.5], ['cool_above_outdoor', 'Cool only if warmer outside than (°C)', 0.5],
-  ['time_limit_s', 'Solver time limit (s)', 1], ['binary_h', 'On/off planned exactly for (h); after that as shares of each step', 0.05],
-  ['plan_lead_s', 'Plan this long before each 5-minute mark (s; 0: by itself)', 5],
+// a small (i) beside a label: its text in a popover, instead of paragraphs under each section
+const infoBtn = text => text ? `<button type="button" class="info" data-info="${esc(text)}" aria-label="About this setting">i</button>` : '';
+const lab = (label, info) => `<span class="lab">${label}${infoBtn(info)}</span>`;
+function infoPopovers(root) {
+  let pop = document.getElementById('info-pop');
+  if (!pop) {
+    pop = Object.assign(document.createElement('div'), { id: 'info-pop', className: 'info-pop', hidden: true });
+    pop.setAttribute('role', 'tooltip');
+    document.body.appendChild(pop);
+    const close = () => { pop.hidden = true; document.querySelectorAll('.info[aria-expanded="true"]').forEach(b => b.setAttribute('aria-expanded', 'false')); };
+    document.addEventListener('click', e => { if (!e.target.closest('.info') && !e.target.closest('.info-pop')) close(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+    window.addEventListener('resize', close);
+    pop.close = close;
+  }
+  root.querySelectorAll('.info').forEach(b => b.onclick = e => {
+    e.preventDefault(); e.stopPropagation();  // a button in a label: not a click on its input
+    const open = b.getAttribute('aria-expanded') === 'true';
+    pop.close();
+    if (open) return;
+    pop.textContent = b.dataset.info;
+    pop.hidden = false;
+    b.setAttribute('aria-expanded', 'true');
+    const r = b.getBoundingClientRect(), w = pop.offsetWidth;
+    pop.style.left = Math.max(8, Math.min(window.scrollX + r.left - 12, window.scrollX + document.documentElement.clientWidth - w - 8)) + 'px';
+    pop.style.top = (window.scrollY + r.bottom + 6) + 'px';
+  });
+}
+
+const SETTINGS_TABS = [
+  ['connection', 'Connection'], ['rooms', 'Rooms & units'], ['power', 'Outside & power'],
+  ['prices', 'Prices'], ['planning', 'Planning'], ['model', 'Model & data'],
+];
+// the optimizer's own settings, grouped: [key, label, step, what it does]
+const PLAN_GROUPS = () => [
+  ['How far ahead', [
+    ['horizon_min_h', 'Plan at least (h)', 1, 'Past the last known price the plan takes the prices of the day before. It plans at least this long, so its end, where it lets rooms cool because heat there is of no use to it any more, lies past the day it plans for.'],
+    ['horizon_max_h', 'Plan at most (h)', 1, 'However many prices are known, no further than this: longer plans take longer to solve.'],
+    ['terminal_quantile', 'Value heat left at the end at this price quantile', 0.05, 'Heat still in the rooms where the plan ends is worth what electricity costs at this quantile of the plan’s prices (0.25: a cheap hour), so the plan neither empties the rooms towards its end nor stocks them up.'],
+  ]],
+  ['How exactly, and when', [
+    ['binary_h', 'On/off planned exactly for (h)', 0.05, 'For this long the plan decides each unit on or off at every step; after that, what share of each step it runs (a third, say), which the units do in pulses, so the plan shows the average and the room swings around it. Longer shows the pulses in the plan, but every plan takes longer, and only its first step is ever done: the next plan decides anew. 0.25 by default.'],
+    ['plan_lead_s', 'Start each plan before the 5-minute mark (s)', 5, `Each plan on the clock decides the step from the next five-minute mark and starts this long before it. 0: by itself, as long before as the slower plans of late took, half as much again and half a minute (1 to 4.5 minutes; now ${num(S.status?.plan_lead_s, 0)} s). Sooner, it decides on older readings; later, it may not be done in time.`],
+    ['time_limit_s', 'Solver time limit (s)', 1, 'The most each solve may take; the best plan found by then is used, and the overview says "time limit". A plan solves several times (heating, maybe cooling, a check per unit whether to start now), so it can take a few times this long.'],
+  ]],
+  ['Compressor (AC units)', [
+    ['min_run_min', 'Minimum run (min)', 1, 'Once started, the outdoor unit runs at least this long. Short runs waste the minutes it takes to warm up.'],
+    ['min_off_min', 'Minimum pause (min)', 1, 'Once stopped, it stays off at least this long.'],
+    ['start_cost', 'Wear per start (€)', 0.01, 'What a start of the compressor costs beyond its electricity (that, the spike when it comes on, is learned with the model): so the plan does not switch for a few cents.'],
+  ]],
+  ['Heaters', [
+    ['heater_min_run_min', 'Minimum run (min)', 1, 'A heater has no compressor to spare: no cost to a start, and its own short minimum run.'],
+    ['heater_min_off_min', 'Minimum pause (min)', 1, 'Once off, a heater stays off at least this long.'],
+    ['heater_off_after_run_min', 'Off after a run (min)', 0.5, 'After a run asked for by a button ends, the heater stays off this long, so the button feels like a switch.'],
+  ]],
+  ['Windows', [
+    ['window_open_after_min', 'An opened window counts once open (min)', 0.5, 'The plan takes an opened window into account only once it has been open this long: stepping onto the balcony changes nothing.'],
+    ['window_assume_open_min', 'An open window closes after (min)', 1, 'An open window is planned as open for this long from now, the units in its room off meanwhile; then as closed again.'],
+  ]],
+  ['Heating or cooling', [
+    ['heat_below_outdoor', 'Heat only if colder outside than (°C)', 0.5, 'With the season on auto: heating is considered only when it gets colder than this outside within a day.'],
+    ['cool_above_outdoor', 'Cool only if warmer outside than (°C)', 0.5, 'With the season on auto: cooling is considered only when it gets warmer than this outside within a day.'],
+  ]],
 ];
 
 pages.settings = async () => {
@@ -1156,84 +1207,130 @@ pages.settings = async () => {
   const L = C.layout;
   const M = C.mapping = C.mapping || {};
   M.zones = M.zones || {}; M.units = M.units || {};
-  const field = (label, path, kind) => `<label class="field">${label}${entitySelect(path, kind, get(C, path) || '')}</label>`;
+  let tab = S.setTab;
+  if (!tab) { try { tab = localStorage.getItem('co-settings-tab'); } catch { } }
+  if (!SETTINGS_TABS.some(([k]) => k === tab)) tab = 'connection';
+  const field = (label, path, kind, info) => `<label class="field">${lab(label, info)}${entitySelect(path, kind, get(C, path) || '')}</label>`;
+  const multi = (label, path, kind, info) => `<label class="field">${lab(label, info)}${entityMulti(path, kind, get(C, path))}</label>`;
+  const numIn = (label, path, step, info, attrs = '') => `<label class="field">${lab(label, info)}<input type="number" step="${step}" data-path="${path}" value="${get(C, path) ?? ''}" ${attrs}></label>`;
+  const group = (title, body, info) => `<div class="set-group"><h4>${title}${infoBtn(info)}</h4>${body}</div>`;
+  const section = (key, body) => `<section class="set-tab" data-tab="${key}" ${key === tab ? '' : 'hidden'}>${body}</section>`;
+  const optimizerUrl = location.origin + location.pathname.replace(/\/$/, '');
+
   const build = S.status?.build ? `<span class="hint" title="when the optimizer’s files were last changed: after an update, the time of the update">version of ${fmtDay(S.status.build, S.tz)} ${fmtTime(S.status.build, S.tz)}</span>` : '';
-  let html = `<div class="toolbar"><h2 style="margin:0">Settings</h2>${build}<span class="spacer"></span><span id="st-msg" class="hint"></span><button class="primary" id="st-save">Save</button></div>`;
-  html += `<div class="card"><h3>Mode</h3>
-    <label class="check"><input type="checkbox" data-path="shadow" ${C.shadow ? 'checked' : ''}> Shadow mode: plan and show, but let the proxies’ own thermostats decide</label>
-    <p class="hint">Set each proxy to <b>auto</b> and point its <code>optimizer_url</code> here: <code>${esc(location.origin + location.pathname.replace(/\/$/, ''))}</code>. In shadow mode the optimizer answers <code>follow: false</code>.</p>
-    <h3 style="margin-top:14px">In shadow mode</h3>
-    <p class="hint">To watch the optimizer beside another automation that switches the units and moves their setpoints: plan these units even when their proxy is off or not in auto, and use these comfort temperatures instead of the proxies’ targets. Outside shadow mode the proxies decide both.</p>
-    <div class="table-wrap"><table><tr><th>Unit</th><th>Plan it anyway</th><th>Comfort temperature of its room</th></tr>
-    ${L.units.map((u, i) => {
-      const first = L.units.findIndex(v => v.zone === u.zone) === i;
-      const zname = (L.zones.find(z => z.id === u.zone) || {}).name || u.zone;
-      return `<tr><td>${esc(u.name)}</td><td><label class="check"><input type="checkbox" data-shadow-unit="${u.id}" ${(C.shadow_units || []).includes(u.id) ? 'checked' : ''}> even when its proxy is off</label></td>
-        <td>${first ? `<input type="number" step="0.5" style="width:90px" data-shadow-comfort="${u.zone}" value="${C.shadow_comfort?.[u.zone] ?? ''}" placeholder="proxy’s"> °C <span class="hint">${esc(zname)}</span>` : ''}</td></tr>`;
-    }).join('')}</table></div>
-    <div class="fields" style="margin-top:12px"><label class="field">API token for proxies and this page<input type="password" data-path="api_token" value="${esc(C.api_token)}" placeholder="none"></label></div>
-    ${C.api_token ? '' : '<p class="hint">Without a token, anyone on your network can change these settings. Set one, and give it to the proxies as <code>optimizer_token</code>. Changing the Home Assistant address asks for its token again.</p>'}</div>`;
-  html += `<div class="card"><h3>Home Assistant</h3><div class="fields wide">
-    <label class="field">URL<input data-path="ha.url" value="${esc(C.ha.url)}" placeholder="http://homeassistant.local:8123" ${C.env?.ha_url ? 'disabled' : ''}>${C.env?.ha_url ? '<span class="hint">set by the container’s HA_URL</span>' : ''}</label>
-    <label class="field">Long-lived access token<input type="password" data-path="ha.token" value="${esc(C.ha.token)}" ${C.env?.ha_token ? 'disabled' : ''}>${C.env?.ha_token ? '<span class="hint">set by the container’s HA_TOKEN</span>' : ''}</label></div>
-    <label class="check" style="margin-top:8px"><input type="checkbox" data-path="ha.verify_ssl" ${C.ha.verify_ssl ? 'checked' : ''}> Verify TLS certificate</label>
-    <p class="hint">${S.status.ha.connected ? 'Connected to Home Assistant ' + esc(S.status.ha.version) + '.' : 'Not connected: ' + esc(S.status.ha.error || '') + '. The entity lists below fill once it is.'}</p></div>`;
-  html += `<div class="card"><h3>Rooms</h3><div class="table-wrap"><table><tr><th>Room</th><th>Thermometer</th><th>Window and door sensors</th><th>Windows face</th><th>Names in calendar events</th></tr>`;
+  let html = `<div class="toolbar"><h2 style="margin:0">Settings</h2>${build}</div>
+    <div class="chips set-tabs" role="tablist">${SETTINGS_TABS.map(([k, t]) => `<button type="button" role="tab" class="chip ${k === tab ? 'active' : ''}" data-tab="${k}" aria-selected="${k === tab}">${t}</button>`).join('')}</div>`;
+
+  // Connection
+  html += section('connection', `<div class="card">
+    ${group('Home Assistant', `<div class="fields wide">
+      <label class="field">${lab('URL', 'Where the optimizer reaches Home Assistant. Changing it asks for the token again, so a token never goes to another address.')}<input data-path="ha.url" value="${esc(C.ha.url)}" placeholder="http://homeassistant.local:8123" ${C.env?.ha_url ? 'disabled' : ''}>${C.env?.ha_url ? '<span class="hint">set by the container’s HA_URL</span>' : ''}</label>
+      <label class="field">${lab('Long-lived access token', 'From your Home Assistant profile, Security, Long-lived access tokens.')}<input type="password" data-path="ha.token" value="${esc(C.ha.token)}" ${C.env?.ha_token ? 'disabled' : ''}>${C.env?.ha_token ? '<span class="hint">set by the container’s HA_TOKEN</span>' : ''}</label></div>
+      <label class="check" style="margin-top:8px"><input type="checkbox" data-path="ha.verify_ssl" ${C.ha.verify_ssl ? 'checked' : ''}> Verify TLS certificate</label>
+      <p class="hint">${S.status.ha.connected ? 'Connected to Home Assistant ' + esc(S.status.ha.version) + '.' : 'Not connected: ' + esc(S.status.ha.error || '') + '. The entity lists fill once it is.'}</p>`)}
+    ${group('The proxies and this page', `<div class="fields wide">
+      <label class="field">${lab('API token', 'Asked from the proxies (as optimizer_token) and from this page. Without one, anyone on your network can change these settings.')}<input type="password" data-path="api_token" value="${esc(C.api_token)}" placeholder="none"></label>
+      <label class="field">${lab('Address for the proxies', 'Set each proxy to auto, with this as its optimizer_url.')}<input readonly value="${esc(optimizerUrl)}" onclick="this.select()"></label></div>
+      ${C.api_token ? '' : '<p class="hint">No API token set: anyone on your network can change these settings.</p>'}`)}
+    ${group('Shadow mode', `<label class="check"><input type="checkbox" data-path="shadow" ${C.shadow ? 'checked' : ''}> Plan and show, but let the proxies’ own thermostats decide</label>
+      <details class="set-more"><summary>Watching beside another automation</summary>
+      <div class="set-rows">${L.units.map((u, i) => {
+        const first = L.units.findIndex(v => v.zone === u.zone) === i;
+        return `<div class="set-row"><b>${esc(u.name)}</b>
+          <label class="check"><input type="checkbox" data-shadow-unit="${u.id}" ${(C.shadow_units || []).includes(u.id) ? 'checked' : ''}> plan it even when its proxy is off</label>
+          ${first ? `<label class="check">comfort <input type="number" step="0.5" style="width:80px" data-shadow-comfort="${u.zone}" value="${C.shadow_comfort?.[u.zone] ?? ''}" placeholder="proxy’s"> °C in ${esc(zoneName(u.zone))}</label>` : ''}</div>`;
+      }).join('')}</div></details>`, 'In shadow mode the optimizer answers the proxies "follow: false". To watch it beside another automation that switches the units and moves their setpoints, it can plan units whose proxy is off, with comfort temperatures of its own instead of the proxies’ targets.')}
+  </div>`);
+
+  // Rooms & units
+  let rooms = '';
   for (const z of L.zones) {
     M.zones[z.id] = M.zones[z.id] || {};
     const fac = z.facades || [];
-    html += `<tr><td>${esc(z.name)}</td><td>${entitySelect(`mapping.zones.${z.id}.thermometer`, 'temp', M.zones[z.id].thermometer || '')}</td>
-      <td>${z.windows ? entityMulti(`mapping.zones.${z.id}.windows`, 'opening', M.zones[z.id].windows) : '<span class="hint">none in the layout</span>'}</td>
-      <td>${z.solar === false ? '<span class="hint">no windows</span>' : `<div class="days" style="flex-wrap:nowrap">${['N', 'E', 'S', 'W'].map(f => `<label><input type="checkbox" data-facade="${z.id}" value="${f}" ${fac.includes(f) ? 'checked' : ''}>${f}</label>`).join('')}</div>`}</td>
-      <td><input data-alias="${z.id}" value="${esc((z.aliases || []).join(', '))}" placeholder="${esc({ office: 'Büro', bedroom: 'Schlafzimmer', living: 'Wohnzimmer, Küche', bath: 'Bad', hall: 'Flur' }[z.id] || 'more names')}" style="width:100%;min-width:120px"></td></tr>`;
+    rooms += `<div class="set-item"><h5>${esc(z.name)}</h5><div class="fields">
+      <label class="field">${lab('Thermometer', 'The room’s air temperature.')}${entitySelect(`mapping.zones.${z.id}.thermometer`, 'temp', M.zones[z.id].thermometer || '')}</label>
+      ${z.windows ? `<label class="field">${lab('Window and door sensors', 'Open, they let heat out (the model knows how much), and the units in the room stay off.')}${entityMulti(`mapping.zones.${z.id}.windows`, 'opening', M.zones[z.id].windows)}</label>` : ''}
+      ${z.solar === false ? '' : `<div class="field">${lab('Windows face', 'Where the room gets its sun from. Ticked, the model looks for direct sun only from those sides (north gets none), which it learns much sooner; none ticked, it looks everywhere. Retrain after changing it.')}<div class="days" style="flex-wrap:nowrap">${['N', 'E', 'S', 'W'].map(f => `<label><input type="checkbox" data-facade="${z.id}" value="${f}" ${fac.includes(f) ? 'checked' : ''}>${f}</label>`).join('')}</div></div>`}
+      <label class="field">${lab('Names in calendar events', 'Other names for the room in calendar events, comma separated, e.g. "Wohnzimmer, Küche".')}<input data-alias="${z.id}" value="${esc((z.aliases || []).join(', '))}" placeholder="${esc({ office: 'Büro', bedroom: 'Schlafzimmer', living: 'Wohnzimmer, Küche', bath: 'Bad', hall: 'Flur' }[z.id] || 'more names')}"></label>
+    </div></div>`;
   }
-  html += `</table></div><p class="hint">Windows face: where each room gets its sun from. Ticked, the model only looks for direct sun from those sides (north gets none), which it learns much faster; none ticked, it looks everywhere. Retrain after changing it.</p></div>`;
-  html += `<div class="card"><h3>Units</h3><div class="table-wrap"><table><tr><th>Unit</th><th>Proxy (what the optimizer answers)</th><th>Device under the proxy</th><th>${L.units.some(u => u.kind === 'heater') ? 'Heater energy (kWh) or power (W)' : ''}</th></tr>`;
+  let units = '';
   for (const u of L.units) {
     M.units[u.id] = M.units[u.id] || {};
-    html += `<tr><td>${esc(u.name)}<div class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</div></td>
-      <td>${entitySelect(`mapping.units.${u.id}.proxy`, 'climate', M.units[u.id].proxy || '')}</td>
-      <td>${entitySelect(`mapping.units.${u.id}.source`, u.kind === 'ac' ? 'climate' : 'switch', M.units[u.id].source || '')}
-      ${u.kind === 'ac' ? `<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" data-fan-for="${u.id}" value="${esc((M.units[u.id].fan_modes || []).join(', '))}" style="width:100%;margin-top:4px">
-        <div class="hint" data-fan-hint="${u.id}"></div>` : ''}</td>
-      <td>${u.kind === 'heater' ? entitySelect(`mapping.units.${u.id}.power`, 'power', M.units[u.id].power || '') : ''}</td></tr>`;
+    units += `<div class="set-item"><h5>${esc(u.name)} <span class="hint">${u.kind === 'ac' ? u.levels + ' fan levels' : 'heater'}</span></h5><div class="fields">
+      <label class="field">${lab('Proxy', 'The proxy climate entity: the optimizer answers it.')}${entitySelect(`mapping.units.${u.id}.proxy`, 'climate', M.units[u.id].proxy || '')}</label>
+      <label class="field">${lab('Device under the proxy', u.kind === 'ac' ? 'The AC’s own climate entity: its history tells the model what the unit did.' : 'The heater’s switch or plug.')}${entitySelect(`mapping.units.${u.id}.source`, u.kind === 'ac' ? 'climate' : 'switch', M.units[u.id].source || '')}</label>
+      ${u.kind === 'ac' ? `<label class="field">${lab('Fan modes, quietest first', 'The device’s fan modes the proxy uses (its source_fan_modes), comma separated; level 0 is the first. Empty: the list the proxy sends.')}<input data-path="mapping.units.${u.id}.fan_modes" data-list="1" data-fan-for="${u.id}" value="${esc((M.units[u.id].fan_modes || []).join(', '))}"><span class="hint" data-fan-hint="${u.id}"></span></label>` : ''}
+      ${u.kind === 'heater' ? `<label class="field">${lab('Energy (kWh) or power (W)', 'The heater’s plug: what it draws, for the model and the electricity charts.')}${entitySelect(`mapping.units.${u.id}.power`, 'power', M.units[u.id].power || '')}</label>` : ''}
+    </div></div>`;
   }
-  html += `</table></div><p class="hint">Fan modes: the device’s fan modes the proxy uses, quietest first (its <code>source_fan_modes</code>); level 0 is the first. Left empty, the optimizer takes the list the proxy sends.</p></div>`;
-  html += `<div class="card"><h3>Outside, power and prices</h3><div class="fields wide">
-    ${field('Outdoor thermometer', 'mapping.outdoor', 'temp')}
-    ${field('Weather (forecast)', 'mapping.weather', 'weather')}
-    ${field('Phase with the outdoor unit: energy (kWh) or power (W)', 'mapping.phase', 'power')}
-    <label class="field">On that phase, metered on their own (taken off it): energy (kWh) or power (W)${entityMulti('mapping.phase_subtract', 'power', M.phase_subtract)}</label>
-    <label class="field">Other phases: energy (kWh) or power (W)${entityMulti('mapping.phases_other', 'power', M.phases_other)}</label>
-    ${field('Car charger: energy (kWh) or power (W), optional', 'mapping.car', 'power')}
-    <label class="field">Prices from<select data-path="prices.source"><option value="tibber_prices" ${C.prices.source === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${C.prices.source === 'attributes' ? 'selected' : ''}>a sensor's attributes</option><option value="fixed" ${C.prices.source === 'fixed' ? 'selected' : ''}>a fixed tariff (below)</option></select></label>
-    <label class="field">tibber_prices entry id (if several)<input data-path="prices.entry_id" value="${esc(C.prices.entry_id || '')}"></label>
-    ${field('Price sensor', 'prices.sensor', 'price')}
-    </div>
-    <h4 style="margin:14px 0 6px">Fixed tariff</h4>
-    <div class="fields"><label class="field">Price (€/kWh)<input type="number" step="0.001" data-path="prices.fixed_price" value="${C.prices.fixed_price ?? 0.3}"></label></div>
-    <div class="table-wrap"><table id="tariff"><tr><th>From</th><th>To</th><th>€/kWh</th><th>Days (none: every day)</th><th></th></tr>
-      ${(C.prices.fixed_periods || []).map(tariffRow).join('')}</table></div>
-    <button id="tariff-add" type="button">Add a time with its own price</button>
-    <p class="hint">With "a fixed tariff", the price above holds whenever none of the times below does: for a day and night rate, the day price above and 22:00 to 06:00 at the night price; for a cheaper weekend, add one from 00:00 to 00:00 (the whole day) on Sa and Su. A time ending before it starts runs past midnight, on the nights it starts. Where times overlap, the lower one in the list wins. With one price at all hours, the plan still saves energy and heats when the heat pump works best, but has no cheap hours to heat ahead into.</p>
-    <p class="hint">For the phases, the car and the heater an energy meter (kWh) is the better choice where there is one: the power over each five minutes comes from the difference of its readings, which counts everything, where a power sensor's reports miss what happens between them. Outdoor thermometer: best one in the shade. One in the sun reads high in the afternoon (on the south balcony up to 5 K), and the model takes that for warm weather; without one, the weather entity's temperature is used. The price sensor is also recorded for the history. With "a sensor's attributes", any list of entries with a start time and a price is understood (Nord Pool, EPEX Spot, Tibber).</p></div>`;
-  html += `<div class="card"><h3>Optimizer</h3><label class="check"><input type="checkbox" data-path="settings.plan_correction" ${C.settings.plan_correction !== false ? 'checked' : ''}> Correct the plans by their recent misses (an hour on, per room)</label><div class="fields">${SETTING_FIELDS.map(([k, label, step]) => `<label class="field">${label}<input type="number" step="${step}" data-path="settings.${k}" value="${C.settings[k]}"></label>`).join('')}
-    <label class="field">Season<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${C.settings.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
-    <p class="hint">Starts cost wear: a compressor start is priced so the plan does not switch for a few cents (its electricity, the spike when it comes on, is learned with the model). Heaters have no compressor to spare: no cost to a start, and their own, short minimum run and pause. On/off is planned exactly for the first quarter hour by default; after that the plan counts what share of each step a unit runs (a third, say), which the units do in pulses, so the plan shows the average and the room swings around it. Planning on/off exactly for longer shows the pulses in the plan, but every plan takes longer (the overview shows how long: "planned in … s"; it has to be done before the step it decides begins) and only its first step is ever done: the next plan, five minutes later, decides anew. Each plan on the clock starts a while before a five-minute mark and decides the step from that mark on; by itself, it starts as long before as the slower plans of late took, and half as much again plus half a minute (at least one minute, at most four and a half; now ${num(S.status?.plan_lead_s, 0)} s): sooner, it decides on older readings, later, it may not be done in time.</p></div>`;
-  html += `<div class="card"><h3>Training</h3><div class="fields">
-    <label class="field">Retrain every night at (hour)<input type="number" min="0" max="23" data-path="retrain_hour" value="${C.retrain_hour}"></label>
-    <label class="field">History kept and trained on (days)<input type="number" min="3" max="365" data-path="history_days" value="${C.history_days}"></label></div>
-    <div class="row" style="margin-top:10px"><label class="field">Load an export (browser snippet or diagnostics file)<input type="file" id="import-file" accept=".json,.gz,application/json,application/gzip"></label><span id="import-msg" class="hint"></span></div></div>`;
-  html += `<div class="card"><h3>Layout (advanced)</h3><p class="hint">Rooms, how they connect, and which units heat them. Changing it means retraining.</p>
-    <textarea id="layout-json" rows="12">${esc(JSON.stringify(C.layout, null, 2))}</textarea>
-    <div class="fields" style="margin-top:8px"><label class="field">Latitude (default: Home Assistant’s)<input type="number" step="0.1" id="lat" value="${C.location?.lat ?? ''}"></label><label class="field">Longitude<input type="number" step="0.1" id="lon" value="${C.location?.lon ?? ''}"></label></div></div>`;
+  html += section('rooms', `<div class="card">${group('Rooms', rooms)}</div><div class="card">${group('Units', units)}</div>`);
+
+  // Outside & power
+  html += section('power', `<div class="card">
+    ${group('Outside', `<div class="fields wide">
+      ${field('Outdoor thermometer', 'mapping.outdoor', 'temp', 'Best one in the shade: one in the sun reads high in the afternoon (on a south balcony up to 5 K), and the model takes that for warm weather. Without one, the weather entity’s temperature is used.')}
+      ${field('Weather (forecast)', 'mapping.weather', 'weather', 'For the hours ahead: the outdoor temperature and the clouds, from which the sun on each side of the apartment is reckoned.')}
+      <label class="field">${lab('Latitude', 'For the sun’s path. Empty: Home Assistant’s.')}<input type="number" step="0.1" id="lat" value="${C.location?.lat ?? ''}"></label>
+      <label class="field">${lab('Longitude', 'For the sun’s path. Empty: Home Assistant’s.')}<input type="number" step="0.1" id="lon" value="${C.location?.lon ?? ''}"></label></div>`)}
+    ${group('Power', `<div class="fields wide">
+      ${field('Phase with the outdoor unit', 'mapping.phase', 'power', 'What the outdoor unit draws is learned from this phase: energy (kWh) or power (W). An energy meter is better where there is one: the power over each five minutes comes from the difference of its readings, which counts everything; a power sensor’s reports miss what happens between them.')}
+      ${multi('On that phase, metered on their own', 'mapping.phase_subtract', 'power', 'Loads on the same phase with a meter of their own (a plug): taken off it, so less of what is not the units is left.')}
+      ${multi('Other phases', 'mapping.phases_other', 'power', 'For the whole household (tariffs compared) and to tell three-phase car charging, which is left out of the power fit.')}
+      ${field('Car charger (optional)', 'mapping.car', 'power', 'What the car draws, left out of the power fit.')}</div>`)}
+  </div>`);
+
+  // Prices
+  const src = C.prices.source;
+  html += section('prices', `<div class="card">
+    ${group('Where prices come from', `<div class="fields wide">
+      <label class="field">${lab('Prices from', 'tibber_prices: the get_price action of the Tibber Prices integration. A sensor’s attributes: any list of entries with a start time and a price (Nord Pool, EPEX Spot, Tibber); cents are recognised. A fixed tariff: below.')}<select data-path="prices.source" id="price-src"><option value="tibber_prices" ${src === 'tibber_prices' ? 'selected' : ''}>tibber_prices.get_price</option><option value="attributes" ${src === 'attributes' ? 'selected' : ''}>a sensor's attributes</option><option value="fixed" ${src === 'fixed' ? 'selected' : ''}>a fixed tariff</option></select></label>
+      <label class="field" data-when-src="tibber_prices">${lab('tibber_prices entry id', 'Only if the Tibber Prices integration is set up more than once.')}<input data-path="prices.entry_id" value="${esc(C.prices.entry_id || '')}" placeholder="only if several"></label>
+      ${field('Price sensor', 'prices.sensor', 'price', 'With "a sensor’s attributes", the sensor listing the prices. Also recorded, for the price history.')}</div>`)}
+    <div data-when-src="fixed">${group('Fixed tariff', `<div class="fields"><label class="field">${lab('Price (€/kWh)', 'Whenever none of the times below holds.')}<input type="number" step="0.001" data-path="prices.fixed_price" value="${C.prices.fixed_price ?? 0.3}"></label></div>
+      <div class="table-wrap"><table id="tariff"><tr><th>From</th><th>To</th><th>€/kWh</th><th>Days (none: every day)</th><th></th></tr>
+        ${(C.prices.fixed_periods || []).map(tariffRow).join('')}</table></div>
+      <button id="tariff-add" type="button">Add a time with its own price</button>`, 'For a day and night rate: the day price above and 22:00 to 06:00 at the night price. For a cheaper weekend: 00:00 to 00:00 (the whole day) on Sa and Su. A time ending before it starts runs past midnight, on the nights it starts; where times overlap, the lower one in the list wins. With one price at all hours the plan has no cheap hours to heat ahead into, but still bundles heating and heats when the heat pump works best.')}</div>
+  </div>`);
+
+  // Planning
+  const st = C.settings;
+  html += section('planning', `<div class="card">
+    ${PLAN_GROUPS().map(([title, rows]) => group(title, `<div class="fields">${rows.map(([k, label, step, info]) => numIn(label, `settings.${k}`, step, info)).join('')}
+      ${title === 'Heating or cooling' ? `<label class="field">${lab('Season', 'auto: heating or cooling as the coming day needs (see the two temperatures); heat or cool: only that.')}<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${st.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>` : ''}</div>`)).join('')}
+    ${group('Corrections', `<label class="check"><input type="checkbox" data-path="settings.plan_correction" ${st.plan_correction !== false ? 'checked' : ''}> Correct the plans by what the model kept getting wrong</label>`, 'Every five minutes the model is run again over the last hour with what the units really did, and held against the thermometers; what it keeps missing a room by goes into the plans as heat the room gains or loses beyond the model. The Model page shows it per room.')}
+  </div>`);
+
+  // Model & data
+  html += section('model', `<div class="card">
+    ${group('Training', `<div class="fields">
+      ${numIn('Retrain every night at (hour)', 'retrain_hour', 1, 'The model is fitted anew every night at this hour, from the history below.', 'min="0" max="23"')}
+      ${numIn('History kept and trained on (days)', 'history_days', 1, 'How many days are kept, trained on and shown.', 'min="3" max="365"')}</div>`)}
+    ${group('Import', `<div class="row"><label class="field">${lab('Load an export', 'The browser snippet’s export or a diagnostics file: its history goes into the store, for training on more days than Home Assistant’s recorder keeps.')}<input type="file" id="import-file" accept=".json,.gz,application/json,application/gzip"></label><span id="import-msg" class="hint"></span></div>`)}
+    <details class="set-more"><summary>Layout (advanced)</summary><p class="hint">Rooms, how they connect, and which units heat them, as JSON. Changing it means retraining.</p>
+      <textarea id="layout-json" rows="14">${esc(JSON.stringify(C.layout, null, 2))}</textarea></details>
+  </div>`);
+
+  html += `<div class="savebar"><span id="st-msg" class="hint"></span><span class="spacer"></span><button class="primary" id="st-save">Save</button></div>`;
   root.innerHTML = html;
+  document.documentElement.style.setProperty('--hdr', (document.querySelector('header')?.offsetHeight || 0) + 'px');
+  infoPopovers(root);
+  root.querySelectorAll('.set-tabs [data-tab]').forEach(b => b.onclick = () => {
+    S.setTab = b.dataset.tab;
+    try { localStorage.setItem('co-settings-tab', b.dataset.tab); } catch { }
+    root.querySelectorAll('.set-tabs [data-tab]').forEach(x => { x.classList.toggle('active', x === b); x.setAttribute('aria-selected', x === b); });
+    root.querySelectorAll('section.set-tab').forEach(sec => { sec.hidden = sec.dataset.tab !== b.dataset.tab; });
+    b.scrollIntoView({ block: 'nearest', inline: 'center' });
+  });
+  const showSrc = () => root.querySelectorAll('[data-when-src]').forEach(el => { el.hidden = el.dataset.whenSrc !== $('#price-src').value; });
+  $('#price-src').addEventListener('change', showSrc);
+  showSrc();
   root.querySelectorAll('[data-multi]').forEach(initMulti);
   root.querySelectorAll('select[data-kind="power"]').forEach(sel => { powerCheck(sel); sel.addEventListener('change', () => powerCheck(sel)); });
   // what each AC device offers, next to its fan modes
   const fanHint = uid => {
-    const src = root.querySelector(`[data-path="mapping.units.${uid}.source"]`)?.value;
-    const offered = (S.entities || []).find(e => e.id === src)?.fan_modes;
+    const src_ = root.querySelector(`[data-path="mapping.units.${uid}.source"]`)?.value;
+    const offered = (S.entities || []).find(e => e.id === src_)?.fan_modes;
     const inp = root.querySelector(`[data-fan-for="${uid}"]`);
     const hint = root.querySelector(`[data-fan-hint="${uid}"]`);
     inp.placeholder = 'empty: as the proxy reports them';
@@ -1261,6 +1358,7 @@ pages.settings = async () => {
     const msg = $('#st-msg');
     root.querySelectorAll('[data-path]').forEach(inp => {
       if (inp.dataset.multi !== undefined) { set(C, inp.dataset.path, JSON.parse(inp.dataset.multi)); return; }
+      if (inp.disabled) return;
       if (inp.type === 'number' && inp.value === '') return;  // left empty: keeps its value (or the default)
       let v = inp.type === 'checkbox' ? inp.checked : inp.type === 'number' ? +inp.value : inp.value.trim();
       if (inp.dataset.list) v = String(v).split(',').map(s => s.trim()).filter(Boolean);
@@ -1284,7 +1382,7 @@ pages.settings = async () => {
     try {
       S.config = await api('config', { method: 'PUT', body: JSON.stringify(C) });
       msg.textContent = 'Saved.';
-      setTimeout(() => pages.settings(), 800);
+      setTimeout(() => { if (current === 'settings') pages.settings(); }, 800);
     } catch (e) { msg.textContent = 'Not saved: ' + e.message; }
   };
 };
