@@ -1043,7 +1043,13 @@ class Planner:
             info["steps"] = took["steps"]
             self.planning["stage"] = "solving"
             t_solve = time.time()
-            plan = await asyncio.to_thread(mpc.solve, pr, solves)
+            # from the last plan, moved on to now: unless asked for (an override, a run: it no longer
+            # holds), older than a quarter of an hour, or for other units
+            prev = self.state.plan
+            if (fresh or prev is None or now - (self.state.created or 0) > 15 * MIN
+                    or set(prev.share) != {u.id for u in pr.units}):
+                prev = None
+            plan = await asyncio.to_thread(mpc.solve, pr, solves, prev)
             info["solve_seconds"] = round(time.time() - t_solve, 1)  # every solve of this plan, not only the chosen one
             info["plan_seconds"] = round(time.time() - t_begin, 1)  # and fetching and building it
             info["solves"] = solves

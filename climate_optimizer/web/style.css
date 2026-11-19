@@ -264,3 +264,4 @@ button:disabled { opacity: 0.5; cursor: default; }
 .steps-sum table { max-width: 640px; }
 .steps-sum td.num, .steps-sum th.num { white-space: nowrap; }
 .steps-sum td .hint { font-size: 12px; }
+.fields .span-all { grid-column: 1 / -1; }

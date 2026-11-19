@@ -28,16 +28,23 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import logging
 import math
 import os
 import sys
 import threading
 import time
+import types
 from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import coo_matrix
+
+try:  # HiGHS itself: a solve can start from a plan and stop once it stops improving
+    import highspy as _highspy
+except Exception:  # pragma: no cover - without it scipy's milp, from cold, to the time limit
+    _highspy = None
 
 from .comfort import ComfortFunction, Side
 from .model.layout import Layout, Params
@@ -70,6 +77,8 @@ class Settings:
     cool_above_outdoor: float = 20.0  # auto: cooling only if it gets warmer than this within a day
     time_limit_s: float = 20.0
     mip_gap: float = 0.01
+    warm_start: bool = True  # each solve starts from the last plan (its on/off moved on to now)
+    stall_s: float = 10.0  # a solve stops once its plan has not improved for this long; 0: only the time limit
 
     @staticmethod
     def from_dict(d: dict) -> Settings:
@@ -367,15 +376,92 @@ def _quiet_stdout():
             os.close(saved)
 
 
-_solves = threading.local()  # the solves of the plan under way in this thread: [what, seconds, status]
+_solves = threading.local()  # the solves of the plan under way in this thread: [what, seconds, status, how]
+log = logging.getLogger(__name__)
+
+
+def _milp(c, integ, lb, ub, A, lo, hi, s: Settings, start=None):
+    """One MILP. With HiGHS's own package: from a start ((indices, values) of integer variables,
+    the rest found by HiGHS), and stopped once its plan has not improved for s.stall_s (most of
+    a solve's time goes into proving a plan found early the best, which within the gap asked
+    it seldom can). Without it, or should it fail: scipy's milp, from cold, to the time limit.
+    Returns x (None without a plan), status (0 optimal, 1 time limit, 5 stopped early, else
+    HiGHS's), fun, mip_gap, message, and how it started ("warm", "cold", "cold (no highspy)")."""
+    if _highspy is not None:
+        try:
+            return _milp_highs(c, integ, lb, ub, A, lo, hi, s, start)
+        except Exception:  # never no plan for want of a start or a stop
+            log.exception("highspy failed: solved with scipy instead")
+    res = milp(c=c, integrality=integ, bounds=Bounds(lb, ub), constraints=LinearConstraint(A, lo, hi),
+               options={"time_limit": s.time_limit_s, "mip_rel_gap": s.mip_gap, "disp": False})
+    return types.SimpleNamespace(x=res.x, status=res.status, fun=res.fun, mip_gap=getattr(res, "mip_gap", None),
+                                 message=res.message, how="cold (no highspy)")
+
+
+WARM_SKIPS_SUBMIPS = True
+
+
+def _milp_highs(c, integ, lb, ub, A, lo, hi, s: Settings, start=None):
+    hp = _highspy
+    h = hp.Highs()
+    h.setOptionValue("output_flag", False)
+    h.setOptionValue("time_limit", float(s.time_limit_s))
+    h.setOptionValue("mip_rel_gap", float(s.mip_gap))
+    A = A.tocsc()
+    n, m = len(c), A.shape[0]
+    lp = hp.HighsLp()
+    lp.num_col_, lp.num_row_ = n, m
+    lp.col_cost_, lp.col_lower_, lp.col_upper_ = c, lb, ub
+    lp.row_lower_, lp.row_upper_ = lo, hi
+    lp.a_matrix_.format_ = hp.MatrixFormat.kColwise
+    lp.a_matrix_.num_col_, lp.a_matrix_.num_row_ = n, m
+    lp.a_matrix_.start_, lp.a_matrix_.index_, lp.a_matrix_.value_ = A.indptr, A.indices, A.data
+    mip = bool(np.any(integ))
+    if mip:
+        lp.integrality_ = [hp.HighsVarType.kInteger if v else hp.HighsVarType.kContinuous for v in integ]
+    h.passModel(lp)
+    how = "cold"
+    if mip and start is not None and len(start[0]):
+        idx, val = start
+        if h.setSolution(len(idx), np.asarray(idx, dtype=np.int32), np.asarray(val, dtype=float)) == hp.HighsStatus.kOk:
+            how = "warm"  # HiGHS finds the rest, or drops it should it not fit
+            if WARM_SKIPS_SUBMIPS:
+                # from a plan already: no sub-MIPs searching for one (seconds each, between which
+                # HiGHS does not look whether to stop, for hundredths of a percent)
+                h.setOptionValue("mip_heuristic_run_rins", False)
+                h.setOptionValue("mip_heuristic_run_rens", False)
+    if mip and s.stall_s > 0:
+        last = [None]  # when the plan last improved (a start that fits counts)
+
+        def improved(e):
+            last[0] = e.data_out.running_time
+
+        def stalled(e):
+            if last[0] is not None and e.data_out.running_time - last[0] >= s.stall_s:
+                e.interrupt()
+
+        h.cbMipImprovingSolution.subscribe(improved)
+        h.cbMipInterrupt.subscribe(stalled)
+    h.run()
+    ms = h.getModelStatus()
+    sol, info = h.getSolution(), h.getInfo()
+    found = sol.value_valid and info.primal_solution_status == 2  # a feasible plan
+    status = {hp.HighsModelStatus.kOptimal: 0, hp.HighsModelStatus.kTimeLimit: 1,
+              hp.HighsModelStatus.kInterrupt: 5}.get(ms, 4)
+    return types.SimpleNamespace(x=np.array(sol.col_value) if found else None, status=status,
+                                 fun=info.objective_function_value if found else math.inf,
+                                 mip_gap=info.mip_gap if mip else 0.0, message=h.modelStatusToString(ms), how=how)
 
 
 def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = None,
-               relax_airing: bool = False, what: str | None = None) -> tuple[Plan | None, float]:
+               relax_airing: bool = False, what: str | None = None,
+               start: dict[str, np.ndarray] | None = None) -> tuple[Plan | None, float]:
     """One MILP with the AC units in `mode`. Returns the plan and its objective.
     fix_on: the on/off of the first steps, as given (to compare plans that differ
     in something else); relax_airing: airing candidates as shares, an LP for them;
-    what: what this solve is for, in the plan's list of solves (the mode by default)."""
+    what: what this solve is for, in the plan's list of solves (the mode by default);
+    start: a plan to start from, each unit's share of every step (on where over half),
+    held to what it may do now (its minimum run and pause, a lockout, a run asked for)."""
     t_start = time.time()
     s = pr.settings
     sys = pr.sys
@@ -391,6 +477,7 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
     unit_col = {u.id: j for j, u in enumerate(layout.units)}
     zid = layout.zone_ids
     V, R = _Vars(), _Rows()
+    st_idx, st_val = [], []  # the start: on/off of the on/off steps
 
     # states
     X = V.add((N + 1) * n, lb=-np.inf, ub=np.inf).reshape(N + 1, n)
@@ -434,6 +521,10 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
             on_lb[fine] = on_ub[fine] = np.round(np.asarray(fix_on[u.id])[fine])
         on = np.concatenate([V.add(int(fine.sum()), lb=on_lb[fine], ub=on_ub[fine], integer=True),
                              V.add(int((~fine).sum()), lb=on_lb[~fine], ub=on_ub[~fine])])
+        if start is not None and u.id in start and len(start[u.id]) == N:
+            want = (np.asarray(start[u.id], float) > 0.5).astype(float)
+            st_idx.append(on[fine])
+            st_val.append(np.clip(want, on_lb, on_ub)[fine])
         st = V.add(N, lb=0.0, ub=1.0, c=s.start_cost if u.kind == "ac" else 0.0)
         for k in range(N):
             R.add([q[k], on[k]], [1.0, -hi[k]], hi=0.0)
@@ -644,15 +735,15 @@ def solve_mode(pr: Problem, mode: str, fix_on: dict[str, np.ndarray] | None = No
     vals[np.abs(vals) < 1e-9] = 0.0  # far couplings in the step matrices: numerically nothing
     A = coo_matrix((vals, (R.r, R.c)), shape=(len(R.lo), V.n)).tocsr()
     A.eliminate_zeros()
+    warm = (np.concatenate(st_idx), np.concatenate(st_val)) if st_idx and s.warm_start else None
     with _quiet_stdout():
-        res = milp(c=np.array(V.c), integrality=np.array(V.integ), bounds=Bounds(np.array(V.lb), np.array(V.ub)),
-                   constraints=LinearConstraint(A, np.array(R.lo), np.array(R.hi)),
-                   options={"time_limit": s.time_limit_s, "mip_rel_gap": s.mip_gap, "disp": False})
+        res = _milp(np.array(V.c), np.array(V.integ), np.array(V.lb), np.array(V.ub), A, np.array(R.lo), np.array(R.hi),
+                    s, warm)
     seconds = time.time() - t_start
-    status = {0: "optimal", 1: "time limit"}.get(res.status, res.message)
-    log = getattr(_solves, "log", None)
-    if log is not None:
-        log.append([what or mode, round(seconds, 2), status if res.x is not None else f"{status}, nothing found"])
+    status = {0: "optimal", 1: "time limit", 5: "stopped early"}.get(res.status, res.message)
+    solves = getattr(_solves, "log", None)
+    if solves is not None:
+        solves.append([what or mode, round(seconds, 2), status if res.x is not None else f"{status}, nothing found", res.how])
     if res.x is None:
         return None, math.inf
     x = res.x
@@ -761,27 +852,42 @@ def airing_cost(pr: Problem, plan: Plan) -> float | None:
     return w - wo if math.isfinite(w) and math.isfinite(wo) else None
 
 
-def solve(pr: Problem, log: list | None = None) -> Plan:
+def shift_start(prev_t: np.ndarray, prev_share: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """A plan's share of each step, on another plan's steps (the plan before, moved on to now):
+    each step takes the share of the step it starts in; past the plan's end, nothing."""
+    prev_t = np.asarray(prev_t, dtype=float)
+    i = np.searchsorted(prev_t, np.asarray(t[:-1], dtype=float), side="right") - 1
+    ok = (i >= 0) & (i < len(prev_t) - 1)
+    out = np.zeros(len(t) - 1)
+    out[ok] = np.asarray(prev_share, float)[i[ok]]
+    return out
+
+
+def solve(pr: Problem, log: list | None = None, prev: Plan | None = None) -> Plan:
     """The cheapest plan over the modes that may run. log: each solve it took is added
-    to it, [what for, seconds, status] (also when no plan comes of them)."""
+    to it, [what for, seconds, status, how it started] (also when no plan comes of them).
+    prev: the plan before, to start the solve in its mode from (Settings.warm_start)."""
     if log is None:
-        return _solve(pr)
+        return _solve(pr, prev)
     _solves.log = log
     try:
-        return _solve(pr)
+        return _solve(pr, prev)
     finally:
         _solves.log = None
 
 
-def _solve(pr: Problem) -> Plan:
+def _solve(pr: Problem, prev: Plan | None = None) -> Plan:
     best, best_obj, objs = None, math.inf, {}
     for mode in candidate_modes(pr):
-        plan, obj = solve_mode(pr, mode)
+        start = None
+        if prev is not None and prev.mode == mode and pr.settings.warm_start:
+            start = {u.id: shift_start(prev.t, prev.share[u.id], pr.t) for u in pr.units if u.id in prev.share}
+        plan, obj = solve_mode(pr, mode, start=start)
         objs[mode] = obj
         if plan is not None and obj < best_obj:
             best, best_obj = plan, obj
     if best is None and pr.airing is not None:  # airing as asked does not fit: plan without
-        return _solve(dataclasses.replace(pr, airing=None))
+        return _solve(dataclasses.replace(pr, airing=None), prev)
     if best is None:
         raise RuntimeError("no feasible plan")
     best.alternatives = {m: o for m, o in objs.items() if m != best.mode}
@@ -841,7 +947,8 @@ def start_now_or_later(pr: Problem, plan: Plan, obj: float) -> Plan:
             f[0] = 0.0  # the step under way stays as it is: from the next
         now = dataclasses.replace(u, forced=f)
         alt = dataclasses.replace(pr, units=[now if x.id == u.id else x for x in pr.units])
-        p2, o2 = solve_mode(alt, plan.mode, what=f"start {u.id}")
+        # from the plan as it is, the run weighed held to (the same steps: nothing to move on)
+        p2, o2 = solve_mode(alt, plan.mode, what=f"start {u.id}", start=plan.share)
         if p2 is not None and o2 < obj + discount:
             p2.alternatives = plan.alternatives
             plan, obj = p2, o2

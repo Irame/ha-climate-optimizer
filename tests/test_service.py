@@ -90,7 +90,7 @@ def test_history_shows_how_long_plans_took(client):
     assert secs >= 0 and limit > 0 and failed is None
     assert steps[0] > steps[1] >= 1  # every step, those of them on/off
     assert client.get("/api/status").json()["plan"]["steps"] == steps
-    assert solves and all(len(x) == 3 and x[1] >= 0 for x in solves)
+    assert solves and all(len(x) == 4 and x[1] >= 0 for x in solves)  # what for, seconds, status, how it started
     assert {x[0] for x in solves} & {"heat", "cool"}
 
 
@@ -927,3 +927,12 @@ def test_slow_results_are_kept_a_while():
         assert await c.get("k", work) == 3
 
     asyncio.run(go())
+
+
+def test_plans_on_the_clock_start_from_the_last_plan(client):
+    p = client.svc.planner
+    client.post("/api/plan")  # asked for (as after an override): afresh
+    last = lambda: client.get("/api/history?hours=24").json()["plan_took"][-1]
+    assert last()[3] and all(x[3] == "cold" for x in last()[3])
+    client.portal.call(p.replan)  # on the clock: from the plan before (in its mode)
+    assert any(x[3] == "warm" for x in last()[3]), last()

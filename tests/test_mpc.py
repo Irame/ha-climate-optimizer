@@ -492,3 +492,52 @@ def test_a_start_is_weighed_at_the_end_of_the_on_off_steps():
     nf, ks = mpc.start_window(pr)
     end = (pr.t[nf] - pr.t[0]) / MIN
     assert (end - (pr.t[ks] - pr.t[0]) / MIN) == 15.0  # the last 15 minutes (the minimum run)
+
+
+def test_shift_start_moves_the_plan_on():
+    t_prev = np.array([0, 2, 7, 12, 27], dtype=float) * MIN
+    share = np.array([1.0, 1.0, 0.0, 0.6])
+    t = np.array([5, 7, 12, 27, 57], dtype=float) * MIN
+    assert list(mpc.shift_start(t_prev, share, t)) == [1.0, 0.0, 0.6, 0.0]  # past the plan's end: nothing
+
+
+def _hard(**kw):
+    st = dataclasses.replace(mpc.Settings(), binary_h=1.0, time_limit_s=30, **kw)
+    return problem(lambda h: 0.3 + 0.2 * ((h % 24) > 17), Ta=(19.0, 17.0, 19.0, 21.0, 19.0), settings=st)
+
+
+def test_a_solve_starts_from_a_plan_and_stops_once_it_stops_improving():
+    pr = _hard(stall_s=0)
+    log = []
+    cold = mpc.solve(pr, log)
+    assert log[0][3] == "cold" and log[0][2] in ("optimal", "time limit")
+    # from that plan itself: as good, and said so
+    log = []
+    warm, obj = mpc.solve_mode(pr, cold.mode, start=cold.share)
+    assert warm is not None
+    log2 = []
+    mpc.solve(pr, log2, prev=cold)
+    assert log2[0][3] == "warm"
+    # a start that cannot be (on and off by turns, under the minimum run): dropped, a plan all the same
+    bad = {u: np.tile([1.0, 0.0], pr.N)[:pr.N] for u in cold.share}
+    p, o = mpc.solve_mode(pr, cold.mode, start=bad)
+    assert p is not None and np.isfinite(o)
+
+
+def test_a_solve_stops_once_its_plan_stops_improving():
+    """A plan the solver cannot prove the best within the gap before its time limit: stopped
+    once it has not improved for a while, with the plan it has, and said so."""
+    price = lambda h: 0.30 + 0.12 * (16 <= h % 24 < 20) - 0.08 * (h % 24 < 6) + 0.02 * np.sin(h * 2.1)
+    st = dataclasses.replace(mpc.Settings(), binary_h=1.0, time_limit_s=25, stall_s=1.0)
+    pr = problem(price, Ta=(20.8, 18.8, 21.4, 21.8, 19.8), settings=st, t0=ms(2026, 1, 14, 13, 0))
+    log = []
+    plan = mpc.solve(pr, log)
+    assert plan is not None and any(x[2] == "stopped early" for x in log), log
+    assert all(x[1] < 25 for x in log)
+
+
+def test_without_highspy_scipy_solves(monkeypatch):
+    monkeypatch.setattr(mpc, "_highspy", None)
+    log = []
+    plan = mpc.solve(problem(lambda h: 0.3), log)
+    assert plan is not None and log[0][3] == "cold (no highspy)" and log[0][2] == "optimal"

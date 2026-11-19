@@ -608,7 +608,7 @@ function drawPlanTook(h) {
     colors: P.map(p => hit(p) || p[4] ? bad : ok),
     marks: P.map(p => p[4] ? 'ring' : hit(p) ? 'big' : null),
     labels: P.map(p => {
-      const parts = p[3].map(x => `${what(x[0])} ${num(x[1], 1)} s${x[2] === 'optimal' ? '' : ' (' + x[2] + ')'}`);
+      const parts = p[3].map(x => `${what(x[0])} ${num(x[1], 1)} s${x[3] === 'warm' ? ' from the last plan' : ''}${x[2] === 'optimal' ? '' : ' (' + x[2] + ')'}`);
       return `${num(p[1], 1)} s${p[5] ? ` · ${p[5][0]} steps, ${p[5][1]} on/off` : ''}${p[4] ? ' · failed: ' + p[4] : ''}${parts.length ? ' · ' + parts.join(', ') : ''}`;
     }),
   });
@@ -1227,6 +1227,7 @@ const PLAN_GROUPS = () => [
     ['binary_h', 'On/off planned exactly for (h)', 0.05, 'For this long the plan decides each unit on or off at every step; after that, what share of each step it runs (a third, say), which the units do in pulses, so the plan shows the average and the room swings around it. Longer shows the pulses in the plan, but every plan takes longer, and only its first step is ever done: the next plan decides anew. Reaching past the five-minute steps, a unit runs a whole 15- or 30-minute step there or not at all. 0.25 by default.'],
     ['plan_lead_s', 'Start each plan before the 5-minute mark (s)', 5, `Each plan on the clock decides the step from the next five-minute mark and starts this long before it. 0: by itself, as long before as the slower plans of late took, half as much again and half a minute (1 to 4.5 minutes; now ${num(S.status?.plan_lead_s, 0)} s). Sooner, it decides on older readings; later, it may not be done in time.`],
     ['time_limit_s', 'Solver time limit (s)', 1, 'The most each solve may take; the best plan found by then is used, and the overview says "time limit". A plan solves several times (heating, maybe cooling, a check per unit whether to start now), so it can take a few times this long.'],
+    ['stall_s', 'Stop a solve once its plan has not improved for (s)', 1, 'The solver mostly finds its plan within seconds, then spends the rest proving that none is better, which within the 1 % asked it often cannot before the time limit. Stopped once its plan has not improved for this long, it takes that plan ("stopped early"): plans come sooner, perhaps a little short of the best. The solver looks whether to stop only now and then, so a solve can run past this. 0: only the time limit. 10 by default.'],
   ]],
   ['Compressor (AC units)', [
     ['min_run_min', 'Minimum run (min)', 1, 'Once started, the outdoor unit runs at least this long. Short runs waste the minutes it takes to warm up.'],
@@ -1394,7 +1395,8 @@ pages.settings = async () => {
   const st = C.settings;
   html += section('planning', `<div class="card">
     ${PLAN_GROUPS().map(([title, rows]) => group(title, `<div class="fields">${rows.map(([k, label, step, info]) => numIn(label, `settings.${k}`, step, info)).join('')}
-      ${title === 'How exactly, and when' ? '<div class="steps-sum" id="steps-sum" aria-live="polite"></div>' : ''}
+      ${title === 'How exactly, and when' ? `<label class="check span-all"><input type="checkbox" data-path="settings.warm_start" ${st.warm_start !== false ? 'checked' : ''}> Start each solve from the last plan${infoBtn('Each solve starts from the plan before, moved on five minutes, so it has a good plan from the first moment and looks only for a better one; with the stop above, that is what makes it quick. Not after an override or a run asked for, nor from a plan older than a quarter of an hour: those start afresh. On the History page each solve says whether it started from the last plan.')}</label>
+      <div class="steps-sum" id="steps-sum" aria-live="polite"></div>` : ''}
       ${title === 'Heating or cooling' ? `<label class="field">${lab('Season', 'auto: heating or cooling as the coming day needs (see the two temperatures); heat or cool: only that.')}<select data-path="settings.season">${['auto', 'heat', 'cool'].map(v => `<option ${st.season === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>` : ''}</div>`)).join('')}
     ${group('Corrections', `<label class="check"><input type="checkbox" data-path="settings.plan_correction" ${st.plan_correction !== false ? 'checked' : ''}> Correct the plans by what the model kept getting wrong</label>`, 'Every five minutes the model is run again over the last hour with what the units really did, and held against the thermometers; what it keeps missing a room by goes into the plans as heat the room gains or loses beyond the model. The Model page shows it per room.')}
   </div>`);
